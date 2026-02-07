@@ -134,7 +134,7 @@ fn bench_chunk_size_sweep(c: &mut Criterion) {
     group.noise_threshold(0.05);
     group.throughput(Throughput::Elements(num_strings as u64));
 
-    for chunk_size in [128, 256, 512, 1024] {
+    for chunk_size in [128, 256, 512, 1024, 2048, 4096] {
         group.bench_with_input(
             BenchmarkId::new("embed_batch_chunked", chunk_size),
             &chunk_size,
@@ -179,9 +179,15 @@ fn bench_mixed_length(c: &mut Criterion) {
     group.noise_threshold(0.05);
     group.throughput(Throughput::Elements(total_tokens as u64));
 
-    group.bench_function("embed_batch_chunked", |b| {
-        b.iter(|| embedder.embed_batch_chunked(&refs, 256).unwrap());
-    });
+    for chunk_size in [256, 512, 1024, 2048] {
+        group.bench_with_input(
+            BenchmarkId::new("embed_batch_chunked", chunk_size),
+            &chunk_size,
+            |b, &chunk_size| {
+                b.iter(|| embedder.embed_batch_chunked(&refs, chunk_size).unwrap());
+            },
+        );
+    }
 
     group.finish();
 }

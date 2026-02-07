@@ -53,3 +53,7 @@ path = "src/bin/preprocess.rs"
 [[bin]]
 name = "train"
 path = "src/bin/train.rs"
+
+[[bin]]
+name = "profile_embedder"
+path = "src/bin/profile_embedder.rs"

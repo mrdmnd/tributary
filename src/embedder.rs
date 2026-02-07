@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
+use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use half::f16;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use parking_lot::RwLock;
 use thiserror::Error;
-use tokenizers::Tokenizer;
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use tracing::info;
 
 // ============================================================================
@@ -27,8 +27,11 @@ pub const DEFAULT_EMBEDDING_REPO: &str = "BAAI/bge-base-en-v1.5";
 /// Default embedding dimension for bge-base-en-v1.5
 pub const EMBEDDING_DIM: usize = 768;
 
-/// Default batch size for embedding operations
-pub const DEFAULT_BATCH_SIZE: usize = 256;
+/// Default batch size for embedding operations.
+/// 2048 saturates most GPUs for short sequences while keeping memory usage
+/// moderate.  For very short inputs (< 20 tokens) even larger sizes (4096+)
+/// can be beneficial.
+pub const DEFAULT_BATCH_SIZE: usize = 2048;
 
 /// Default work queue capacity
 pub const DEFAULT_QUEUE_CAPACITY: usize = 10_000;
@@ -87,6 +90,9 @@ pub struct EmbedderConfig {
     pub queue_capacity: usize,
     /// Max sequence length
     pub max_seq_len: usize,
+    /// Dtype for model weights and computation.
+    /// F16 is ~2x faster than F32 on GPUs with tensor cores (Volta+).
+    pub dtype: DType,
 }
 
 impl Default for EmbedderConfig {
@@ -99,6 +105,7 @@ impl Default for EmbedderConfig {
             normalize: true,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             max_seq_len: MAX_SEQ_LEN,
+            dtype: DType::F16,
         }
     }
 }
@@ -133,12 +140,18 @@ struct EmbeddingModel {
     tokenizer: Tokenizer,
     device: Device,
     config: EmbedderConfig,
+    /// Cached epsilon scalar in the model dtype, living on the GPU device.
+    /// Avoids repeated Host→Device micro-transfers on every forward pass.
+    eps: Tensor,
 }
 
 impl EmbeddingModel {
     /// Load the model from HuggingFace Hub
     fn load(config: &EmbedderConfig) -> Result<Self> {
-        info!("Loading model from: {}", config.model_repo);
+        info!(
+            "Loading model from: {} (dtype: {:?})",
+            config.model_repo, config.dtype
+        );
 
         // Set up device
         let device = Device::new_cuda(config.cuda_device)?;
@@ -158,10 +171,26 @@ impl EmbeddingModel {
             repo.get("pytorch_model.bin")
         })?;
 
-        // Load tokenizer
+        // Load tokenizer with padding configured for efficient batching.
+        // PaddingStrategy::BatchLongest pads all sequences in a batch to the
+        // length of the longest — the tokenizer does this internally so we
+        // avoid a separate manual-padding pass.
         info!("Loading tokenizer...");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| EmbedderError::InitError(format!("Failed to load tokenizer: {}", e)))?;
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            ..Default::default()
+        }));
+        if let Err(e) = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+            max_length: config.max_seq_len,
+            ..Default::default()
+        })) {
+            return Err(EmbedderError::InitError(format!(
+                "Failed to configure truncation: {}",
+                e
+            )));
+        }
 
         // Load model config
         info!("Loading model config...");
@@ -170,21 +199,31 @@ impl EmbeddingModel {
         let model_config: BertConfig = serde_json::from_str(&config_str)
             .map_err(|e| EmbedderError::InitError(format!("Failed to parse config: {}", e)))?;
 
-        // Load model weights
-        info!("Loading model weights from {:?}...", weights_path);
+        // Load model weights in the configured dtype (F16 ≈ 2× faster than F32
+        // on tensor-core GPUs due to halved memory bandwidth + native TC ops).
+        info!(
+            "Loading model weights from {:?} (dtype={:?})...",
+            weights_path, config.dtype
+        );
         let vb = if weights_path
             .extension()
             .map(|e| e == "safetensors")
             .unwrap_or(false)
         {
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)? }
+            unsafe {
+                VarBuilder::from_mmaped_safetensors(&[weights_path], config.dtype, &device)?
+            }
         } else {
-            VarBuilder::from_pth(&weights_path, DTYPE, &device)?
+            VarBuilder::from_pth(&weights_path, config.dtype, &device)?
         };
 
         // Build model
         info!("Building model...");
         let model = BertModel::load(vb, &model_config)?;
+
+        // Pre-allocate an epsilon scalar on GPU in the model dtype so that
+        // mean_pool / l2_normalize never trigger a Host→Device copy.
+        let eps = Tensor::new(&[1e-7f32], &device)?.to_dtype(config.dtype)?;
 
         info!("Model loaded successfully!");
         Ok(Self {
@@ -192,6 +231,7 @@ impl EmbeddingModel {
             tokenizer,
             device,
             config: config.clone(),
+            eps,
         })
     }
 
@@ -204,29 +244,50 @@ impl EmbeddingModel {
     ///
     /// For batches >= [`Self::PARALLEL_TOKENIZE_THRESHOLD`] we delegate to the
     /// HuggingFace `encode_batch` method which parallelises across strings via
-    /// Rayon.  Smaller batches use a simple sequential loop to avoid thread-pool
-    /// overhead.
+    /// Rayon **and** handles padding internally (via [`PaddingStrategy::BatchLongest`]
+    /// configured at load time).  Smaller batches use a simple sequential loop to
+    /// avoid thread-pool overhead, with a fast manual padding pass.
     fn tokenize(&self, texts: &[&str]) -> Result<(Tensor, Tensor, Tensor)> {
-        let mut all_input_ids = Vec::with_capacity(texts.len());
-        let mut all_attention_mask = Vec::with_capacity(texts.len());
-        let mut max_len = 0;
+        let batch_size = texts.len();
 
-        if texts.len() >= Self::PARALLEL_TOKENIZE_THRESHOLD {
-            // Parallel path: encode_batch uses Rayon internally.
+        if batch_size >= Self::PARALLEL_TOKENIZE_THRESHOLD {
+            // ── Fast parallel path ──────────────────────────────────────
+            // encode_batch uses Rayon internally AND the tokenizer's
+            // PaddingParams pads all sequences to BatchLongest, so the
+            // returned encodings are already uniformly shaped.
             let encodings = self
                 .tokenizer
                 .encode_batch(texts.to_vec(), true)
                 .map_err(|e| EmbedderError::TokenizeError(e.to_string()))?;
 
-            for encoding in &encodings {
-                let ids: Vec<u32> = encoding.get_ids().to_vec();
-                let len = ids.len().min(self.config.max_seq_len);
-                max_len = max_len.max(len);
-                all_attention_mask.push(vec![1u32; len]);
-                all_input_ids.push(ids);
+            let max_len = encodings
+                .first()
+                .map_or(0, |e| e.get_ids().len());
+
+            // Pre-allocate flat buffers and copy contiguously.
+            let total = batch_size * max_len;
+            let mut flat_ids = Vec::with_capacity(total);
+            let mut flat_mask = Vec::with_capacity(total);
+            for enc in &encodings {
+                flat_ids.extend_from_slice(enc.get_ids());
+                flat_mask.extend_from_slice(enc.get_attention_mask());
             }
+
+            let input_ids =
+                Tensor::from_vec(flat_ids, (batch_size, max_len), &self.device)?;
+            // token_type_ids are all-zero for single-sentence tasks; create
+            // directly on GPU to avoid a CPU allocation + copy.
+            let token_type_ids =
+                Tensor::zeros((batch_size, max_len), DType::U32, &self.device)?;
+            let attention_mask =
+                Tensor::from_vec(flat_mask, (batch_size, max_len), &self.device)?;
+
+            Ok((input_ids, token_type_ids, attention_mask))
         } else {
-            // Sequential path: avoid Rayon thread-pool overhead for small batches.
+            // ── Sequential path (small batches) ─────────────────────────
+            let mut all_input_ids = Vec::with_capacity(batch_size);
+            let mut max_len: usize = 0;
+
             for text in texts {
                 let encoding = self
                     .tokenizer
@@ -236,44 +297,40 @@ impl EmbeddingModel {
                 let ids: Vec<u32> = encoding.get_ids().to_vec();
                 let len = ids.len().min(self.config.max_seq_len);
                 max_len = max_len.max(len);
-                all_attention_mask.push(vec![1u32; len]);
                 all_input_ids.push(ids);
             }
-        }
 
-        // Pad to max length
-        let batch_size = texts.len();
-        let mut padded_ids = vec![0u32; batch_size * max_len];
-        let mut padded_mask = vec![0u32; batch_size * max_len];
-        let padded_token_types = vec![0u32; batch_size * max_len]; // All zeros for single-sentence
+            // Pad to max length in batch
+            let total = batch_size * max_len;
+            let mut padded_ids = vec![0u32; total];
+            let mut padded_mask = vec![0u32; total];
 
-        for (i, (ids, mask)) in all_input_ids
-            .iter()
-            .zip(all_attention_mask.iter())
-            .enumerate()
-        {
-            let len = ids.len().min(max_len);
-            for j in 0..len {
-                padded_ids[i * max_len + j] = ids[j];
-                padded_mask[i * max_len + j] = mask[j];
+            for (i, ids) in all_input_ids.iter().enumerate() {
+                let len = ids.len().min(max_len);
+                let row = i * max_len;
+                padded_ids[row..row + len].copy_from_slice(&ids[..len]);
+                for slot in &mut padded_mask[row..row + len] {
+                    *slot = 1;
+                }
             }
+
+            let input_ids =
+                Tensor::from_vec(padded_ids, (batch_size, max_len), &self.device)?;
+            let token_type_ids =
+                Tensor::zeros((batch_size, max_len), DType::U32, &self.device)?;
+            let attention_mask =
+                Tensor::from_vec(padded_mask, (batch_size, max_len), &self.device)?;
+
+            Ok((input_ids, token_type_ids, attention_mask))
         }
-
-        // Create tensors
-        let input_ids = Tensor::from_vec(padded_ids, (batch_size, max_len), &self.device)?;
-        let token_type_ids =
-            Tensor::from_vec(padded_token_types, (batch_size, max_len), &self.device)?;
-        let attention_mask = Tensor::from_vec(padded_mask, (batch_size, max_len), &self.device)?;
-
-        Ok((input_ids, token_type_ids, attention_mask))
     }
 
-    /// Compute embeddings for a batch of texts
-    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
+    /// Compute embeddings for a batch of texts, returning a GPU tensor.
+    ///
+    /// The result lives on the CUDA device in the model's dtype (e.g. F16).
+    /// **No Device→Host copy occurs**, so this does not synchronize the GPU
+    /// stream — callers can pipeline multiple batches before transferring.
+    fn embed_batch_as_tensor(&self, texts: &[&str]) -> Result<Tensor> {
         // Tokenize
         let (input_ids, token_type_ids, attention_mask) = self.tokenize(texts)?;
 
@@ -286,13 +343,25 @@ impl EmbeddingModel {
         let embeddings = self.mean_pool(&hidden_states, &attention_mask)?;
 
         // Normalize if configured
-        let embeddings = if self.config.normalize {
-            self.l2_normalize(&embeddings)?
+        if self.config.normalize {
+            Ok(self.l2_normalize(&embeddings)?)
         } else {
-            embeddings
-        };
+            Ok(embeddings)
+        }
+    }
 
-        // Convert to Vec<Vec<f32>>
+    /// Compute embeddings for a batch of texts, downloading to CPU.
+    ///
+    /// `BertModel::forward` takes `&self`, so this method only needs `&self` —
+    /// callers can use a read-lock instead of a write-lock.
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let embeddings = self.embed_batch_as_tensor(texts)?;
+
+        // Convert to Vec<Vec<f32>> — this is the DtoH synchronization point.
         let embeddings = embeddings.to_dtype(DType::F32)?.to_vec2()?;
 
         Ok(embeddings)
@@ -302,19 +371,18 @@ impl EmbeddingModel {
     fn mean_pool(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> CandleResult<Tensor> {
         // hidden_states: [batch, seq_len, hidden_dim]
         // attention_mask: [batch, seq_len]
+        let dtype = hidden_states.dtype();
 
         // Expand mask to hidden dim
-        let mask = attention_mask
-            .to_dtype(hidden_states.dtype())?
-            .unsqueeze(2)?; // [batch, seq_len, 1]
+        let mask = attention_mask.to_dtype(dtype)?.unsqueeze(2)?; // [batch, seq_len, 1]
 
         // Apply mask and sum
         let masked = hidden_states.broadcast_mul(&mask)?;
         let sum = masked.sum(1)?; // [batch, hidden_dim]
 
-        // Divide by sum of mask (number of valid tokens)
+        // Divide by sum of mask (number of valid tokens).
         let count = mask.sum(1)?; // [batch, 1]
-        let count = count.broadcast_add(&Tensor::new(&[1e-9f32], &self.device)?)?; // Avoid div by zero
+        let count = count.broadcast_add(&self.eps)?;
 
         sum.broadcast_div(&count)
     }
@@ -322,7 +390,7 @@ impl EmbeddingModel {
     /// L2 normalize embeddings
     fn l2_normalize(&self, embeddings: &Tensor) -> CandleResult<Tensor> {
         let norm = embeddings.sqr()?.sum_keepdim(1)?.sqrt()?;
-        let norm = norm.broadcast_add(&Tensor::new(&[1e-9f32], &self.device)?)?;
+        let norm = norm.broadcast_add(&self.eps)?;
         embeddings.broadcast_div(&norm)
     }
 }
@@ -386,8 +454,8 @@ impl Embedder {
             return Ok(Vec::new());
         }
 
-        let mut guard = self.inner.write();
-        let model = guard.as_mut().ok_or(EmbedderError::NotLoaded)?;
+        let guard = self.inner.read();
+        let model = guard.as_ref().ok_or(EmbedderError::NotLoaded)?;
         model.embed_batch(texts)
     }
 
@@ -417,16 +485,62 @@ impl Embedder {
     // Chunked Batch Processing
     // ========================================================================
 
-    /// Process a large batch in chunks
+    /// Process a large batch in chunks.
+    ///
+    /// Strings are **sorted by byte-length** before chunking so that each GPU
+    /// batch contains strings of similar token counts.  This minimises padding
+    /// within each chunk and can dramatically reduce wasted compute when the
+    /// input corpus has heterogeneous lengths.  Results are returned in the
+    /// original input order.
+    ///
+    /// All chunks are processed on the GPU without synchronising in between;
+    /// the per-chunk embedding tensors are concatenated on-device and then
+    /// transferred to the host in a **single** Device→Host copy.  This avoids
+    /// repeated sync barriers that would otherwise stall the CUDA stream.
     pub fn embed_batch_chunked(&self, texts: &[&str], chunk_size: usize) -> Result<Vec<Vec<f32>>> {
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-
-        for chunk in texts.chunks(chunk_size) {
-            let chunk_embeddings = self.embed_batch(chunk)?;
-            all_embeddings.extend(chunk_embeddings);
+        if texts.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(all_embeddings)
+        let guard = self.inner.read();
+        let model = guard.as_ref().ok_or(EmbedderError::NotLoaded)?;
+
+        // Build (original_index, text) pairs and sort by byte-length (a cheap
+        // but effective proxy for token count).
+        let mut indexed: Vec<(usize, &str)> = texts.iter().copied().enumerate().collect();
+        indexed.sort_unstable_by_key(|&(_, s)| s.len());
+
+        let sorted_texts: Vec<&str> = indexed.iter().map(|&(_, s)| s).collect();
+
+        // ── GPU-resident phase: no DtoH sync ────────────────────────────
+        // Each chunk produces a [chunk_len, hidden_dim] tensor that stays on
+        // the CUDA device.  We collect them all, then `cat` once.
+        let mut gpu_chunks: Vec<Tensor> = Vec::with_capacity(
+            (texts.len() + chunk_size - 1) / chunk_size,
+        );
+        for chunk in sorted_texts.chunks(chunk_size) {
+            gpu_chunks.push(model.embed_batch_as_tensor(chunk)?);
+        }
+
+        // ── Single DtoH transfer ────────────────────────────────────────
+        let all_embeddings_gpu = if gpu_chunks.len() == 1 {
+            gpu_chunks.into_iter().next().unwrap()
+        } else {
+            Tensor::cat(&gpu_chunks, 0)?
+        };
+        // Drop the per-chunk tensors' storage is now in `all_embeddings_gpu`.
+        let sorted_embeddings: Vec<Vec<f32>> =
+            all_embeddings_gpu.to_dtype(DType::F32)?.to_vec2()?;
+
+        // ── Scatter back to original order ───────────────────────────────
+        let mut result: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        result.resize_with(texts.len(), Vec::new);
+        for (sorted_idx, embedding) in sorted_embeddings.into_iter().enumerate() {
+            let original_idx = indexed[sorted_idx].0;
+            result[original_idx] = embedding;
+        }
+
+        Ok(result)
     }
 
     /// Process a large batch in chunks, returning f16
