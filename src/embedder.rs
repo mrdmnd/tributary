@@ -4,16 +4,14 @@
 //!
 //! # Performance optimizations
 //!
-//! - **Fused mean-pooling + L2 norm in ONNX** — the default model
-//!   (`model_fp16_pooled.onnx`) includes mean-pooling and L2 normalisation as
-//!   graph ops, outputting `[B, 768]` directly.  This reduces the GPU→CPU
-//!   output transfer by ~10x compared to the raw `[B, S, 768]` hidden states.
+//! - **FP16 pooling in ONNX** — mean-pooling + L2 normalisation run in FP16,
+//!   with a single FP16→FP32 cast only on the reduced `[B, 768]` output.
+//!   This avoids materialising the full `[B, S, 768]` tensor in FP32.
+//! - **INT32 inputs** — the model accepts INT32 directly (matching the ORT
+//!   kernel's internal type), halving host→device input transfer size vs INT64.
 //! - **IoBinding with CUDA-pinned I/O** — both input **and** output tensors
 //!   are allocated in page-locked host memory and bound via ORT's `IoBinding`
 //!   API, enabling truly asynchronous DMA in both directions.
-//! - **SIMD mean-pooling fallback** — if the model does *not* include fused
-//!   pooling, the `[B, S, H]` output is mean-pooled on the CPU using
-//!   `wide::f32x8` (AVX2).
 //! - **Pipelined tokenization** — a background thread tokenizes chunk N+1 while
 //!   the GPU processes chunk N.
 //! - **Optional CUDA graph capture** — eliminates per-kernel launch overhead
@@ -25,7 +23,7 @@ use std::path::PathBuf;
 use half::f16;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use ort::io_binding::IoBinding;
-use ort::memory::{Allocator, AllocatorType, AllocationDevice, MemoryInfo, MemoryType};
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
@@ -33,7 +31,6 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use tracing::info;
-use wide::f32x8;
 
 // ============================================================================
 // Configuration
@@ -61,9 +58,6 @@ pub const MAX_SEQ_LEN: usize = 512;
 /// Points to the **pooled** model that includes fused mean-pooling + L2 norm.
 /// Generate with `uv run ort/scripts/export_onnx.py`.
 pub const DEFAULT_ONNX_MODEL_PATH: &str = "ort/models/bge-base-en-v1.5-onnx/model_fp16_pooled.onnx";
-
-/// Width of SIMD lanes used by the mean-pooling kernel (AVX2 = 8×f32).
-const SIMD_WIDTH: usize = 8;
 
 // ============================================================================
 // Error Types
@@ -112,8 +106,6 @@ pub struct EmbedderConfig {
     pub cuda_device: usize,
     /// Batch size for embedding operations
     pub batch_size: usize,
-    /// Whether to normalize embeddings (L2 norm)
-    pub normalize: bool,
     /// Work queue capacity for background processing
     pub queue_capacity: usize,
     /// Max sequence length
@@ -142,7 +134,6 @@ impl Default for EmbedderConfig {
             onnx_model_path: PathBuf::from(DEFAULT_ONNX_MODEL_PATH),
             cuda_device: 0,
             batch_size: DEFAULT_BATCH_SIZE,
-            normalize: true,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             max_seq_len: MAX_SEQ_LEN,
             enable_cuda_graph: false,
@@ -190,10 +181,12 @@ impl EmbedderConfig {
 
 /// A pre-tokenized batch ready for inference.
 ///
-/// All arrays use `i64` (the ONNX convention for integer tensors).
+/// Arrays use `i32` — the optimized ONNX model declares INT32 inputs directly
+/// (the ORT BERT optimizer's `EmbedLayerNormalization` kernel uses INT32
+/// internally, so there is no reason to send INT64 from the host).
 pub struct TokenizedBatch {
-    pub input_ids: Vec<i64>,
-    pub attention_mask: Vec<i64>,
+    pub input_ids: Vec<i32>,
+    pub attention_mask: Vec<i32>,
     pub batch_size: usize,
     pub seq_len: usize,
 }
@@ -220,8 +213,8 @@ pub fn tokenize_batch(tokenizer: &Tokenizer, texts: &[&str]) -> Result<Tokenized
     let mut flat_ids = Vec::with_capacity(total);
     let mut flat_mask = Vec::with_capacity(total);
     for enc in &encodings {
-        flat_ids.extend(enc.get_ids().iter().map(|&x| x as i64));
-        flat_mask.extend(enc.get_attention_mask().iter().map(|&x| x as i64));
+        flat_ids.extend(enc.get_ids().iter().map(|&x| x as i32));
+        flat_mask.extend(enc.get_attention_mask().iter().map(|&x| x as i32));
     }
 
     Ok(TokenizedBatch {
@@ -242,6 +235,12 @@ pub fn tokenize_batch(tokenizer: &Tokenizer, texts: &[&str]) -> Result<Tokenized
 /// repeated `cudaMallocHost` / `cudaFreeHost` round-trips for the three
 /// input tensors (input_ids, attention_mask, token_type_ids).
 ///
+/// `token_type_ids` is always zero for single-segment models like BGE, but
+/// we keep it as a model input (rather than a graph-computed constant)
+/// because ORT's `ConstantOfShape` would allocate a fresh `[B, S]` tensor
+/// on every call for dynamic shapes.  A cached pinned tensor + `memset` is
+/// much cheaper.
+///
 /// The `IoBinding` is **not** cached — it is created fresh each call.
 /// Caching it caused CUDA cleanup issues (error 700 on `cudaEventDestroy`)
 /// because ORT's internal event tracking does not expect bindings to
@@ -250,9 +249,9 @@ struct CachedInputs {
     batch_size: usize,
     seq_len: usize,
     /// Pre-allocated pinned input tensors (data overwritten each call).
-    input_ids: Tensor<i64>,
-    attn_mask: Tensor<i64>,
-    token_type: Tensor<i64>,
+    input_ids: Tensor<i32>,
+    attn_mask: Tensor<i32>,
+    token_type: Tensor<i32>,
 }
 
 /// Bundles the ORT session with CUDA-pinned memory allocators.
@@ -274,11 +273,7 @@ struct InferenceCtx {
     pinned_output_alloc: Allocator,
     /// The ORT session — dropped last (owns the CUDA context).
     session: Session,
-    /// Whether the loaded ONNX model already includes fused mean-pooling +
-    /// L2 normalisation (output shape `[B, H]` instead of `[B, S, H]`).
-    model_is_pooled: bool,
-    /// Name of the first model output (e.g. `"embeddings"` or
-    /// `"last_hidden_state"`).
+    /// Name of the first model output (e.g. `"embeddings"`).
     output_name: String,
 }
 
@@ -306,14 +301,9 @@ unsafe impl Send for InferenceCtx {}
 /// the output — live in CUDA-pinned (page-locked) host memory, enabling
 /// truly asynchronous DMA via `cudaMemcpyAsync` in both directions.
 ///
-/// If the model is **pooled** (output `[B, H]`), the embeddings are read
-/// directly from the output tensor.  Otherwise the full hidden states
-/// `[B, S, H]` are mean-pooled on the CPU with SIMD.
-fn ort_infer(
-    ctx: &mut InferenceCtx,
-    batch: TokenizedBatch,
-    normalize: bool,
-) -> Result<Vec<Vec<f32>>> {
+/// The model is expected to be **pooled** (output `[B, H]`) with fused
+/// mean-pooling and L2 normalisation baked into the ONNX graph.
+fn ort_infer(ctx: &mut InferenceCtx, batch: TokenizedBatch) -> Result<Vec<Vec<f32>>> {
     let TokenizedBatch {
         input_ids,
         attention_mask,
@@ -334,14 +324,13 @@ fn ort_infer(
 
         // Allocate fresh pinned input tensors.
         let input_ids_tensor =
-            Tensor::<i64>::new(&ctx.pinned_input_alloc, [batch_size, seq_len])
+            Tensor::<i32>::new(&ctx.pinned_input_alloc, [batch_size, seq_len])
                 .map_err(|e| EmbedderError::EmbedError(format!("pinned input_ids: {e}")))?;
         let attn_mask_tensor =
-            Tensor::<i64>::new(&ctx.pinned_input_alloc, [batch_size, seq_len])
+            Tensor::<i32>::new(&ctx.pinned_input_alloc, [batch_size, seq_len])
                 .map_err(|e| EmbedderError::EmbedError(format!("pinned attn_mask: {e}")))?;
-        let token_type_tensor =
-            Tensor::<i64>::new(&ctx.pinned_input_alloc, [batch_size, seq_len])
-                .map_err(|e| EmbedderError::EmbedError(format!("pinned token_type: {e}")))?;
+        let token_type_tensor = Tensor::<i32>::new(&ctx.pinned_input_alloc, [batch_size, seq_len])
+            .map_err(|e| EmbedderError::EmbedError(format!("pinned token_type: {e}")))?;
 
         ctx.cached = Some(CachedInputs {
             batch_size,
@@ -357,14 +346,14 @@ fn ort_infer(
     let cached = ctx.cached.as_mut().unwrap();
     // SAFETY: CUDA_PINNED memory is CPU-accessible (page-locked host RAM).
     unsafe {
-        let ptr = cached.input_ids.data_ptr_mut() as *mut i64;
+        let ptr = cached.input_ids.data_ptr_mut() as *mut i32;
         std::ptr::copy_nonoverlapping(input_ids.as_ptr(), ptr, n);
 
-        let ptr = cached.attn_mask.data_ptr_mut() as *mut i64;
+        let ptr = cached.attn_mask.data_ptr_mut() as *mut i32;
         std::ptr::copy_nonoverlapping(attention_mask.as_ptr(), ptr, n);
 
         // Token-type IDs — always zero for single-segment models.
-        let ptr = cached.token_type.data_ptr_mut() as *mut i64;
+        let ptr = cached.token_type.data_ptr_mut() as *mut i32;
         std::ptr::write_bytes(ptr, 0, n);
     }
 
@@ -384,24 +373,12 @@ fn ort_infer(
         .bind_input("token_type_ids", &cached.token_type)
         .map_err(|e| EmbedderError::EmbedError(format!("bind token_type_ids: {e}")))?;
 
-    // Allocate pinned output and bind.
-    if ctx.model_is_pooled {
-        let output_tensor =
-            Tensor::<f32>::new(&ctx.pinned_output_alloc, [batch_size, EMBEDDING_DIM])
-                .map_err(|e| EmbedderError::EmbedError(format!("pinned output: {e}")))?;
-        binding
-            .bind_output(&ctx.output_name, output_tensor)
-            .map_err(|e| EmbedderError::EmbedError(format!("bind output: {e}")))?;
-    } else {
-        let output_tensor = Tensor::<f32>::new(
-            &ctx.pinned_output_alloc,
-            [batch_size, seq_len, EMBEDDING_DIM],
-        )
+    // Allocate pinned output ([B, H]) and bind.
+    let output_tensor = Tensor::<f32>::new(&ctx.pinned_output_alloc, [batch_size, EMBEDDING_DIM])
         .map_err(|e| EmbedderError::EmbedError(format!("pinned output: {e}")))?;
-        binding
-            .bind_output(&ctx.output_name, output_tensor)
-            .map_err(|e| EmbedderError::EmbedError(format!("bind output: {e}")))?;
-    }
+    binding
+        .bind_output(&ctx.output_name, output_tensor)
+        .map_err(|e| EmbedderError::EmbedError(format!("bind output: {e}")))?;
 
     // ── Run inference via IoBinding ─────────────────────────────────────
     let outputs = ctx
@@ -418,188 +395,18 @@ fn ort_infer(
         .downcast_ref::<ort::value::TensorValueType<f32>>()
         .map_err(|e| EmbedderError::EmbedError(format!("downcast output: {e}")))?;
 
-    if ctx.model_is_pooled {
-        // Output is already [B, H].
-        let total = batch_size * EMBEDDING_DIM;
-        // SAFETY: CUDA_PINNED memory is CPU-accessible.
-        let data: &[f32] = unsafe {
-            let ptr = output_ref.data_ptr() as *const f32;
-            std::slice::from_raw_parts(ptr, total)
-        };
-        let embeddings: Vec<Vec<f32>> = data
-            .chunks_exact(EMBEDDING_DIM)
-            .map(|chunk| chunk.to_vec())
-            .collect();
-        Ok(embeddings)
-    } else {
-        // Output is [B, S, H] — need CPU mean-pooling.
-        let total = batch_size * seq_len * EMBEDDING_DIM;
-        let data: &[f32] = unsafe {
-            let ptr = output_ref.data_ptr() as *const f32;
-            std::slice::from_raw_parts(ptr, total)
-        };
-        Ok(mean_pool_and_normalize(
-            data,
-            &attention_mask,
-            batch_size,
-            seq_len,
-            EMBEDDING_DIM,
-            normalize,
-        ))
-    }
-}
-
-// ============================================================================
-// SIMD Mean Pooling + L2 Normalisation
-// ============================================================================
-
-/// Mean-pool hidden states and optionally L2-normalise, using AVX2 SIMD.
-///
-/// Processes 8 hidden dimensions per cycle via `wide::f32x8`.  Falls back to
-/// a scalar implementation if `hidden_dim` is not a multiple of 8 (uncommon
-/// for modern transformers — 256, 384, 512, 768, 1024 etc. are all 8-aligned).
-fn mean_pool_and_normalize(
-    hidden_states: &[f32],
-    attention_mask: &[i64],
-    batch_size: usize,
-    seq_len: usize,
-    hidden_dim: usize,
-    normalize: bool,
-) -> Vec<Vec<f32>> {
-    if hidden_dim % SIMD_WIDTH == 0 {
-        mean_pool_and_normalize_simd(
-            hidden_states,
-            attention_mask,
-            batch_size,
-            seq_len,
-            hidden_dim,
-            normalize,
-        )
-    } else {
-        mean_pool_and_normalize_scalar(
-            hidden_states,
-            attention_mask,
-            batch_size,
-            seq_len,
-            hidden_dim,
-            normalize,
-        )
-    }
-}
-
-/// SIMD (f32×8 / AVX2) implementation.
-#[inline]
-fn mean_pool_and_normalize_simd(
-    hidden_states: &[f32],
-    attention_mask: &[i64],
-    batch_size: usize,
-    seq_len: usize,
-    hidden_dim: usize,
-    normalize: bool,
-) -> Vec<Vec<f32>> {
-    let simd_chunks = hidden_dim / SIMD_WIDTH;
-    let mut result = Vec::with_capacity(batch_size);
-
-    for b in 0..batch_size {
-        let mut accum = vec![f32x8::ZERO; simd_chunks];
-        let mut count = 0.0f32;
-
-        for s in 0..seq_len {
-            let mask_val = attention_mask[b * seq_len + s];
-            if mask_val > 0 {
-                let mask_f = mask_val as f32;
-                let mask_vec = f32x8::splat(mask_f);
-                let base = (b * seq_len + s) * hidden_dim;
-                for c in 0..simd_chunks {
-                    let off = base + c * SIMD_WIDTH;
-                    // SAFETY-note: the slice is guaranteed to have `hidden_dim`
-                    // elements per token.  `try_into` converts &[f32] → [f32;8].
-                    let arr: [f32; SIMD_WIDTH] =
-                        hidden_states[off..off + SIMD_WIDTH].try_into().unwrap();
-                    accum[c] += f32x8::new(arr) * mask_vec;
-                }
-                count += mask_f;
-            }
-        }
-
-        // Divide by token count.
-        let inv_count = f32x8::splat(1.0 / count.max(1e-7));
-        for acc in &mut accum {
-            *acc *= inv_count;
-        }
-
-        // L2 normalise.
-        if normalize {
-            let mut sum_sq = f32x8::ZERO;
-            for acc in &accum {
-                sum_sq += *acc * *acc;
-            }
-            let lanes: [f32; SIMD_WIDTH] = sum_sq.to_array();
-            let norm = lanes.iter().sum::<f32>().sqrt().max(1e-7);
-            let inv_norm = f32x8::splat(1.0 / norm);
-            for acc in &mut accum {
-                *acc *= inv_norm;
-            }
-        }
-
-        // Flatten SIMD lanes → contiguous f32 embedding.
-        let mut embedding = Vec::with_capacity(hidden_dim);
-        for acc in &accum {
-            embedding.extend_from_slice(&acc.to_array());
-        }
-        result.push(embedding);
-    }
-
-    result
-}
-
-/// Scalar fallback (for hidden_dim values not divisible by 8).
-fn mean_pool_and_normalize_scalar(
-    hidden_states: &[f32],
-    attention_mask: &[i64],
-    batch_size: usize,
-    seq_len: usize,
-    hidden_dim: usize,
-    normalize: bool,
-) -> Vec<Vec<f32>> {
-    let mut result = Vec::with_capacity(batch_size);
-
-    for b in 0..batch_size {
-        let mut embedding = vec![0.0f32; hidden_dim];
-        let mut count = 0.0f32;
-
-        for s in 0..seq_len {
-            let mask_val = attention_mask[b * seq_len + s] as f32;
-            if mask_val > 0.0 {
-                let offset = (b * seq_len + s) * hidden_dim;
-                for d in 0..hidden_dim {
-                    embedding[d] += hidden_states[offset + d] * mask_val;
-                }
-                count += mask_val;
-            }
-        }
-
-        let count = count.max(1e-7);
-        for val in &mut embedding {
-            *val /= count;
-        }
-
-        if normalize {
-            let norm: f32 = embedding
-                .iter()
-                .map(|x| x * x)
-                .sum::<f32>()
-                .sqrt()
-                .max(1e-7);
-            for val in &mut embedding {
-                *val /= norm;
-            }
-        }
-
-        result.push(embedding);
-    }
-
-    result
+    // Output is already [B, H] (pooled + L2-normalised by the ONNX graph).
+    let total = batch_size * EMBEDDING_DIM;
+    // SAFETY: CUDA_PINNED memory is CPU-accessible.
+    let data: &[f32] = unsafe {
+        let ptr = output_ref.data_ptr() as *const f32;
+        std::slice::from_raw_parts(ptr, total)
+    };
+    let embeddings: Vec<Vec<f32>> = data
+        .chunks_exact(EMBEDDING_DIM)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    Ok(embeddings)
 }
 
 // ============================================================================
@@ -619,8 +426,6 @@ pub struct OrtEmbedder {
     ctx: Mutex<InferenceCtx>,
     /// Shared tokenizer.
     tokenizer: Tokenizer,
-    /// Whether to L2-normalize output embeddings.
-    normalize: bool,
     /// Configuration (public for external access to batch_size, etc.)
     pub config: EmbedderConfig,
 }
@@ -723,17 +528,16 @@ impl OrtEmbedder {
         .map_err(|e| EmbedderError::InitError(format!("pinned output Allocator: {e}")))?;
         info!("CUDA-pinned allocators ready (input + output)");
 
-        // ── Auto-detect pooled model ─────────────────────────────────────
-        // A pooled model outputs [B, H] (2 dims); an unpooled model outputs
-        // [B, S, H] (3 dims).
+        // ── Verify the model is pooled ──────────────────────────────────
+        // A pooled model outputs [B, H] (2 dims).  We require this — unpooled
+        // models (output [B, S, H]) are not supported.
         let output_info = session.outputs();
         let first_output = output_info
             .first()
             .ok_or_else(|| EmbedderError::InitError("Model has no outputs".into()))?;
         let output_name = first_output.name().to_string();
 
-        // Count the number of output dimensions from the value type info.
-        let model_is_pooled = match first_output.dtype() {
+        match first_output.dtype() {
             ort::value::ValueType::Tensor { ty: _, shape, .. } => {
                 info!(
                     "Output '{}' shape: {:?} ({} dims)",
@@ -741,22 +545,23 @@ impl OrtEmbedder {
                     shape,
                     shape.len()
                 );
-                shape.len() == 2
+                if shape.len() != 2 {
+                    return Err(EmbedderError::InitError(format!(
+                        "Expected a pooled model with 2-dim output [B, H], but got {} dims. \
+                         Re-export with `uv run ort/scripts/export_onnx.py` (without --skip-fuse-pooling).",
+                        shape.len()
+                    )));
+                }
             }
-            _ => false,
+            other => {
+                return Err(EmbedderError::InitError(format!(
+                    "Unexpected output type: {:?}",
+                    other
+                )));
+            }
         };
 
-        if model_is_pooled {
-            info!("Detected POOLED model (output [B, H]) — skipping CPU mean-pooling");
-        } else {
-            info!("Detected UNPOOLED model (output [B, S, H]) — will use SIMD mean-pooling");
-        }
-
-        let normalize = config.normalize;
-        info!(
-            "Embedder ready (normalize={}, cuda_graph={}, pooled={})",
-            normalize, config.enable_cuda_graph, model_is_pooled
-        );
+        info!("Embedder ready (cuda_graph={})", config.enable_cuda_graph);
 
         Ok(Self {
             ctx: Mutex::new(InferenceCtx {
@@ -764,11 +569,9 @@ impl OrtEmbedder {
                 pinned_input_alloc,
                 pinned_output_alloc,
                 session,
-                model_is_pooled,
                 output_name,
             }),
             tokenizer,
-            normalize,
             config,
         })
     }
@@ -809,7 +612,7 @@ impl OrtEmbedder {
 
         let batch = tokenize_batch(&self.tokenizer, texts)?;
         let mut ctx = self.ctx.lock();
-        ort_infer(&mut ctx, batch, self.normalize)
+        ort_infer(&mut ctx, batch)
     }
 
     /// Embed a batch of text strings, returning f16 embeddings (for storage).
@@ -886,7 +689,7 @@ impl OrtEmbedder {
                 let batch = rx.recv().map_err(|_| {
                     EmbedderError::EmbedError("Tokenization channel closed".into())
                 })??;
-                let embeddings = ort_infer(&mut ctx, batch, self.normalize)?;
+                let embeddings = ort_infer(&mut ctx, batch)?;
                 all_embeddings.extend(embeddings);
             }
         } // Mutex released before joining the tokenization thread.
@@ -945,7 +748,6 @@ mod tests {
     fn test_config_default() {
         let config = EmbedderConfig::default();
         assert_eq!(config.model_repo, DEFAULT_EMBEDDING_REPO);
-        assert!(config.normalize);
         assert_eq!(config.cuda_device, 0);
         assert_eq!(
             config.onnx_model_path,
@@ -959,35 +761,6 @@ mod tests {
         let placeholder = placeholder_embedding(1024);
         assert_eq!(placeholder.len(), 1024);
         assert!(placeholder.iter().all(|&v| v == f16::ZERO));
-    }
-
-    #[test]
-    fn test_mean_pool_simd_matches_scalar() {
-        // Verify SIMD and scalar implementations produce identical results.
-        let batch_size = 4;
-        let seq_len = 6;
-        let hidden_dim = 16; // divisible by 8
-        let total = batch_size * seq_len * hidden_dim;
-        let hidden: Vec<f32> = (0..total).map(|i| (i as f32) * 0.01).collect();
-        let mask: Vec<i64> = (0..batch_size * seq_len)
-            .map(|i| if i % seq_len < 4 { 1 } else { 0 })
-            .collect();
-
-        let simd_result = mean_pool_and_normalize_simd(
-            &hidden, &mask, batch_size, seq_len, hidden_dim, true,
-        );
-        let scalar_result = mean_pool_and_normalize_scalar(
-            &hidden, &mask, batch_size, seq_len, hidden_dim, true,
-        );
-
-        for (s, sc) in simd_result.iter().zip(scalar_result.iter()) {
-            for (a, b) in s.iter().zip(sc.iter()) {
-                assert!(
-                    (a - b).abs() < 1e-5,
-                    "SIMD vs scalar mismatch: {a} vs {b}"
-                );
-            }
-        }
     }
 
     // ========================================================================

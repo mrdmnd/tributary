@@ -22,7 +22,6 @@ thiserror = "2.0.18"
 tokenizers = { version = "0.22.2", features = ["hf-hub"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-wide = "1.1.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

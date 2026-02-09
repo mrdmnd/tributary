@@ -15,10 +15,14 @@ This script:
    layer normalization fusion, etc.) at level O2.
 3. Converts the optimized model to FP16 for faster inference on GPUs with
    tensor cores.
-4. Fuses mean-pooling + L2 normalisation into the graph so the model outputs
-   [batch_size, 768] embeddings directly (instead of [batch_size, seq_len, 768]
-   hidden states).  This eliminates CPU-side pooling and reduces the GPU→CPU
-   output transfer by ~10x.
+4. Post-processes the graph:
+   a. **INT32 inputs** — removes the three INT64→INT32 Cast nodes inserted by
+      the ORT optimizer and changes the model inputs to INT32 directly, halving
+      host→device input transfer size.
+   b. **FP16 pooling** — fuses mean-pooling + L2 normalisation into the graph,
+      running entirely in FP16.  A single FP16→FP32 cast is applied only on the
+      reduced ``[B, 768]`` output, avoiding a costly ``[B, S, 768]`` FP32
+      materialisation that the previous approach required.
 
 The resulting model can be used with the ORT backend in tributary.
 
@@ -31,7 +35,8 @@ The output directory will contain:
     model.onnx              - Base ONNX model (FP32)
     model_opt.onnx          - Optimized model (FP32, fused attention)
     model_fp16.onnx         - Optimized model (FP16, fused attention)
-    model_fp16_pooled.onnx  - Optimized model (FP16, fused attention, fused pooling)
+    model_fp16_pooled.onnx  - Final model (FP16 backbone, INT32 inputs,
+                              fused FP16 pooling)
 """
 
 import argparse
@@ -41,12 +46,74 @@ from pathlib import Path
 import numpy as np
 
 
-def fuse_mean_pool_l2_norm(input_path: str, output_path: str) -> None:
-    """Append mean-pooling + L2 normalisation to an ONNX transformer model.
+def optimize_inputs(model) -> None:
+    """Optimize model inputs **in-place**.
+
+    Args:
+        model: An ``onnx.ModelProto`` loaded via ``onnx.load``.
+
+    **INT64 → INT32**: removes the three ``Cast`` nodes inserted by the ORT
+    transformer optimizer and changes the model input declarations to INT32.
+    This halves the host→device input transfer size.
+
+    ``token_type_ids`` is kept as a model input (INT32) rather than replaced
+    with a graph-computed constant.  Although it's always zero for single-
+    segment models like BGE, a ``ConstantOfShape`` node would allocate a fresh
+    ``[B, S]`` tensor on every inference call (ORT cannot cache it for dynamic
+    shapes).  The Rust side handles this more efficiently: a pre-allocated
+    pinned tensor zeroed with a single ``memset``.
+    """
+    from onnx import TensorProto
+
+    graph = model.graph
+
+    # ── Remove INT64 → INT32 Cast nodes ─────────────────────────────────
+    input_names = {"input_ids", "attention_mask", "token_type_ids"}
+    cast_nodes_to_remove = []
+    cast_remap: dict[str, str] = {}  # cast_output → original_input
+
+    for node in graph.node:
+        if (
+            node.op_type == "Cast"
+            and len(node.input) == 1
+            and node.input[0] in input_names
+        ):
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i == TensorProto.INT32:
+                    cast_nodes_to_remove.append(node)
+                    cast_remap[node.output[0]] = node.input[0]
+
+    for node in cast_nodes_to_remove:
+        graph.node.remove(node)
+        print(f"    Removed INT64→INT32 Cast: {node.input[0]}")
+
+    # Rewrite downstream consumers to reference the (now-INT32) inputs.
+    for node in graph.node:
+        for i, inp in enumerate(node.input):
+            if inp in cast_remap:
+                node.input[i] = cast_remap[inp]
+
+    # Change input type declarations from INT64 → INT32.
+    for inp in graph.input:
+        if inp.name in input_names:
+            inp.type.tensor_type.elem_type = TensorProto.INT32
+
+
+def fuse_mean_pool_l2_norm(model) -> None:
+    """Append mean-pooling + L2 normalisation to an ONNX transformer model
+    **in-place**.
+
+    Args:
+        model: An ``onnx.ModelProto`` loaded via ``onnx.load``.
 
     Transforms the graph so that:
       - Old output  ``last_hidden_state  [B, S, 768]``
       - New output  ``embeddings         [B, 768]``
+
+    The pooling operations run entirely in **FP16** to avoid materialising
+    the full ``[B, S, 768]`` tensor in FP32.  A single FP16→FP32 cast is
+    applied only on the reduced ``[B, 768]`` output — saving ~2× memory
+    bandwidth through the reduction.
 
     The ``attention_mask`` model input (already present) is reused as the
     pooling weight.
@@ -54,15 +121,13 @@ def fuse_mean_pool_l2_norm(input_path: str, output_path: str) -> None:
     All new ops use **opset 17** conventions (axes-as-input for ReduceSum /
     Unsqueeze).
     """
-    import onnx
     from onnx import TensorProto, helper, numpy_helper
 
-    model = onnx.load(input_path)
     graph = model.graph
 
     # ── Identify the existing output and attention_mask input ────────────
     assert len(graph.output) >= 1, "Model must have at least one output"
-    hidden_output_name = graph.output[0].name  # e.g. "last_hidden_state"
+    old_output_name = graph.output[0].name  # e.g. "last_hidden_state"
 
     attn_mask_input = None
     for inp in graph.input:
@@ -70,6 +135,28 @@ def fuse_mean_pool_l2_norm(input_path: str, output_path: str) -> None:
             attn_mask_input = inp
             break
     assert attn_mask_input is not None, "Model must have an 'attention_mask' input"
+
+    # ── Tap the FP16 tensor before the keep_io_types Cast ───────────────
+    # convert_float_to_float16(keep_io_types=True) inserts a Cast(FP16→FP32)
+    # at the output.  We remove it and feed the FP16 tensor directly into the
+    # pooling ops, casting to FP32 only on the much smaller [B, 768] result.
+    fp16_hidden_name = None
+    cast_to_remove = None
+    for node in graph.node:
+        if node.op_type == "Cast" and old_output_name in node.output:
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i == TensorProto.FLOAT:
+                    fp16_hidden_name = node.input[0]
+                    cast_to_remove = node
+                    break
+
+    if fp16_hidden_name is not None:
+        graph.node.remove(cast_to_remove)
+        print(f"    Removed FP16→FP32 Cast on [B, S, 768] ('{cast_to_remove.name}')")
+    else:
+        # No cast found — model output is already FP16 or FP32 directly.
+        fp16_hidden_name = old_output_name
+        print("    Warning: no FP16→FP32 Cast found; pooling in output dtype")
 
     # ── Constant tensors (axes, epsilon) ────────────────────────────────
     # Unsqueeze axes = [2]  (expand [B,S] → [B,S,1])
@@ -80,12 +167,13 @@ def fuse_mean_pool_l2_norm(input_path: str, output_path: str) -> None:
     reduce_axes = numpy_helper.from_array(
         np.array([1], dtype=np.int64), name="pool_reduce_axes"
     )
-    # Clip min = 1e-7  (avoid division by zero)
+    # Clip min in FP16 — use 1e-4 (safely in the FP16 normal range; smaller
+    # values like 1e-7 fall into subnormal territory and some GPUs flush
+    # subnormals to zero).  The mask sum is always >= 1 for valid inputs,
+    # so this is purely a safety net.
     clip_min = numpy_helper.from_array(
-        np.array(1e-7, dtype=np.float32), name="pool_clip_min"
+        np.array(1e-4, dtype=np.float16), name="pool_clip_min"
     )
-    # Clip has an optional max — we leave it empty (unused).
-    clip_max_name = ""
 
     graph.initializer.extend([unsqueeze_axes, reduce_axes, clip_min])
 
@@ -102,28 +190,28 @@ def fuse_mean_pool_l2_norm(input_path: str, output_path: str) -> None:
         )
     )
 
-    # 2. Cast mask from INT64 → FLOAT
+    # 2. Cast mask to FP16 (not FP32 — pooling runs in FP16)
     new_nodes.append(
         helper.make_node(
             "Cast",
             inputs=["pool_mask_3d"],
-            outputs=["pool_mask_float"],
+            outputs=["pool_mask_fp16"],
             name="pool_Cast",
-            to=TensorProto.FLOAT,
+            to=TensorProto.FLOAT16,
         )
     )
 
-    # 3. Mul: hidden_states * mask → zero out padding positions
+    # 3. Mul: hidden_states * mask (both FP16) → zero out padding positions
     new_nodes.append(
         helper.make_node(
             "Mul",
-            inputs=[hidden_output_name, "pool_mask_float"],
+            inputs=[fp16_hidden_name, "pool_mask_fp16"],
             outputs=["pool_masked_hidden"],
             name="pool_Mul",
         )
     )
 
-    # 4. ReduceSum(masked_hidden, axes=[1], keepdims=0) → [B, H]
+    # 4. ReduceSum(masked_hidden, axes=[1], keepdims=0) → [B, H] FP16
     new_nodes.append(
         helper.make_node(
             "ReduceSum",
@@ -134,28 +222,28 @@ def fuse_mean_pool_l2_norm(input_path: str, output_path: str) -> None:
         )
     )
 
-    # 5. ReduceSum(float_mask, axes=[1], keepdims=0) → [B, 1]
+    # 5. ReduceSum(mask_fp16, axes=[1], keepdims=0) → [B, 1] FP16
     new_nodes.append(
         helper.make_node(
             "ReduceSum",
-            inputs=["pool_mask_float", "pool_reduce_axes"],
+            inputs=["pool_mask_fp16", "pool_reduce_axes"],
             outputs=["pool_mask_sum"],
             name="pool_ReduceSum_mask",
             keepdims=0,
         )
     )
 
-    # 6. Clip mask_sum >= 1e-7
+    # 6. Clip mask_sum >= 1e-4 (FP16 — avoids div-by-zero)
     new_nodes.append(
         helper.make_node(
             "Clip",
-            inputs=["pool_mask_sum", "pool_clip_min", clip_max_name],
+            inputs=["pool_mask_sum", "pool_clip_min", ""],
             outputs=["pool_mask_clamped"],
             name="pool_Clip",
         )
     )
 
-    # 7. Div: mean pooling
+    # 7. Div: mean pooling (FP16)
     new_nodes.append(
         helper.make_node(
             "Div",
@@ -165,15 +253,70 @@ def fuse_mean_pool_l2_norm(input_path: str, output_path: str) -> None:
         )
     )
 
-    # 8. LpNormalization (L2, axis=1)
+    # 8–12. Manual L2 normalisation (replaces LpNormalization which lacks
+    #        a CUDA EP kernel and would force a GPU→CPU→GPU bounce).
+    #        All primitives (Mul, ReduceSum, Sqrt, Clip, Div) have FP16
+    #        CUDA kernels.
+
+    # 8. Square: pool_mean² → [B, 768] FP16
     new_nodes.append(
         helper.make_node(
-            "LpNormalization",
-            inputs=["pool_mean"],
+            "Mul",
+            inputs=["pool_mean", "pool_mean"],
+            outputs=["pool_squared"],
+            name="pool_Square",
+        )
+    )
+
+    # 9. ReduceSum(squared, axis=1, keepdims=1) → [B, 1] FP16
+    new_nodes.append(
+        helper.make_node(
+            "ReduceSum",
+            inputs=["pool_squared", "pool_reduce_axes"],
+            outputs=["pool_sum_sq"],
+            name="pool_ReduceSum_sq",
+            keepdims=1,
+        )
+    )
+
+    # 10. Sqrt → L2 norm per row → [B, 1] FP16
+    new_nodes.append(
+        helper.make_node(
+            "Sqrt",
+            inputs=["pool_sum_sq"],
+            outputs=["pool_l2_raw"],
+            name="pool_Sqrt",
+        )
+    )
+
+    # 11. Clip L2 norm ≥ 1e-4 (reuse pool_clip_min; avoids div-by-zero)
+    new_nodes.append(
+        helper.make_node(
+            "Clip",
+            inputs=["pool_l2_raw", "pool_clip_min", ""],
+            outputs=["pool_l2_safe"],
+            name="pool_ClipL2",
+        )
+    )
+
+    # 12. Div: normalise → [B, 768] FP16 (broadcasts [B, 1])
+    new_nodes.append(
+        helper.make_node(
+            "Div",
+            inputs=["pool_mean", "pool_l2_safe"],
+            outputs=["pool_norm_fp16"],
+            name="pool_DivNorm",
+        )
+    )
+
+    # 13. Cast FP16 → FP32 on the reduced [B, 768] only (not [B, S, 768]!)
+    new_nodes.append(
+        helper.make_node(
+            "Cast",
+            inputs=["pool_norm_fp16"],
             outputs=["embeddings"],
-            name="pool_LpNorm",
-            axis=1,
-            p=2,
+            name="pool_CastOutput",
+            to=TensorProto.FLOAT,
         )
     )
 
@@ -190,9 +333,7 @@ def fuse_mean_pool_l2_norm(input_path: str, output_path: str) -> None:
         )
     )
 
-    # ── Validate and save ───────────────────────────────────────────────
-    onnx.checker.check_model(model)
-    onnx.save(model, output_path)
+    print("    Fused FP16 mean-pooling + L2 norm → [B, 768] FP32 output")
 
 
 def main():
@@ -235,7 +376,7 @@ def main():
     parser.add_argument(
         "--skip-fuse-pooling",
         action="store_true",
-        help="Skip fusing mean-pooling + L2 normalisation into the model",
+        help="Skip post-processing (input optimization + pooling fusion)",
     )
     args = parser.parse_args()
 
@@ -304,19 +445,26 @@ def main():
         fp16_path = opt_path
         print("\n  Skipping FP16 conversion (--skip-fp16)")
 
-    # ── Step 4: Fuse mean-pooling + L2 norm ─────────────────────────────
+    # ── Step 4: Post-processing (input optimization + pooling fusion) ───
     if not args.skip_fuse_pooling:
         print(f"\n{'=' * 60}")
-        print("Step 4: Fusing mean-pooling + L2 normalisation")
+        print("Step 4: Post-processing (input optimization + pooling fusion)")
         print(f"{'=' * 60}")
 
+        import onnx
+
+        post_model = onnx.load(str(fp16_path))
+        optimize_inputs(post_model)
+        fuse_mean_pool_l2_norm(post_model)
+
         pooled_path = output_dir / "model_fp16_pooled.onnx"
-        fuse_mean_pool_l2_norm(str(fp16_path), str(pooled_path))
-        print(f"  Pooled model saved to: {pooled_path}")
+        onnx.checker.check_model(post_model)
+        onnx.save(post_model, str(pooled_path))
+        print(f"  Final model saved to: {pooled_path}")
         print(f"  Size: {os.path.getsize(pooled_path) / 1024 / 1024:.1f} MB")
         fp16_path = pooled_path
     else:
-        print("\n  Skipping pooling fusion (--skip-fuse-pooling)")
+        print("\n  Skipping post-processing (--skip-fuse-pooling)")
 
     # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
