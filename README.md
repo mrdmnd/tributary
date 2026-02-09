@@ -7,16 +7,16 @@ OPINIONATED: Assumes a modern (Blackwell+) NVIDIA setup with CUDA 13 or better.
 ## Prerequisites
 
 - **BLACKWELL GPU** with CUDA 13+ drivers
-- **[uv](https://docs.astral.sh/uv/)** (for running the ONNX export script)
+- **[uv](https://docs.astral.sh/uv/)** (only needed for the ONNX export script)
 
 
-## Setup
+## Embedding
 
-The database preprocessing binary uses a high-performance local embedding library based on ONNX and BGE-base-en-v1.5.
+The embedder uses ONNX Runtime with CUDA EP for GPU-accelerated text embeddings.
 
-You need to set this up:
+### Setup
 
-### 1. Download the ONNX Runtime CUDA 13 binary
+1. **Download the ONNX Runtime CUDA 13 binary:**
 
 ```bash
 mkdir -p ort/ort-libs && cd ort/ort-libs
@@ -26,14 +26,9 @@ tar xzf ort-cuda13.tgz
 cd ../..
 ```
 
-The library path is configured automatically via `.cargo/config.toml` — no
-environment variables needed.
+The library path is configured automatically via `.cargo/config.toml`.
 
-### 2. Export the ONNX model
-
-The embedding model (BGE-base-en-v1.5) must be exported to an optimized FP16
-ONNX format before use. This applies BERT-specific graph fusions (fused
-attention, layer norm, etc.) and FP16 conversion for tensor core acceleration.
+2. **Export the ONNX model:**
 
 ```bash
 uv run ort/scripts/export_onnx.py
@@ -41,7 +36,7 @@ uv run ort/scripts/export_onnx.py
 
 This creates `ort/models/bge-base-en-v1.5-onnx/model_fp16.onnx` (~208 MB).
 
-### 3. Build and run
+3. **Build:**
 
 ```bash
 cargo build --release

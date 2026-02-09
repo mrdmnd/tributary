@@ -9,10 +9,6 @@
 //! # Running
 //!
 //! ```sh
-//! # Make sure ORT_DYLIB_PATH is set to the CUDA 13 ORT library:
-//! export ORT_DYLIB_PATH=/path/to/ort/ort-libs/onnxruntime-linux-x64-gpu-1.24.1/lib/libonnxruntime.so.1.24.1
-//! export LD_LIBRARY_PATH=/path/to/ort/ort-libs/onnxruntime-linux-x64-gpu-1.24.1/lib:$LD_LIBRARY_PATH
-//!
 //! cargo bench --bench embedder_throughput
 //! ```
 //!
@@ -40,10 +36,10 @@
 //! sudo nvidia-smi -rpl
 //! ```
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput};
 use rand::Rng;
 use rand_distr::LogNormal;
-use tributary::embedder::{DEFAULT_EMBEDDING_REPO, Embedder, EmbedderConfig};
+use tributary::embedder::{DEFAULT_EMBEDDING_REPO, EmbedderConfig, OrtEmbedder};
 
 // ============================================================================
 // Test data generators
@@ -130,18 +126,29 @@ fn generate_mixed_length_strings(count: usize, max_words: usize) -> Vec<String> 
         .collect()
 }
 
+/// Load a tokenizer (for counting tokens in the mixed-length benchmark).
+fn load_tokenizer() -> tokenizers::Tokenizer {
+    let api = hf_hub::api::sync::Api::new().unwrap();
+    let repo = api.repo(hf_hub::Repo::new(
+        DEFAULT_EMBEDDING_REPO.to_string(),
+        hf_hub::RepoType::Model,
+    ));
+    let path = repo.get("tokenizer.json").unwrap();
+    tokenizers::Tokenizer::from_file(&path).unwrap()
+}
+
 // ============================================================================
-// Benchmark helpers
+// ORT Benchmarks
 // ============================================================================
 
 /// Resolve the ONNX model path from the environment or use the default.
 fn ort_model_path() -> String {
     std::env::var("ONNX_MODEL_PATH")
-        .unwrap_or_else(|_| "ort/models/bge-base-en-v1.5-onnx/model_fp16.onnx".to_string())
+        .unwrap_or_else(|_| "ort/models/bge-base-en-v1.5-onnx/model_fp16_pooled.onnx".to_string())
 }
 
-/// Create an embedder, or panic with a helpful message if the model is missing.
-fn create_embedder() -> Embedder {
+/// Create an ORT embedder, or panic with a helpful message if the model is missing.
+fn create_ort_embedder() -> OrtEmbedder {
     let path = ort_model_path();
     if !std::path::Path::new(&path).exists() {
         panic!(
@@ -150,29 +157,23 @@ fn create_embedder() -> Embedder {
             path
         );
     }
-    Embedder::new(EmbedderConfig::default().with_onnx_model(&path))
-        .expect("Failed to create embedder")
+    OrtEmbedder::new(EmbedderConfig::default().with_onnx_model(&path))
+        .expect("Failed to create ORT embedder")
 }
 
-// ============================================================================
-// Benchmarks
-// ============================================================================
-
-/// Sweep `chunk_size` (the GPU batch size) with a fixed corpus of short
-/// strings.  This reveals the GPU saturation curve and is the most actionable
-/// benchmark for tuning `DEFAULT_BATCH_SIZE`.
 fn bench_chunk_size_sweep(c: &mut Criterion) {
-    let num_strings = 5_000;
+    let num_strings = 8_192;
     let strings = generate_short_strings(num_strings);
     let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
 
-    let embedder = create_embedder();
+    let embedder = create_ort_embedder();
 
     let mut group = c.benchmark_group("chunk_size_sweep");
+    group.sample_size(50);
     group.noise_threshold(0.05);
     group.throughput(Throughput::Elements(num_strings as u64));
 
-    for chunk_size in [128, 256, 512, 1024, 2048, 4096] {
+    for chunk_size in [512, 1024, 2048, 4096, 8192] {
         group.bench_with_input(
             BenchmarkId::new("embed_batch_chunked", chunk_size),
             &chunk_size,
@@ -184,25 +185,10 @@ fn bench_chunk_size_sweep(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark with a realistic mixed-length corpus (log-normal token-length
-/// distribution).  Reports throughput in tokens/sec so we can see how padding
-/// overhead and variable sequence lengths affect real-world performance.
 fn bench_mixed_length(c: &mut Criterion) {
-    // Load the tokenizer separately so we can count tokens for the throughput
-    // metric without including tokenizer load time in the measurement.
-    let tokenizer = {
-        let api = hf_hub::api::sync::Api::new().unwrap();
-        let repo = api.repo(hf_hub::Repo::new(
-            DEFAULT_EMBEDDING_REPO.to_string(),
-            hf_hub::RepoType::Model,
-        ));
-        let path = repo.get("tokenizer.json").unwrap();
-        tokenizers::Tokenizer::from_file(&path).unwrap()
-    };
+    let tokenizer = load_tokenizer();
 
-    let num_strings = 5_000;
-    // Cap word count so that after tokenization we stay within BERT's 512
-    // token limit.  ~60 words ≈ ~80-100 tokens with BPE.
+    let num_strings = 8_192;
     let strings = generate_mixed_length_strings(num_strings, 60);
     let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
 
@@ -211,12 +197,16 @@ fn bench_mixed_length(c: &mut Criterion) {
         .map(|s| tokenizer.encode(s.as_str(), true).unwrap().get_ids().len())
         .sum();
 
-    let embedder = create_embedder();
+    let embedder = create_ort_embedder();
 
     let mut group = c.benchmark_group("mixed_length");
+    group.sample_size(10);
     group.noise_threshold(0.05);
     group.throughput(Throughput::Elements(total_tokens as u64));
 
+    // Keep chunk sizes ≤ 2048 for mixed-length strings — larger chunks
+    // cause catastrophic padding waste because the longest string in the
+    // chunk determines seq_len for the entire batch.
     for chunk_size in [256, 512, 1024, 2048] {
         group.bench_with_input(
             BenchmarkId::new("embed_batch_chunked", chunk_size),
@@ -229,14 +219,18 @@ fn bench_mixed_length(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group! {
-    name = benches;
-    config = Criterion::default()
-        // Each iteration runs a full GPU batch, so we don't need many samples.
-        .sample_size(10)
-        // Give the GPU time to stabilize.
+// ============================================================================
+// Criterion main
+// ============================================================================
+
+fn main() {
+    let mut criterion = Criterion::default()
         .warm_up_time(std::time::Duration::from_secs(3))
-        .measurement_time(std::time::Duration::from_secs(20));
-    targets = bench_chunk_size_sweep, bench_mixed_length
+        .measurement_time(std::time::Duration::from_secs(15))
+        .configure_from_args();
+
+    bench_chunk_size_sweep(&mut criterion);
+    bench_mixed_length(&mut criterion);
+
+    criterion.final_summary();
 }
-criterion_main!(benches);
