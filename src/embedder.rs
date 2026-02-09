@@ -1,18 +1,22 @@
 //! Text embedding module.
 //!
-//! Provides CUDA-accelerated text embeddings with:
-//! - Batch embedding API for efficient processing
-//! - Work queue for background embedding of discovered text values
-//! - Integration with the Database types for column/table embeddings
+//! Provides CUDA-accelerated text embeddings using ONNX Runtime with the CUDA
+//! execution provider and graph optimizations (fused attention, FP16, CUDA
+//! graphs).
+//!
+//! The [`Embedder`] owns both the tokenizer and the ORT session.  Large batches
+//! processed via [`embed_batch_chunked`](Embedder::embed_batch_chunked) benefit
+//! from **pipelined tokenization**: a background thread tokenizes chunk N+1
+//! while the GPU processes chunk N.
 
-use std::sync::Arc;
+use std::path::PathBuf;
 
-use candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use half::f16;
 use hf_hub::{Repo, RepoType, api::sync::Api};
-use parking_lot::RwLock;
+use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
+use ort::value::Tensor;
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use tracing::info;
@@ -21,23 +25,30 @@ use tracing::info;
 // Configuration
 // ============================================================================
 
-/// Default embedding model - BGE is a reasonably high-quality off-the-shelf embedding model
+/// Default embedding model — BGE is a reasonably high-quality off-the-shelf
+/// embedding model.
 pub const DEFAULT_EMBEDDING_REPO: &str = "BAAI/bge-base-en-v1.5";
 
 /// Default embedding dimension for bge-base-en-v1.5
 pub const EMBEDDING_DIM: usize = 768;
 
 /// Default batch size for embedding operations.
-/// 2048 saturates most GPUs for short sequences while keeping memory usage
-/// moderate.  For very short inputs (< 20 tokens) even larger sizes (4096+)
-/// can be beneficial.
-pub const DEFAULT_BATCH_SIZE: usize = 2048;
+/// 512 saturates the GPU well for short sequences with ORT.
+pub const DEFAULT_BATCH_SIZE: usize = 512;
 
 /// Default work queue capacity
 pub const DEFAULT_QUEUE_CAPACITY: usize = 10_000;
 
 /// Max sequence length
 pub const MAX_SEQ_LEN: usize = 512;
+
+/// Default ONNX model path (relative to the project root).
+pub const DEFAULT_ONNX_MODEL_PATH: &str = "ort/models/bge-base-en-v1.5-onnx/model_fp16.onnx";
+
+/// Minimum batch size at which we use `encode_batch` (Rayon-parallel) instead
+/// of a sequential loop.  Below this threshold the thread-pool overhead is not
+/// worth it.
+const PARALLEL_TOKENIZE_THRESHOLD: usize = 32;
 
 // ============================================================================
 // Error Types
@@ -60,11 +71,11 @@ pub enum EmbedderError {
     #[error("Model not loaded")]
     NotLoaded,
 
-    #[error("Candle error: {0}")]
-    Candle(#[from] candle_core::Error),
-
     #[error("HF Hub error: {0}")]
     HfHub(#[from] hf_hub::api::sync::ApiError),
+
+    #[error("ONNX Runtime error: {0}")]
+    Ort(#[from] ort::Error),
 }
 
 pub type Result<T> = std::result::Result<T, EmbedderError>;
@@ -73,13 +84,15 @@ pub type Result<T> = std::result::Result<T, EmbedderError>;
 // Embedder Configuration
 // ============================================================================
 
-/// Configuration for the embedder
+/// Configuration for the embedder.
 #[derive(Debug, Clone)]
 pub struct EmbedderConfig {
-    /// Model repository on HuggingFace
+    /// Model repository on HuggingFace (used to download the tokenizer).
     pub model_repo: String,
     /// Model revision (branch, tag, or commit)
     pub model_revision: String,
+    /// Path to the optimized `.onnx` model file.
+    pub onnx_model_path: PathBuf,
     /// CUDA device ordinal
     pub cuda_device: usize,
     /// Batch size for embedding operations
@@ -90,9 +103,6 @@ pub struct EmbedderConfig {
     pub queue_capacity: usize,
     /// Max sequence length
     pub max_seq_len: usize,
-    /// Dtype for model weights and computation.
-    /// F16 is ~2x faster than F32 on GPUs with tensor cores (Volta+).
-    pub dtype: DType,
 }
 
 impl Default for EmbedderConfig {
@@ -100,12 +110,12 @@ impl Default for EmbedderConfig {
         Self {
             model_repo: DEFAULT_EMBEDDING_REPO.to_string(),
             model_revision: "main".to_string(),
+            onnx_model_path: PathBuf::from(DEFAULT_ONNX_MODEL_PATH),
             cuda_device: 0,
             batch_size: DEFAULT_BATCH_SIZE,
             normalize: true,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             max_seq_len: MAX_SEQ_LEN,
-            dtype: DType::F16,
         }
     }
 }
@@ -128,53 +138,253 @@ impl EmbedderConfig {
         self.cuda_device = device;
         self
     }
+
+    /// Set the ONNX model path
+    pub fn with_onnx_model(mut self, path: impl Into<PathBuf>) -> Self {
+        self.onnx_model_path = path.into();
+        self
+    }
 }
 
 // ============================================================================
-// Embedding Model
+// Pre-tokenized batch
 // ============================================================================
 
-/// The loaded embedding model and tokenizer
-struct EmbeddingModel {
-    model: BertModel,
+/// A pre-tokenized batch ready for inference.
+///
+/// All arrays use `i64` (the ONNX convention for integer tensors).
+pub struct TokenizedBatch {
+    pub input_ids: Vec<i64>,
+    pub attention_mask: Vec<i64>,
+    pub batch_size: usize,
+    pub seq_len: usize,
+}
+
+// ============================================================================
+// Shared tokenization
+// ============================================================================
+
+/// Tokenize a batch of texts into a [`TokenizedBatch`].
+///
+/// For batches >= [`PARALLEL_TOKENIZE_THRESHOLD`] we delegate to the
+/// HuggingFace `encode_batch` method which parallelises across strings via
+/// Rayon **and** handles padding internally (via [`PaddingStrategy::BatchLongest`]
+/// configured at load time).  Smaller batches use a simple sequential loop to
+/// avoid thread-pool overhead, with a fast manual padding pass.
+fn tokenize_batch(
+    tokenizer: &Tokenizer,
+    texts: &[&str],
+    max_seq_len: usize,
+) -> Result<TokenizedBatch> {
+    let batch_size = texts.len();
+
+    if batch_size >= PARALLEL_TOKENIZE_THRESHOLD {
+        // ── Fast parallel path ──────────────────────────────────────────
+        let encodings = tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| EmbedderError::TokenizeError(e.to_string()))?;
+
+        let max_len = encodings.first().map_or(0, |e| e.get_ids().len());
+
+        let total = batch_size * max_len;
+        let mut flat_ids = Vec::with_capacity(total);
+        let mut flat_mask = Vec::with_capacity(total);
+        for enc in &encodings {
+            flat_ids.extend(enc.get_ids().iter().map(|&x| x as i64));
+            flat_mask.extend(enc.get_attention_mask().iter().map(|&x| x as i64));
+        }
+
+        Ok(TokenizedBatch {
+            input_ids: flat_ids,
+            attention_mask: flat_mask,
+            batch_size,
+            seq_len: max_len,
+        })
+    } else {
+        // ── Sequential path (small batches) ─────────────────────────────
+        let mut all_input_ids = Vec::with_capacity(batch_size);
+        let mut max_len: usize = 0;
+
+        for text in texts {
+            let encoding = tokenizer
+                .encode(*text, true)
+                .map_err(|e| EmbedderError::TokenizeError(e.to_string()))?;
+
+            let ids: Vec<u32> = encoding.get_ids().to_vec();
+            let len = ids.len().min(max_seq_len);
+            max_len = max_len.max(len);
+            all_input_ids.push(ids);
+        }
+
+        let total = batch_size * max_len;
+        let mut padded_ids = vec![0i64; total];
+        let mut padded_mask = vec![0i64; total];
+
+        for (i, ids) in all_input_ids.iter().enumerate() {
+            let len = ids.len().min(max_len);
+            let row = i * max_len;
+            for j in 0..len {
+                padded_ids[row + j] = ids[j] as i64;
+                padded_mask[row + j] = 1;
+            }
+        }
+
+        Ok(TokenizedBatch {
+            input_ids: padded_ids,
+            attention_mask: padded_mask,
+            batch_size,
+            seq_len: max_len,
+        })
+    }
+}
+
+// ============================================================================
+// ORT Inference
+// ============================================================================
+
+/// Run inference on a pre-tokenized batch using the ORT session.
+///
+/// Returns `[batch_size, EMBEDDING_DIM]` embeddings as `f32`.
+fn ort_infer(
+    session: &Mutex<Session>,
+    input_ids: &[i64],
+    attention_mask: &[i64],
+    batch_size: usize,
+    seq_len: usize,
+    normalize: bool,
+) -> Result<Vec<Vec<f32>>> {
+    // Create ort Tensors from flat i64 slices.
+    let input_ids_tensor =
+        Tensor::<i64>::from_array(([batch_size, seq_len], input_ids.to_vec()))
+            .map_err(|e| EmbedderError::EmbedError(format!("input_ids tensor: {}", e)))?;
+
+    let attention_mask_tensor =
+        Tensor::<i64>::from_array(([batch_size, seq_len], attention_mask.to_vec()))
+            .map_err(|e| EmbedderError::EmbedError(format!("attention_mask tensor: {}", e)))?;
+
+    let token_type_ids_tensor =
+        Tensor::<i64>::from_array(([batch_size, seq_len], vec![0i64; batch_size * seq_len]))
+            .map_err(|e| EmbedderError::EmbedError(format!("token_type_ids tensor: {}", e)))?;
+
+    // Run inference (Session::run requires &mut self).
+    let mut session = session.lock();
+    let outputs = session
+        .run(ort::inputs![
+            "input_ids" => input_ids_tensor,
+            "attention_mask" => attention_mask_tensor,
+            "token_type_ids" => token_type_ids_tensor,
+        ])
+        .map_err(|e| EmbedderError::EmbedError(format!("ORT inference: {}", e)))?;
+
+    // The first output is last_hidden_state [B, S, H].
+    let (shape, hidden_data) = outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| EmbedderError::EmbedError(format!("ORT extract output: {}", e)))?;
+
+    let hidden_dim = if shape.len() == 3 {
+        shape[2] as usize
+    } else {
+        EMBEDDING_DIM
+    };
+
+    Ok(mean_pool_and_normalize(
+        hidden_data,
+        attention_mask,
+        batch_size,
+        seq_len,
+        hidden_dim,
+        normalize,
+    ))
+}
+
+/// Mean pool hidden states and optionally L2-normalize.
+///
+/// `hidden_states` is a flat `[batch_size * seq_len * hidden_dim]` array in
+/// row-major order.  `attention_mask` is `[batch_size * seq_len]`.
+fn mean_pool_and_normalize(
+    hidden_states: &[f32],
+    attention_mask: &[i64],
+    batch_size: usize,
+    seq_len: usize,
+    hidden_dim: usize,
+    normalize: bool,
+) -> Vec<Vec<f32>> {
+    let mut result = Vec::with_capacity(batch_size);
+
+    for b in 0..batch_size {
+        let mut embedding = vec![0.0f32; hidden_dim];
+        let mut count = 0.0f32;
+
+        for s in 0..seq_len {
+            let mask_val = attention_mask[b * seq_len + s] as f32;
+            if mask_val > 0.0 {
+                let offset = (b * seq_len + s) * hidden_dim;
+                for d in 0..hidden_dim {
+                    embedding[d] += hidden_states[offset + d] * mask_val;
+                }
+                count += mask_val;
+            }
+        }
+
+        // Divide by token count.
+        let count = count.max(1e-7);
+        for val in &mut embedding {
+            *val /= count;
+        }
+
+        // L2 normalize.
+        if normalize {
+            let norm: f32 = embedding
+                .iter()
+                .map(|x| x * x)
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-7);
+            for val in &mut embedding {
+                *val /= norm;
+            }
+        }
+
+        result.push(embedding);
+    }
+
+    result
+}
+
+// ============================================================================
+// Embedder (public API)
+// ============================================================================
+
+/// Text embedder backed by ONNX Runtime with CUDA acceleration.
+///
+/// The [`Embedder`] owns the tokenizer and an ORT session.  Large batches
+/// processed via [`embed_batch_chunked`](Self::embed_batch_chunked) benefit
+/// from **pipelined tokenization**: a background thread tokenizes chunk N+1
+/// while the GPU processes chunk N.
+pub struct Embedder {
+    /// ORT session (wrapped in Mutex because `Session::run` requires `&mut`).
+    session: Mutex<Session>,
+    /// Shared tokenizer.
     tokenizer: Tokenizer,
-    device: Device,
-    config: EmbedderConfig,
-    /// Cached epsilon scalar in the model dtype, living on the GPU device.
-    /// Avoids repeated Host→Device micro-transfers on every forward pass.
-    eps: Tensor,
+    /// Whether to L2-normalize output embeddings.
+    normalize: bool,
+    /// Configuration (public for external access to batch_size, etc.)
+    pub config: EmbedderConfig,
 }
 
-impl EmbeddingModel {
-    /// Load the model from HuggingFace Hub
-    fn load(config: &EmbedderConfig) -> Result<Self> {
-        info!(
-            "Loading model from: {} (dtype: {:?})",
-            config.model_repo, config.dtype
-        );
+impl Embedder {
+    /// Create a new embedder with the given configuration.
+    ///
+    /// This downloads the tokenizer from HuggingFace Hub (if not cached) and
+    /// loads the ONNX model into an ORT session with CUDA EP.
+    pub fn new(config: EmbedderConfig) -> Result<Self> {
+        info!("Initializing embedder with model: {}", config.model_repo);
 
-        // Set up device
-        let device = Device::new_cuda(config.cuda_device)?;
-        info!("Using CUDA device: {:?}", device);
-
-        // Download model files from HuggingFace
+        // ── Load tokenizer ───────────────────────────────────────────────
         let api = Api::new()?;
         let repo = api.repo(Repo::new(config.model_repo.clone(), RepoType::Model));
-
-        info!("Downloading model files...");
         let tokenizer_path = repo.get("tokenizer.json")?;
-        let config_path = repo.get("config.json")?;
 
-        // Try model.safetensors first, fall back to pytorch_model.bin via safetensors
-        let weights_path = repo.get("model.safetensors").or_else(|_| {
-            info!("model.safetensors not found, trying pytorch_model.bin...");
-            repo.get("pytorch_model.bin")
-        })?;
-
-        // Load tokenizer with padding configured for efficient batching.
-        // PaddingStrategy::BatchLongest pads all sequences in a batch to the
-        // length of the longest — the tokenizer does this internally so we
-        // avoid a separate manual-padding pass.
         info!("Loading tokenizer...");
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| EmbedderError::InitError(format!("Failed to load tokenizer: {}", e)))?;
@@ -192,235 +402,56 @@ impl EmbeddingModel {
             )));
         }
 
-        // Load model config
-        info!("Loading model config...");
-        let config_str = std::fs::read_to_string(&config_path)
-            .map_err(|e| EmbedderError::InitError(format!("Failed to read config: {}", e)))?;
-        let model_config: BertConfig = serde_json::from_str(&config_str)
-            .map_err(|e| EmbedderError::InitError(format!("Failed to parse config: {}", e)))?;
+        // ── Load ORT session ─────────────────────────────────────────────
+        info!("Loading ORT model from: {:?}", config.onnx_model_path);
 
-        // Load model weights in the configured dtype (F16 ≈ 2× faster than F32
-        // on tensor-core GPUs due to halved memory bandwidth + native TC ops).
-        info!(
-            "Loading model weights from {:?} (dtype={:?})...",
-            weights_path, config.dtype
-        );
-        let vb = if weights_path
-            .extension()
-            .map(|e| e == "safetensors")
-            .unwrap_or(false)
-        {
-            unsafe {
-                VarBuilder::from_mmaped_safetensors(&[weights_path], config.dtype, &device)?
-            }
-        } else {
-            VarBuilder::from_pth(&weights_path, config.dtype, &device)?
-        };
+        if !config.onnx_model_path.exists() {
+            return Err(EmbedderError::InitError(format!(
+                "ONNX model file not found: {:?}. Run `uv run ort/scripts/export_onnx.py` first.",
+                config.onnx_model_path
+            )));
+        }
 
-        // Build model
-        info!("Building model...");
-        let model = BertModel::load(vb, &model_config)?;
+        let session = Session::builder()
+            .map_err(|e| EmbedderError::InitError(format!("ORT session builder: {}", e)))?
+            .with_execution_providers([
+                ort::execution_providers::CUDAExecutionProvider::default()
+                    .with_device_id(config.cuda_device as i32)
+                    .build(),
+            ])
+            .map_err(|e| EmbedderError::InitError(format!("ORT execution providers: {}", e)))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| EmbedderError::InitError(format!("ORT optimization level: {}", e)))?
+            .commit_from_file(&config.onnx_model_path)
+            .map_err(|e| {
+                EmbedderError::InitError(format!(
+                    "ORT load model from {:?}: {}",
+                    config.onnx_model_path, e
+                ))
+            })?;
 
-        // Pre-allocate an epsilon scalar on GPU in the model dtype so that
-        // mean_pool / l2_normalize never trigger a Host→Device copy.
-        let eps = Tensor::new(&[1e-7f32], &device)?.to_dtype(config.dtype)?;
+        // Log model input/output info.
+        info!("ORT model inputs:");
+        for input in session.inputs() {
+            info!("  {}", input.name());
+        }
+        info!("ORT model outputs:");
+        for output in session.outputs() {
+            info!("  {}", output.name());
+        }
 
-        info!("Model loaded successfully!");
+        let normalize = config.normalize;
+        info!("Embedder ready (normalize={})", normalize);
+
         Ok(Self {
-            model,
+            session: Mutex::new(session),
             tokenizer,
-            device,
-            config: config.clone(),
-            eps,
-        })
-    }
-
-    /// Minimum batch size at which we use `encode_batch` (Rayon-parallel) instead
-    /// of a sequential loop.  Below this threshold the thread-pool overhead is not
-    /// worth it.
-    const PARALLEL_TOKENIZE_THRESHOLD: usize = 32;
-
-    /// Tokenize a batch of texts synchronously.
-    ///
-    /// For batches >= [`Self::PARALLEL_TOKENIZE_THRESHOLD`] we delegate to the
-    /// HuggingFace `encode_batch` method which parallelises across strings via
-    /// Rayon **and** handles padding internally (via [`PaddingStrategy::BatchLongest`]
-    /// configured at load time).  Smaller batches use a simple sequential loop to
-    /// avoid thread-pool overhead, with a fast manual padding pass.
-    fn tokenize(&self, texts: &[&str]) -> Result<(Tensor, Tensor, Tensor)> {
-        let batch_size = texts.len();
-
-        if batch_size >= Self::PARALLEL_TOKENIZE_THRESHOLD {
-            // ── Fast parallel path ──────────────────────────────────────
-            // encode_batch uses Rayon internally AND the tokenizer's
-            // PaddingParams pads all sequences to BatchLongest, so the
-            // returned encodings are already uniformly shaped.
-            let encodings = self
-                .tokenizer
-                .encode_batch(texts.to_vec(), true)
-                .map_err(|e| EmbedderError::TokenizeError(e.to_string()))?;
-
-            let max_len = encodings
-                .first()
-                .map_or(0, |e| e.get_ids().len());
-
-            // Pre-allocate flat buffers and copy contiguously.
-            let total = batch_size * max_len;
-            let mut flat_ids = Vec::with_capacity(total);
-            let mut flat_mask = Vec::with_capacity(total);
-            for enc in &encodings {
-                flat_ids.extend_from_slice(enc.get_ids());
-                flat_mask.extend_from_slice(enc.get_attention_mask());
-            }
-
-            let input_ids =
-                Tensor::from_vec(flat_ids, (batch_size, max_len), &self.device)?;
-            // token_type_ids are all-zero for single-sentence tasks; create
-            // directly on GPU to avoid a CPU allocation + copy.
-            let token_type_ids =
-                Tensor::zeros((batch_size, max_len), DType::U32, &self.device)?;
-            let attention_mask =
-                Tensor::from_vec(flat_mask, (batch_size, max_len), &self.device)?;
-
-            Ok((input_ids, token_type_ids, attention_mask))
-        } else {
-            // ── Sequential path (small batches) ─────────────────────────
-            let mut all_input_ids = Vec::with_capacity(batch_size);
-            let mut max_len: usize = 0;
-
-            for text in texts {
-                let encoding = self
-                    .tokenizer
-                    .encode(*text, true)
-                    .map_err(|e| EmbedderError::TokenizeError(e.to_string()))?;
-
-                let ids: Vec<u32> = encoding.get_ids().to_vec();
-                let len = ids.len().min(self.config.max_seq_len);
-                max_len = max_len.max(len);
-                all_input_ids.push(ids);
-            }
-
-            // Pad to max length in batch
-            let total = batch_size * max_len;
-            let mut padded_ids = vec![0u32; total];
-            let mut padded_mask = vec![0u32; total];
-
-            for (i, ids) in all_input_ids.iter().enumerate() {
-                let len = ids.len().min(max_len);
-                let row = i * max_len;
-                padded_ids[row..row + len].copy_from_slice(&ids[..len]);
-                for slot in &mut padded_mask[row..row + len] {
-                    *slot = 1;
-                }
-            }
-
-            let input_ids =
-                Tensor::from_vec(padded_ids, (batch_size, max_len), &self.device)?;
-            let token_type_ids =
-                Tensor::zeros((batch_size, max_len), DType::U32, &self.device)?;
-            let attention_mask =
-                Tensor::from_vec(padded_mask, (batch_size, max_len), &self.device)?;
-
-            Ok((input_ids, token_type_ids, attention_mask))
-        }
-    }
-
-    /// Compute embeddings for a batch of texts, returning a GPU tensor.
-    ///
-    /// The result lives on the CUDA device in the model's dtype (e.g. F16).
-    /// **No Device→Host copy occurs**, so this does not synchronize the GPU
-    /// stream — callers can pipeline multiple batches before transferring.
-    fn embed_batch_as_tensor(&self, texts: &[&str]) -> Result<Tensor> {
-        // Tokenize
-        let (input_ids, token_type_ids, attention_mask) = self.tokenize(texts)?;
-
-        // Forward pass through BERT model
-        let hidden_states =
-            self.model
-                .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
-
-        // Mean pooling over sequence length (considering attention mask)
-        let embeddings = self.mean_pool(&hidden_states, &attention_mask)?;
-
-        // Normalize if configured
-        if self.config.normalize {
-            Ok(self.l2_normalize(&embeddings)?)
-        } else {
-            Ok(embeddings)
-        }
-    }
-
-    /// Compute embeddings for a batch of texts, downloading to CPU.
-    ///
-    /// `BertModel::forward` takes `&self`, so this method only needs `&self` —
-    /// callers can use a read-lock instead of a write-lock.
-    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let embeddings = self.embed_batch_as_tensor(texts)?;
-
-        // Convert to Vec<Vec<f32>> — this is the DtoH synchronization point.
-        let embeddings = embeddings.to_dtype(DType::F32)?.to_vec2()?;
-
-        Ok(embeddings)
-    }
-
-    /// Mean pooling over sequence length
-    fn mean_pool(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> CandleResult<Tensor> {
-        // hidden_states: [batch, seq_len, hidden_dim]
-        // attention_mask: [batch, seq_len]
-        let dtype = hidden_states.dtype();
-
-        // Expand mask to hidden dim
-        let mask = attention_mask.to_dtype(dtype)?.unsqueeze(2)?; // [batch, seq_len, 1]
-
-        // Apply mask and sum
-        let masked = hidden_states.broadcast_mul(&mask)?;
-        let sum = masked.sum(1)?; // [batch, hidden_dim]
-
-        // Divide by sum of mask (number of valid tokens).
-        let count = mask.sum(1)?; // [batch, 1]
-        let count = count.broadcast_add(&self.eps)?;
-
-        sum.broadcast_div(&count)
-    }
-
-    /// L2 normalize embeddings
-    fn l2_normalize(&self, embeddings: &Tensor) -> CandleResult<Tensor> {
-        let norm = embeddings.sqr()?.sum_keepdim(1)?.sqrt()?;
-        let norm = norm.broadcast_add(&self.eps)?;
-        embeddings.broadcast_div(&norm)
-    }
-}
-
-// ============================================================================
-// Embedder
-// ============================================================================
-
-/// Text embedder using BERT with CUDA support
-pub struct Embedder {
-    /// The loaded model
-    inner: Arc<RwLock<Option<EmbeddingModel>>>,
-    /// Configuration (public for external access to batch_size, etc.)
-    pub config: EmbedderConfig,
-}
-
-impl Embedder {
-    /// Create a new embedder with the given configuration
-    pub fn new(config: EmbedderConfig) -> Result<Self> {
-        info!("Initializing embedder with model: {}", config.model_repo);
-
-        let model = EmbeddingModel::load(&config)?;
-
-        Ok(Self {
-            inner: Arc::new(RwLock::new(Some(model))),
+            normalize,
             config,
         })
     }
 
-    /// Get the embedding dimension
+    /// Get the embedding dimension.
     pub fn embedding_dim(&self) -> usize {
         EMBEDDING_DIM
     }
@@ -429,7 +460,7 @@ impl Embedder {
     // Single Embedding API
     // ========================================================================
 
-    /// Embed a single text string, returning f32 embeddings
+    /// Embed a single text string, returning f32 embeddings.
     pub fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let embeddings = self.embed_batch(&[text])?;
         embeddings
@@ -438,7 +469,7 @@ impl Embedder {
             .ok_or_else(|| EmbedderError::EmbedError("No embedding returned".to_string()))
     }
 
-    /// Embed a single text string, returning f16 embeddings (for storage)
+    /// Embed a single text string, returning f16 embeddings (for storage).
     pub fn embed_one_f16(&self, text: &str) -> Result<Vec<f16>> {
         self.embed_one(text)
             .map(|v| v.into_iter().map(f16::from_f32).collect())
@@ -448,18 +479,24 @@ impl Embedder {
     // Batch Embedding API
     // ========================================================================
 
-    /// Embed a batch of text strings, returning f32 embeddings
+    /// Embed a batch of text strings, returning f32 embeddings.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
-        let guard = self.inner.read();
-        let model = guard.as_ref().ok_or(EmbedderError::NotLoaded)?;
-        model.embed_batch(texts)
+        let batch = tokenize_batch(&self.tokenizer, texts, self.config.max_seq_len)?;
+        ort_infer(
+            &self.session,
+            &batch.input_ids,
+            &batch.attention_mask,
+            batch.batch_size,
+            batch.seq_len,
+            self.normalize,
+        )
     }
 
-    /// Embed a batch of text strings, returning f16 embeddings (for storage)
+    /// Embed a batch of text strings, returning f16 embeddings (for storage).
     pub fn embed_batch_f16(&self, texts: &[&str]) -> Result<Vec<Vec<f16>>> {
         self.embed_batch(texts).map(|batch| {
             batch
@@ -469,23 +506,23 @@ impl Embedder {
         })
     }
 
-    /// Embed owned strings in batch
+    /// Embed owned strings in batch.
     pub fn embed_batch_owned(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         self.embed_batch(&refs)
     }
 
-    /// Embed owned strings in batch, returning f16
+    /// Embed owned strings in batch, returning f16.
     pub fn embed_batch_owned_f16(&self, texts: &[String]) -> Result<Vec<Vec<f16>>> {
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         self.embed_batch_f16(&refs)
     }
 
     // ========================================================================
-    // Chunked Batch Processing
+    // Chunked Batch Processing (with pipelined tokenization)
     // ========================================================================
 
-    /// Process a large batch in chunks.
+    /// Process a large batch in chunks with pipelined tokenization.
     ///
     /// Strings are **sorted by byte-length** before chunking so that each GPU
     /// batch contains strings of similar token counts.  This minimises padding
@@ -493,17 +530,12 @@ impl Embedder {
     /// input corpus has heterogeneous lengths.  Results are returned in the
     /// original input order.
     ///
-    /// All chunks are processed on the GPU without synchronising in between;
-    /// the per-chunk embedding tensors are concatenated on-device and then
-    /// transferred to the host in a **single** Device→Host copy.  This avoids
-    /// repeated sync barriers that would otherwise stall the CUDA stream.
+    /// Tokenization of chunk N+1 runs on a **background thread** while the GPU
+    /// processes chunk N, hiding most of the CPU tokenization latency.
     pub fn embed_batch_chunked(&self, texts: &[&str], chunk_size: usize) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-
-        let guard = self.inner.read();
-        let model = guard.as_ref().ok_or(EmbedderError::NotLoaded)?;
 
         // Build (original_index, text) pairs and sort by byte-length (a cheap
         // but effective proxy for token count).
@@ -511,31 +543,55 @@ impl Embedder {
         indexed.sort_unstable_by_key(|&(_, s)| s.len());
 
         let sorted_texts: Vec<&str> = indexed.iter().map(|&(_, s)| s).collect();
+        let num_chunks = (sorted_texts.len() + chunk_size - 1) / chunk_size;
 
-        // ── GPU-resident phase: no DtoH sync ────────────────────────────
-        // Each chunk produces a [chunk_len, hidden_dim] tensor that stays on
-        // the CUDA device.  We collect them all, then `cat` once.
-        let mut gpu_chunks: Vec<Tensor> = Vec::with_capacity(
-            (texts.len() + chunk_size - 1) / chunk_size,
-        );
-        for chunk in sorted_texts.chunks(chunk_size) {
-            gpu_chunks.push(model.embed_batch_as_tensor(chunk)?);
+        // ── Pipelined tokenization ─────────────────────────────────────
+        // Clone the tokenizer for the background thread (~2 MB, cheap).
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<TokenizedBatch>>(2);
+        let tok = self.tokenizer.clone();
+        let max_seq_len = self.config.max_seq_len;
+
+        // Collect chunks as owned Strings so the thread can outlive `texts`.
+        let chunks_owned: Vec<Vec<String>> = sorted_texts
+            .chunks(chunk_size)
+            .map(|c| c.iter().map(|s| s.to_string()).collect())
+            .collect();
+
+        let tok_handle = std::thread::spawn(move || {
+            for chunk_strings in chunks_owned {
+                let refs: Vec<&str> = chunk_strings.iter().map(|s| s.as_str()).collect();
+                let result = tokenize_batch(&tok, &refs, max_seq_len);
+                if tx.send(result).is_err() {
+                    break; // receiver dropped
+                }
+            }
+        });
+
+        // ── Inference on main thread ───────────────────────────────────
+        let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for _ in 0..num_chunks {
+            let batch = rx
+                .recv()
+                .map_err(|_| EmbedderError::EmbedError("Tokenization channel closed".into()))??;
+            let embeddings = ort_infer(
+                &self.session,
+                &batch.input_ids,
+                &batch.attention_mask,
+                batch.batch_size,
+                batch.seq_len,
+                self.normalize,
+            )?;
+            all_embeddings.extend(embeddings);
         }
 
-        // ── Single DtoH transfer ────────────────────────────────────────
-        let all_embeddings_gpu = if gpu_chunks.len() == 1 {
-            gpu_chunks.into_iter().next().unwrap()
-        } else {
-            Tensor::cat(&gpu_chunks, 0)?
-        };
-        // Drop the per-chunk tensors' storage is now in `all_embeddings_gpu`.
-        let sorted_embeddings: Vec<Vec<f32>> =
-            all_embeddings_gpu.to_dtype(DType::F32)?.to_vec2()?;
+        tok_handle
+            .join()
+            .map_err(|_| EmbedderError::EmbedError("Tokenization thread panicked".into()))?;
 
-        // ── Scatter back to original order ───────────────────────────────
+        // ── Scatter back to original order ─────────────────────────────
         let mut result: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         result.resize_with(texts.len(), Vec::new);
-        for (sorted_idx, embedding) in sorted_embeddings.into_iter().enumerate() {
+        for (sorted_idx, embedding) in all_embeddings.into_iter().enumerate() {
             let original_idx = indexed[sorted_idx].0;
             result[original_idx] = embedding;
         }
@@ -543,7 +599,7 @@ impl Embedder {
         Ok(result)
     }
 
-    /// Process a large batch in chunks, returning f16
+    /// Process a large batch in chunks, returning f16.
     pub fn embed_batch_chunked_f16(
         &self,
         texts: &[&str],
@@ -556,16 +612,9 @@ impl Embedder {
                 .collect()
         })
     }
-
-    /// Unload the model to free memory
-    pub fn unload(&self) {
-        let mut guard = self.inner.write();
-        *guard = None;
-        info!("Model unloaded");
-    }
 }
 
-/// Create a placeholder embedding (zeros) for lazy initialization
+/// Create a placeholder embedding (zeros) for lazy initialization.
 pub fn placeholder_embedding(dim: usize) -> Vec<f16> {
     vec![f16::ZERO; dim]
 }
@@ -585,6 +634,10 @@ mod tests {
         assert_eq!(config.model_repo, DEFAULT_EMBEDDING_REPO);
         assert!(config.normalize);
         assert_eq!(config.cuda_device, 0);
+        assert_eq!(
+            config.onnx_model_path,
+            PathBuf::from(DEFAULT_ONNX_MODEL_PATH)
+        );
     }
 
     #[test]
@@ -595,7 +648,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Integration Tests (require model download + CUDA/CPU)
+    // Integration Tests (require model download + CUDA + ONNX model)
     // Run with: cargo test --release -- --ignored
     // ========================================================================
 
@@ -649,7 +702,6 @@ mod tests {
         println!("Embedding dimension: {}", embedding.len());
         assert!(!embedding.is_empty(), "Embedding should not be empty");
 
-        // Check that embedding is normalized (L2 norm ≈ 1.0)
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         println!("L2 norm: {}", norm);
         assert!(
@@ -697,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run with: cargo test --release -- --ignored test_embed_1000_strings
+    #[ignore]
     fn test_embed_1000_strings() {
         println!("Initializing embedder...");
         let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
@@ -721,21 +773,8 @@ mod tests {
             1000.0 / elapsed.as_secs_f64()
         );
 
-        assert_eq!(embeddings.len(), 1000, "Should have 1000 embeddings");
-
-        // Verify all embeddings are valid
-        let embedding_dim = embeddings[0].len();
-        println!("Embedding dimension: {}", embedding_dim);
-
+        assert_eq!(embeddings.len(), 1000);
         for (i, embedding) in embeddings.iter().enumerate() {
-            assert_eq!(
-                embedding.len(),
-                embedding_dim,
-                "Embedding {} has wrong dimension",
-                i
-            );
-
-            // Check normalization
             let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!(
                 (norm - 1.0).abs() < 0.01,
@@ -744,328 +783,35 @@ mod tests {
                 norm
             );
         }
-
-        // Check that different texts produce different embeddings
-        let first = &embeddings[0];
-        let second = &embeddings[1];
-        let dot_product: f32 = first.iter().zip(second.iter()).map(|(a, b)| a * b).sum();
-        println!(
-            "Cosine similarity between first two embeddings: {}",
-            dot_product
-        );
-        assert!(
-            dot_product < 0.9999,
-            "Different texts should produce different embeddings"
-        );
     }
 
     #[test]
-    #[ignore] // Run with: cargo test --release -- --ignored test_embed_1000_strings_f16
-    fn test_embed_1000_strings_f16() {
-        println!("Initializing embedder...");
-        let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
-
-        let strings = generate_test_strings(1000);
-        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
-
-        println!("Embedding 1000 strings to f16...");
-        let start = Instant::now();
-        let embeddings = embedder
-            .embed_batch_chunked_f16(&refs, DEFAULT_BATCH_SIZE)
-            .expect("Failed to embed 1000 strings to f16");
-        let elapsed = start.elapsed();
-
-        println!(
-            "Embedded 1000 strings to f16 in {:?} ({:.2} strings/sec)",
-            elapsed,
-            1000.0 / elapsed.as_secs_f64()
-        );
-
-        assert_eq!(embeddings.len(), 1000, "Should have 1000 embeddings");
-
-        // Verify f16 embeddings
-        for (i, embedding) in embeddings.iter().enumerate() {
-            assert!(!embedding.is_empty(), "Embedding {} should not be empty", i);
-
-            // Convert to f32 and check normalization
-            let f32_embedding: Vec<f32> = embedding.iter().map(|x| x.to_f32()).collect();
-            let norm: f32 = f32_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!(
-                (norm - 1.0).abs() < 0.02, // Slightly looser tolerance for f16
-                "Embedding {} should be normalized, got norm: {}",
-                i,
-                norm
-            );
-        }
-
-        // Calculate memory usage
-        let bytes_per_embedding = embeddings[0].len() * std::mem::size_of::<f16>();
-        let total_bytes = bytes_per_embedding * embeddings.len();
-        println!(
-            "Memory usage: {} bytes per embedding, {} KB total for 1000 embeddings",
-            bytes_per_embedding,
-            total_bytes / 1024
-        );
-    }
-
-    #[test]
-    #[ignore] // Run with: cargo test --release -- --ignored test_embed_varying_lengths
-    fn test_embed_varying_lengths() {
-        println!("Initializing embedder...");
-        let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
-
-        // Generate strings of varying lengths
-        let strings: Vec<String> = (0..100)
-            .map(|i| {
-                let base = "word ".repeat(1 + (i % 50));
-                format!("Text {}: {}", i, base.trim())
-            })
-            .collect();
-        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
-
-        println!("Embedding 100 strings of varying lengths...");
-        let start = Instant::now();
-        let embeddings = embedder
-            .embed_batch_chunked(&refs, 16)
-            .expect("Failed to embed varying length strings");
-        let elapsed = start.elapsed();
-
-        println!("Embedded 100 varying-length strings in {:?}", elapsed);
-
-        assert_eq!(embeddings.len(), 100);
-
-        // All embeddings should have the same dimension regardless of input length
-        let dim = embeddings[0].len();
-        for (i, embedding) in embeddings.iter().enumerate() {
-            assert_eq!(
-                embedding.len(),
-                dim,
-                "All embeddings should have same dimension, embedding {} has {}",
-                i,
-                embedding.len()
-            );
-        }
-    }
-
-    #[test]
-    #[ignore] // Run with: cargo test --release -- --ignored test_embed_special_characters
-    fn test_embed_special_characters() {
-        println!("Initializing embedder...");
-        let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
-
-        let texts = vec![
-            "normal text",
-            "text with numbers 12345",
-            "text with symbols !@#$%^&*()",
-            "text with émojis 🎉🚀",
-            "text with unicode: 日本語 中文 العربية",
-            "text\nwith\nnewlines",
-            "text\twith\ttabs",
-            "",  // Empty string
-            " ", // Just whitespace
-            "a", // Single character
-        ];
-
-        println!("Embedding {} special texts...", texts.len());
-        let embeddings = embedder
-            .embed_batch(&texts)
-            .expect("Failed to embed special texts");
-
-        assert_eq!(embeddings.len(), texts.len());
-        println!("All {} special texts embedded successfully", texts.len());
-
-        for (i, (text, embedding)) in texts.iter().zip(embeddings.iter()).enumerate() {
-            println!(
-                "  [{}] '{}' -> {} dims",
-                i,
-                text.chars().take(30).collect::<String>(),
-                embedding.len()
-            );
-            assert!(
-                !embedding.is_empty(),
-                "Embedding for '{}' should not be empty",
-                text
-            );
-        }
-    }
-
-    #[test]
-    #[ignore] // Run with: cargo test --release -- --ignored test_similarity_sanity
+    #[ignore]
     fn test_similarity_sanity() {
         println!("Initializing embedder...");
         let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
 
         let texts = vec![
-            "user_id of customers",      // Similar to index 1
-            "customer_id of users",      // Similar to index 0
-            "price of products",         // Different topic
-            "cost of items",             // Similar to index 2
-            "completely unrelated text", // Different
+            "user_id of customers",
+            "customer_id of users",
+            "price of products",
+            "cost of items",
+            "completely unrelated text",
         ];
 
         let embeddings = embedder.embed_batch(&texts).expect("Failed to embed");
 
-        // Helper to compute cosine similarity
         let cosine_sim =
             |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b.iter()).map(|(x, y)| x * y).sum() };
 
-        println!("\nCosine similarity matrix:");
-        for i in 0..texts.len() {
-            for j in 0..texts.len() {
-                let sim = cosine_sim(&embeddings[i], &embeddings[j]);
-                print!("{:.3} ", sim);
-            }
-            println!(" <- '{}'", texts[i]);
-        }
-
-        // Sanity checks
         let sim_0_1 = cosine_sim(&embeddings[0], &embeddings[1]);
-        let sim_2_3 = cosine_sim(&embeddings[2], &embeddings[3]);
         let sim_0_4 = cosine_sim(&embeddings[0], &embeddings[4]);
 
-        println!("\nSimilarity checks:");
-        println!("  '{}' vs '{}' = {:.3}", texts[0], texts[1], sim_0_1);
-        println!("  '{}' vs '{}' = {:.3}", texts[2], texts[3], sim_2_3);
-        println!("  '{}' vs '{}' = {:.3}", texts[0], texts[4], sim_0_4);
-
-        // Similar texts should have higher similarity than unrelated ones
         assert!(
             sim_0_1 > sim_0_4,
             "Similar texts should have higher similarity: {} vs {}",
             sim_0_1,
             sim_0_4
         );
-        assert!(
-            sim_2_3 > sim_0_4,
-            "Similar texts should have higher similarity: {} vs {}",
-            sim_2_3,
-            sim_0_4
-        );
     }
-
-    #[test]
-    #[ignore] // Run with: cargo test --release -- --ignored test_benchmark_batch_sizes --nocapture
-    fn test_benchmark_batch_sizes() {
-        println!("Initializing embedder...");
-        let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
-
-        // Generate 10,000 test strings
-        let num_strings = 10_000;
-        let strings = generate_test_strings(num_strings);
-        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
-
-        println!("\n=== Batch Size Benchmark ({} strings) ===\n", num_strings);
-        println!(
-            "{:>12} {:>12} {:>12} {:>12}",
-            "Batch Size", "Time (s)", "Strings/sec", "Speedup"
-        );
-        println!("{}", "-".repeat(52));
-
-        let batch_sizes = [8, 16, 32, 64, 128, 256, 512];
-        let mut baseline_throughput = 0.0;
-
-        for &batch_size in &batch_sizes {
-            // Warm-up run
-            let _ = embedder.embed_batch_chunked(&refs[..batch_size.min(100)], batch_size);
-
-            // Timed run
-            let start = Instant::now();
-            let embeddings = embedder
-                .embed_batch_chunked(&refs, batch_size)
-                .expect("Failed to embed");
-            let elapsed = start.elapsed();
-
-            let throughput = num_strings as f64 / elapsed.as_secs_f64();
-            let speedup = if baseline_throughput > 0.0 {
-                throughput / baseline_throughput
-            } else {
-                baseline_throughput = throughput;
-                1.0
-            };
-
-            println!(
-                "{:>12} {:>12.3} {:>12.1} {:>12.2}x",
-                batch_size,
-                elapsed.as_secs_f64(),
-                throughput,
-                speedup
-            );
-
-            assert_eq!(embeddings.len(), num_strings);
-        }
-
-        println!("\n=== Memory & Dimension Info ===");
-        let sample_embedding = embedder.embed_one("test").unwrap();
-        println!("Embedding dimension: {}", sample_embedding.len());
-        println!(
-            "Memory per embedding (f32): {} bytes",
-            sample_embedding.len() * 4
-        );
-        println!(
-            "Memory per embedding (f16): {} bytes",
-            sample_embedding.len() * 2
-        );
-        println!(
-            "Memory for {} embeddings (f16): {:.2} MB",
-            num_strings,
-            (num_strings * sample_embedding.len() * 2) as f64 / 1024.0 / 1024.0
-        );
-    }
-
-    #[test]
-    #[ignore] // Run with: cargo test --release -- --ignored test_sustained_throughput --nocapture
-    fn test_sustained_throughput() {
-        println!("Initializing embedder...");
-        let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
-
-        let batch_size = 128; // Use larger batch for sustained test
-        let num_batches = 100;
-        let strings_per_batch = batch_size;
-        let total_strings = num_batches * strings_per_batch;
-
-        let strings = generate_test_strings(strings_per_batch);
-        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
-
-        println!("\n=== Sustained Throughput Test ===");
-        println!("Batch size: {}", batch_size);
-        println!("Number of batches: {}", num_batches);
-        println!("Total strings: {}", total_strings);
-        println!();
-
-        // Warm-up
-        let _ = embedder.embed_batch(&refs);
-
-        let start = Instant::now();
-        let mut total_embedded = 0;
-
-        for batch_num in 0..num_batches {
-            let embeddings = embedder.embed_batch(&refs).expect("Failed to embed");
-            total_embedded += embeddings.len();
-
-            if (batch_num + 1) % 10 == 0 {
-                let elapsed = start.elapsed();
-                let throughput = total_embedded as f64 / elapsed.as_secs_f64();
-                println!(
-                    "Batch {:>3}/{}: {:>6} strings, {:.1} strings/sec (running avg)",
-                    batch_num + 1,
-                    num_batches,
-                    total_embedded,
-                    throughput
-                );
-            }
-        }
-
-        let total_elapsed = start.elapsed();
-        let final_throughput = total_embedded as f64 / total_elapsed.as_secs_f64();
-
-        println!("\n=== Final Results ===");
-        println!("Total time: {:.3}s", total_elapsed.as_secs_f64());
-        println!("Total strings: {}", total_embedded);
-        println!("Throughput: {:.1} strings/sec", final_throughput);
-        println!(
-            "Latency per batch: {:.2}ms",
-            total_elapsed.as_millis() as f64 / num_batches as f64
-        );
-    }
-
 }

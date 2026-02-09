@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-candle-core = { version = "0.9.2", features = ["cuda"] }
-candle-nn = { version = "0.9.2", features = ["cuda", "cudnn"] }
-candle-transformers = { version = "0.9.2", features = ["cuda", "cudnn"] }
 clap = { version = "4.5.57", features = ["derive"] }
 half = { version = "2.7.1", features = ["rkyv"] }
 hf-hub = "0.4.3"
@@ -14,6 +11,7 @@ indicatif = "0.18.3"
 itertools = "0.14.0"
 memmap2 = "0.9.9"
 mimalloc = "0.1.48"
+ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
 parking_lot = "0.12.5"
 rand = "0.9.2"
 rayon = "1.11.0"
@@ -53,7 +51,3 @@ path = "src/bin/preprocess.rs"
 [[bin]]
 name = "train"
 path = "src/bin/train.rs"
-
-[[bin]]
-name = "profile_embedder"
-path = "src/bin/profile_embedder.rs"

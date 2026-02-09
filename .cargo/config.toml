@@ -1,2 +1,8 @@
 [build]
 rustflags = ["-Clink-arg=-fuse-ld=lld", "-Ctarget-cpu=native"]
+
+[env]
+# Point ort's load-dynamic feature at the CUDA 13 ONNX Runtime library.
+# `relative = true` resolves the path relative to the workspace root.
+ORT_DYLIB_PATH = { value = "ort/ort-libs/onnxruntime-linux-x64-gpu-1.24.1/lib/libonnxruntime.so.1.24.1", relative = true }
+LD_LIBRARY_PATH = { value = "ort/ort-libs/onnxruntime-linux-x64-gpu-1.24.1/lib", relative = true }

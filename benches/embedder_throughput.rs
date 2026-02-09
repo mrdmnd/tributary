@@ -1,5 +1,21 @@
 //! Embedder throughput benchmarks.
 //!
+//! Benchmarks the ORT backend on two workloads:
+//! - **chunk_size_sweep**: Short, uniform strings — reveals the GPU saturation
+//!   curve and optimal `batch_size`.
+//! - **mixed_length**: Realistic log-normal token-length distribution — measures
+//!   real-world throughput including padding overhead.
+//!
+//! # Running
+//!
+//! ```sh
+//! # Make sure ORT_DYLIB_PATH is set to the CUDA 13 ORT library:
+//! export ORT_DYLIB_PATH=/path/to/ort/ort-libs/onnxruntime-linux-x64-gpu-1.24.1/lib/libonnxruntime.so.1.24.1
+//! export LD_LIBRARY_PATH=/path/to/ort/ort-libs/onnxruntime-linux-x64-gpu-1.24.1/lib:$LD_LIBRARY_PATH
+//!
+//! cargo bench --bench embedder_throughput
+//! ```
+//!
 //! # GPU clock-locking for reproducible results
 //!
 //! NVIDIA GPUs dynamically adjust clock frequencies based on power and thermal
@@ -17,7 +33,7 @@
 //! sudo nvidia-smi -pl <watts>
 //!
 //! # Run the benchmarks:
-//! cargo bench
+//! cargo bench --bench embedder_throughput
 //!
 //! # Reset clocks when done:
 //! sudo nvidia-smi -rgc
@@ -115,6 +131,30 @@ fn generate_mixed_length_strings(count: usize, max_words: usize) -> Vec<String> 
 }
 
 // ============================================================================
+// Benchmark helpers
+// ============================================================================
+
+/// Resolve the ONNX model path from the environment or use the default.
+fn ort_model_path() -> String {
+    std::env::var("ONNX_MODEL_PATH")
+        .unwrap_or_else(|_| "ort/models/bge-base-en-v1.5-onnx/model_fp16.onnx".to_string())
+}
+
+/// Create an embedder, or panic with a helpful message if the model is missing.
+fn create_embedder() -> Embedder {
+    let path = ort_model_path();
+    if !std::path::Path::new(&path).exists() {
+        panic!(
+            "ONNX model not found at '{}'. Run `uv run ort/scripts/export_onnx.py` first, \
+             or set ONNX_MODEL_PATH.",
+            path
+        );
+    }
+    Embedder::new(EmbedderConfig::default().with_onnx_model(&path))
+        .expect("Failed to create embedder")
+}
+
+// ============================================================================
 // Benchmarks
 // ============================================================================
 
@@ -122,15 +162,13 @@ fn generate_mixed_length_strings(count: usize, max_words: usize) -> Vec<String> 
 /// strings.  This reveals the GPU saturation curve and is the most actionable
 /// benchmark for tuning `DEFAULT_BATCH_SIZE`.
 fn bench_chunk_size_sweep(c: &mut Criterion) {
-    let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
-
     let num_strings = 5_000;
     let strings = generate_short_strings(num_strings);
     let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
 
+    let embedder = create_embedder();
+
     let mut group = c.benchmark_group("chunk_size_sweep");
-    // GPU benchmarks are inherently noisy; relax the noise threshold so
-    // Criterion doesn't flag every run as a regression.
     group.noise_threshold(0.05);
     group.throughput(Throughput::Elements(num_strings as u64));
 
@@ -150,8 +188,6 @@ fn bench_chunk_size_sweep(c: &mut Criterion) {
 /// distribution).  Reports throughput in tokens/sec so we can see how padding
 /// overhead and variable sequence lengths affect real-world performance.
 fn bench_mixed_length(c: &mut Criterion) {
-    let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to create embedder");
-
     // Load the tokenizer separately so we can count tokens for the throughput
     // metric without including tokenizer load time in the measurement.
     let tokenizer = {
@@ -175,6 +211,8 @@ fn bench_mixed_length(c: &mut Criterion) {
         .map(|s| tokenizer.encode(s.as_str(), true).unwrap().get_ids().len())
         .sum();
 
+    let embedder = create_embedder();
+
     let mut group = c.benchmark_group("mixed_length");
     group.noise_threshold(0.05);
     group.throughput(Throughput::Elements(total_tokens as u64));
@@ -188,7 +226,6 @@ fn bench_mixed_length(c: &mut Criterion) {
             },
         );
     }
-
     group.finish();
 }
 
