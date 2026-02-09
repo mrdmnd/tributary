@@ -1,22 +1,21 @@
 # tributary
-A foundation model transformer for Relational Databases
 
-OPINIONATED: Assumes a modern (Blackwell+) NVIDIA setup with CUDA 13 or better.
+A foundation model transformer for relational databases.
 
+Assumes a modern (Blackwell+) NVIDIA GPU with CUDA 13 drivers.
 
 ## Prerequisites
 
-- **BLACKWELL GPU** with CUDA 13+ drivers
-- **[uv](https://docs.astral.sh/uv/)** (only needed for the ONNX export script)
+- **Blackwell GPU** with CUDA 13+ drivers
+- **[uv](https://docs.astral.sh/uv/)** — runs the ONNX export script
+- **lld** — used as the linker (set in `.cargo/config.toml`)
 
+## Setup
 
-## Embedding
+### 1. Download ONNX Runtime
 
-The embedder uses ONNX Runtime with CUDA EP for GPU-accelerated text embeddings.
-
-### Setup
-
-1. **Download the ONNX Runtime CUDA 13 binary:**
+The project dynamically loads ONNX Runtime with the CUDA execution provider.
+Download the pre-built binary and extract it:
 
 ```bash
 mkdir -p ort/ort-libs && cd ort/ort-libs
@@ -28,20 +27,51 @@ cd ../..
 
 The library path is configured automatically via `.cargo/config.toml`.
 
-2. **Export the ONNX model:**
+### 2. Export the ONNX model
 
 ```bash
 uv run ort/scripts/export_onnx.py
 ```
 
-This creates `ort/models/bge-base-en-v1.5-onnx/model_fp16.onnx` (~208 MB).
+This runs a four-step pipeline (export, BERT graph fusion, FP16 conversion,
+post-processing) and produces `ort/models/bge-base-en-v1.5-onnx/model_fp16_pooled.onnx`
+(~105 MB). See the script's docstring for details.
 
-3. **Build:**
+The final model includes:
+
+- **BERT-specific graph fusions** — `Attention`, `BiasGelu`,
+  `SkipLayerNormalization`, `EmbedLayerNormalization`.
+- **FP16 weights and activations** — enables tensor-core acceleration.
+- **INT32 inputs** — halves host-to-device transfer size vs the default INT64.
+- **Fused FP16 mean-pooling + L2 normalisation** — output is `[B, 768]` FP32.
+  Uses only CUDA-friendly primitives to avoid a CPU fallback on
+  `LpNormalization`.
+
+### 3. Build
 
 ```bash
 cargo build --release
 ```
 
+## Project structure
+
+```
+src/
+  lib.rs            — crate root (mimalloc global allocator)
+  embedder.rs       — ORT-backed GPU embedding (tokenization, IoBinding, pipelining)
+  types.rs          — shared types (placeholder)
+  utils.rs          — shared utilities (placeholder)
+  bin/
+    preprocess.rs   — data preprocessing binary (WIP)
+    train.rs        — model training binary (WIP)
+benches/
+  embedder_throughput.rs — Criterion benchmarks (chunk-size sweep + mixed-length)
+ort/
+  scripts/
+    export_onnx.py  — ONNX export & optimisation pipeline
+  ort-libs/         — ONNX Runtime shared library (gitignored)
+  models/           — exported ONNX models (gitignored)
+```
 
 ## Benchmarking
 

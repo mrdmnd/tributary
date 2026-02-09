@@ -1,19 +1,36 @@
 //! Text embedding module.
 //!
-//! Provides GPU-accelerated text embeddings using ONNX Runtime with CUDA EP.
+//! Provides GPU-accelerated sentence embeddings (BAAI/bge-base-en-v1.5) using
+//! ONNX Runtime with the CUDA execution provider.
 //!
-//! # Performance optimizations
+//! # Model
 //!
-//! - **FP16 pooling in ONNX** — mean-pooling + L2 normalisation run in FP16,
-//!   with a single FP16→FP32 cast only on the reduced `[B, 768]` output.
-//!   This avoids materialising the full `[B, S, 768]` tensor in FP32.
-//! - **INT32 inputs** — the model accepts INT32 directly (matching the ORT
-//!   kernel's internal type), halving host→device input transfer size vs INT64.
+//! The ONNX model is exported by `ort/scripts/export_onnx.py` and includes:
+//!
+//! - **BERT graph fusions** — `Attention`, `BiasGelu`, `SkipLayerNormalization`,
+//!   and `EmbedLayerNormalization` (applied by ORT's BERT-specific optimizer).
+//! - **FP16 weights and activations** — enables tensor-core acceleration.
+//! - **INT32 inputs** — the three model inputs (`input_ids`, `attention_mask`,
+//!   `token_type_ids`) are declared as INT32 directly, halving host→device
+//!   transfer size compared to the default INT64.
+//! - **Fused FP16 mean-pooling + L2 normalisation** — baked into the ONNX
+//!   graph using only CUDA-friendly primitives (Mul, ReduceSum, Sqrt, Clip,
+//!   Div).  The standard ONNX `LpNormalization` op is avoided because ORT
+//!   lacks a CUDA kernel for it, which would force a GPU→CPU→GPU bounce.
+//!   A single FP16→FP32 cast is applied only on the reduced `[B, 768]`
+//!   output, avoiding materialisation of the full `[B, S, 768]` tensor in
+//!   FP32.
+//!
+//! # Runtime optimizations
+//!
 //! - **IoBinding with CUDA-pinned I/O** — both input **and** output tensors
 //!   are allocated in page-locked host memory and bound via ORT's `IoBinding`
 //!   API, enabling truly asynchronous DMA in both directions.
-//! - **Pipelined tokenization** — a background thread tokenizes chunk N+1 while
-//!   the GPU processes chunk N.
+//! - **Cached pinned tensors** — pinned input buffers for a given
+//!   `(batch_size, seq_len)` shape are allocated once and reused across calls,
+//!   avoiding repeated `cudaMallocHost`/`cudaFreeHost` round-trips.
+//! - **Pipelined tokenization** — a background thread tokenizes chunk N+1
+//!   while the GPU processes chunk N.
 //! - **Optional CUDA graph capture** — eliminates per-kernel launch overhead
 //!   for fixed-shape workloads.  Enable with
 //!   [`EmbedderConfig::with_cuda_graph`].
@@ -55,8 +72,10 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 10_000;
 pub const MAX_SEQ_LEN: usize = 512;
 
 /// Default ONNX model path (relative to the project root).
-/// Points to the **pooled** model that includes fused mean-pooling + L2 norm.
-/// Generate with `uv run ort/scripts/export_onnx.py`.
+///
+/// Points to the final model produced by `ort/scripts/export_onnx.py`: FP16
+/// backbone, INT32 inputs, fused FP16 mean-pooling + L2 normalisation, with
+/// a single FP16→FP32 cast on the `[B, 768]` output.
 pub const DEFAULT_ONNX_MODEL_PATH: &str = "ort/models/bge-base-en-v1.5-onnx/model_fp16_pooled.onnx";
 
 // ============================================================================
@@ -181,9 +200,11 @@ impl EmbedderConfig {
 
 /// A pre-tokenized batch ready for inference.
 ///
-/// Arrays use `i32` — the optimized ONNX model declares INT32 inputs directly
-/// (the ORT BERT optimizer's `EmbedLayerNormalization` kernel uses INT32
-/// internally, so there is no reason to send INT64 from the host).
+/// Arrays use `i32` because the export script re-declares model inputs as
+/// INT32.  The ORT BERT optimizer's `EmbedLayerNormalization` kernel uses
+/// INT32 internally, so there is no benefit to the default INT64 — using
+/// INT32 halves the host→device transfer size for `input_ids` and
+/// `attention_mask`.
 pub struct TokenizedBatch {
     pub input_ids: Vec<i32>,
     pub attention_mask: Vec<i32>,
@@ -548,7 +569,7 @@ impl OrtEmbedder {
                 if shape.len() != 2 {
                     return Err(EmbedderError::InitError(format!(
                         "Expected a pooled model with 2-dim output [B, H], but got {} dims. \
-                         Re-export with `uv run ort/scripts/export_onnx.py` (without --skip-fuse-pooling).",
+                         Re-export with `uv run ort/scripts/export_onnx.py`.",
                         shape.len()
                     )));
                 }

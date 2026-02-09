@@ -7,36 +7,46 @@
 #     "onnx",
 # ]
 # ///
-"""Export BAAI/bge-base-en-v1.5 to an optimized ONNX model.
+"""Export BAAI/bge-base-en-v1.5 to an optimized, inference-ready ONNX model.
 
-This script:
-1. Exports the model to ONNX format using HuggingFace optimum.
-2. Applies ONNX Runtime's BERT-specific graph optimizations (attention fusion,
-   layer normalization fusion, etc.) at level O2.
-3. Converts the optimized model to FP16 for faster inference on GPUs with
-   tensor cores.
-4. Post-processes the graph:
-   a. **INT32 inputs** — removes the three INT64→INT32 Cast nodes inserted by
-      the ORT optimizer and changes the model inputs to INT32 directly, halving
-      host→device input transfer size.
-   b. **FP16 pooling** — fuses mean-pooling + L2 normalisation into the graph,
-      running entirely in FP16.  A single FP16→FP32 cast is applied only on the
-      reduced ``[B, 768]`` output, avoiding a costly ``[B, S, 768]`` FP32
-      materialisation that the previous approach required.
+Pipeline
+--------
+1. **Export** — converts the HuggingFace model to ONNX via ``optimum``.
+2. **Graph optimise** — applies ORT's BERT-specific fusions (``Attention``,
+   ``BiasGelu``, ``SkipLayerNormalization``, ``EmbedLayerNormalization``).
+3. **FP16 conversion** — converts weights and activations to FP16 for tensor-
+   core acceleration.
+4. **Post-processing** — applied on the FP16 graph:
+   a. *INT32 inputs* — removes the three INT64→INT32 Cast nodes inserted by
+      the ORT optimizer and re-declares inputs as INT32, halving host→device
+      input transfer size.
+   b. *FP16 mean-pooling + L2 normalisation* — fuses pooling into the graph
+      using only CUDA-friendly primitives (Mul, ReduceSum, Sqrt, Clip, Div).
+      The standard ONNX ``LpNormalization`` op is deliberately avoided because
+      ORT lacks a CUDA kernel for it, which would force a GPU→CPU→GPU bounce.
+      A single FP16→FP32 cast is applied only on the reduced ``[B, 768]``
+      output, avoiding materialisation of the full ``[B, S, 768]`` tensor in
+      FP32.
 
-The resulting model can be used with the ORT backend in tributary.
+The final model (``model_fp16_pooled.onnx``) is the only artifact consumed by
+the tributary Rust runtime.  Intermediate files are retained for debugging.
 
-Usage:
-    ./ort/scripts/export_onnx.py
+Usage
+-----
+::
+
     uv run ort/scripts/export_onnx.py
-    uv run ort/scripts/export_onnx.py --model BAAI/bge-base-en-v1.5 --output-dir ort/models/bge-base-en-v1.5-onnx
+    uv run ort/scripts/export_onnx.py --model BAAI/bge-base-en-v1.5 \\
+        --output-dir ort/models/bge-base-en-v1.5-onnx
 
-The output directory will contain:
-    model.onnx              - Base ONNX model (FP32)
-    model_opt.onnx          - Optimized model (FP32, fused attention)
-    model_fp16.onnx         - Optimized model (FP16, fused attention)
-    model_fp16_pooled.onnx  - Final model (FP16 backbone, INT32 inputs,
-                              fused FP16 pooling)
+Output files
+------------
+::
+
+    model.onnx              - Base ONNX export (FP32, debugging only)
+    model_opt.onnx          - After graph optimisation (FP32, debugging only)
+    model_fp16.onnx         - After FP16 conversion (debugging only)
+    model_fp16_pooled.onnx  - Final model used by tributary
 """
 
 import argparse
@@ -115,11 +125,14 @@ def fuse_mean_pool_l2_norm(model) -> None:
     applied only on the reduced ``[B, 768]`` output — saving ~2× memory
     bandwidth through the reduction.
 
-    The ``attention_mask`` model input (already present) is reused as the
-    pooling weight.
+    L2 normalisation is decomposed into ``Mul`` → ``ReduceSum`` → ``Sqrt``
+    → ``Clip`` → ``Div`` rather than using the ONNX ``LpNormalization`` op,
+    because ORT has no CUDA kernel for ``LpNormalization`` — it falls back to
+    CPU, causing a GPU→CPU→GPU data bounce.  The manual decomposition keeps
+    the entire pooling tail on-GPU.
 
-    All new ops use **opset 17** conventions (axes-as-input for ReduceSum /
-    Unsqueeze).
+    The ``attention_mask`` model input (already present) is reused as the
+    pooling weight.  All new ops use **opset 17** conventions.
     """
     from onnx import TensorProto, helper, numpy_helper
 
@@ -368,16 +381,6 @@ def main():
         default=768,
         help="Hidden size (default: 768 for BERT-base)",
     )
-    parser.add_argument(
-        "--skip-fp16",
-        action="store_true",
-        help="Skip FP16 conversion (useful for debugging)",
-    )
-    parser.add_argument(
-        "--skip-fuse-pooling",
-        action="store_true",
-        help="Skip post-processing (input optimization + pooling fusion)",
-    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -428,64 +431,54 @@ def main():
             print(f"    {op}: {count}")
 
     # ── Step 3: Convert to FP16 ──────────────────────────────────────────
-    if not args.skip_fp16:
-        print(f"\n{'=' * 60}")
-        print("Step 3: Converting to FP16")
-        print(f"{'=' * 60}")
+    print(f"\n{'=' * 60}")
+    print("Step 3: Converting to FP16")
+    print(f"{'=' * 60}")
 
-        opt_model.convert_float_to_float16(
-            keep_io_types=True  # Keep inputs/outputs as FP32 for compatibility
-        )
+    opt_model.convert_float_to_float16(
+        keep_io_types=True  # Keep inputs/outputs as FP32 for compatibility
+    )
 
-        fp16_path = output_dir / "model_fp16.onnx"
-        opt_model.save_model_to_file(str(fp16_path))
-        print(f"  FP16 model saved to: {fp16_path}")
-        print(f"  Size: {os.path.getsize(fp16_path) / 1024 / 1024:.1f} MB")
-    else:
-        fp16_path = opt_path
-        print("\n  Skipping FP16 conversion (--skip-fp16)")
+    fp16_path = output_dir / "model_fp16.onnx"
+    opt_model.save_model_to_file(str(fp16_path))
+    print(f"  FP16 model saved to: {fp16_path}")
+    print(f"  Size: {os.path.getsize(fp16_path) / 1024 / 1024:.1f} MB")
 
-    # ── Step 4: Post-processing (input optimization + pooling fusion) ───
-    if not args.skip_fuse_pooling:
-        print(f"\n{'=' * 60}")
-        print("Step 4: Post-processing (input optimization + pooling fusion)")
-        print(f"{'=' * 60}")
+    # ── Step 4: Post-processing (INT32 inputs + fused FP16 pooling) ─────
+    print(f"\n{'=' * 60}")
+    print("Step 4: Post-processing (INT32 inputs + fused FP16 pooling)")
+    print(f"{'=' * 60}")
 
-        import onnx
+    import onnx
 
-        post_model = onnx.load(str(fp16_path))
-        optimize_inputs(post_model)
-        fuse_mean_pool_l2_norm(post_model)
+    post_model = onnx.load(str(fp16_path))
+    optimize_inputs(post_model)
+    fuse_mean_pool_l2_norm(post_model)
 
-        pooled_path = output_dir / "model_fp16_pooled.onnx"
-        onnx.checker.check_model(post_model)
-        onnx.save(post_model, str(pooled_path))
-        print(f"  Final model saved to: {pooled_path}")
-        print(f"  Size: {os.path.getsize(pooled_path) / 1024 / 1024:.1f} MB")
-        fp16_path = pooled_path
-    else:
-        print("\n  Skipping post-processing (--skip-fuse-pooling)")
+    final_path = output_dir / "model_fp16_pooled.onnx"
+    onnx.checker.check_model(post_model)
+    onnx.save(post_model, str(final_path))
+    print(f"  Final model saved to: {final_path}")
+    print(f"  Size: {os.path.getsize(final_path) / 1024 / 1024:.1f} MB")
 
     # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
     print("Summary")
     print(f"{'=' * 60}")
 
-    import onnx
-
-    final_model = onnx.load(str(fp16_path))
+    summary_model = onnx.load(str(final_path))
     print(f"  Model: {args.model}")
-    print(f"  Opset: {final_model.opset_import[0].version}")
-    print(f"  Inputs:")
-    for inp in final_model.graph.input:
+    print(f"  Opset: {summary_model.opset_import[0].version}")
+    print("  Inputs:")
+    for inp in summary_model.graph.input:
         shape = [
             d.dim_param if d.dim_param else str(d.dim_value)
             for d in inp.type.tensor_type.shape.dim
         ]
         dtype = inp.type.tensor_type.elem_type
         print(f"    {inp.name}: [{', '.join(shape)}] (dtype={dtype})")
-    print(f"  Outputs:")
-    for out in final_model.graph.output:
+    print("  Outputs:")
+    for out in summary_model.graph.output:
         shape = [
             d.dim_param if d.dim_param else str(d.dim_value)
             for d in out.type.tensor_type.shape.dim
@@ -493,9 +486,9 @@ def main():
         dtype = out.type.tensor_type.elem_type
         print(f"    {out.name}: [{', '.join(shape)}] (dtype={dtype})")
 
-    final_size = os.path.getsize(fp16_path)
+    final_size = os.path.getsize(final_path)
     print(f"\n  Final model size: {final_size / 1024 / 1024:.1f} MB")
-    print(f"  Output path:      {fp16_path}")
+    print(f"  Output path:      {final_path}")
 
 
 if __name__ == "__main__":
