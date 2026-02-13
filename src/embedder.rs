@@ -37,7 +37,6 @@
 
 use std::path::PathBuf;
 
-use half::f16;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use ort::io_binding::IoBinding;
 use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
@@ -615,12 +614,6 @@ impl OrtEmbedder {
             .ok_or_else(|| EmbedderError::EmbedError("No embedding returned".to_string()))
     }
 
-    /// Embed a single text string, returning f16 embeddings (for storage).
-    pub fn embed_one_f16(&self, text: &str) -> Result<Vec<f16>> {
-        self.embed_one(text)
-            .map(|v| v.into_iter().map(f16::from_f32).collect())
-    }
-
     // ====================================================================
     // Batch Embedding API
     // ====================================================================
@@ -636,26 +629,10 @@ impl OrtEmbedder {
         ort_infer(&mut ctx, batch)
     }
 
-    /// Embed a batch of text strings, returning f16 embeddings (for storage).
-    pub fn embed_batch_f16(&self, texts: &[&str]) -> Result<Vec<Vec<f16>>> {
-        self.embed_batch(texts).map(|batch| {
-            batch
-                .into_iter()
-                .map(|v| v.into_iter().map(f16::from_f32).collect())
-                .collect()
-        })
-    }
-
     /// Embed owned strings in batch.
     pub fn embed_batch_owned(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         self.embed_batch(&refs)
-    }
-
-    /// Embed owned strings in batch, returning f16.
-    pub fn embed_batch_owned_f16(&self, texts: &[String]) -> Result<Vec<Vec<f16>>> {
-        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        self.embed_batch_f16(&refs)
     }
 
     // ====================================================================
@@ -730,19 +707,6 @@ impl OrtEmbedder {
         Ok(result)
     }
 
-    /// Process a large batch in chunks, returning f16.
-    pub fn embed_batch_chunked_f16(
-        &self,
-        texts: &[&str],
-        chunk_size: usize,
-    ) -> Result<Vec<Vec<f16>>> {
-        self.embed_batch_chunked(texts, chunk_size).map(|batch| {
-            batch
-                .into_iter()
-                .map(|v| v.into_iter().map(f16::from_f32).collect())
-                .collect()
-        })
-    }
 }
 
 /// Backwards-compatible type alias.
@@ -753,8 +717,8 @@ pub type Embedder = OrtEmbedder;
 // ============================================================================
 
 /// Create a placeholder embedding (zeros) for lazy initialization.
-pub fn placeholder_embedding(dim: usize) -> Vec<f16> {
-    vec![f16::ZERO; dim]
+pub fn placeholder_embedding(dim: usize) -> Vec<f32> {
+    vec![0.0_f32; dim]
 }
 
 // ============================================================================
@@ -781,7 +745,7 @@ mod tests {
     fn test_placeholder_embedding() {
         let placeholder = placeholder_embedding(1024);
         assert_eq!(placeholder.len(), 1024);
-        assert!(placeholder.iter().all(|&v| v == f16::ZERO));
+        assert!(placeholder.iter().all(|&v| v == 0.0_f32));
     }
 
     // ========================================================================
