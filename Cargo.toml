@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 arrow = { version = "57.3", default-features = true, features = ["ipc"] }
-burn = { version = "0.20.1", features = ["std", "tui", "train", "vision", "cuda", "fusion"] }
+burn = { version = "0.20.1", features = ["std", "tui", "train", "vision", "cuda", "wgpu", "fusion", "collective"] }
 clap = { version = "4.5.57", features = ["derive"] }
 hf-hub = "0.4.3"
 indicatif = "0.18.3"

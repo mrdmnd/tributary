@@ -7,4 +7,3 @@ pub mod common;
 pub mod embedder;
 pub mod model;
 pub mod training;
-pub mod utils;

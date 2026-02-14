@@ -1,5 +1,5 @@
 [build]
-rustflags = ["-Clink-arg=-fuse-ld=lld", "-Ctarget-cpu=native"]
+rustflags = ["-Ctarget-cpu=native"]
 
 [env]
 # Point ort's load-dynamic feature at the CUDA 13 ONNX Runtime library.
