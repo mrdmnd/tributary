@@ -5,6 +5,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+use half::f16;
 use memmap2::Mmap;
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -57,8 +58,8 @@ pub enum SemanticType {
     /// Normalization: embed each cell value with frozen text embedding model
     Text = 5,
 
-    /// Everything else is unsupported.
-    Unsupported = 6,
+    /// Column is deliberately ignored — no data is stored or processed.
+    Ignored = 6,
 }
 
 // ============================================================================
@@ -80,6 +81,11 @@ pub struct ColumnIdx(pub u32);
 #[rkyv(derive(Debug, Hash, PartialEq, Eq))]
 pub struct RowIdx(pub u32);
 
+/// Global task index in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug, Hash, PartialEq, Eq))]
+pub struct TaskIdx(pub u32);
+
 /// Index into the interned text embedding vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug, Hash, PartialEq, Eq))]
@@ -93,7 +99,6 @@ pub struct ColumnMetadata {
     pub name: String,
     pub stype: SemanticType,
     pub fkey_target_col: Option<ColumnIdx>,
-    pub is_prediction_target: bool, // True if this column is a legal prediction target for the model.
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -102,6 +107,41 @@ pub struct TableMetadata {
     pub col_range: (ColumnIdx, ColumnIdx), // The range of global column indices for the table [start, end)
     pub row_range: (RowIdx, RowIdx), // The range of global row indices for the table [start, end)
     pub pkey_col: Option<ColumnIdx>, // The primary key column index for the table, if it has one.
+}
+
+/// Metadata for a single prediction task.
+///
+/// Each task is defined by a SQL query that materializes ground-truth labels as
+/// `(anchor_row, {observation_time}, target_value)` tuples. The preprocessor
+/// executes the query and stores the results in a `<task_name>.bin` file.
+///
+/// During training, the sampler picks a task, draws seeds from its anchor rows,
+/// builds BFS subgraphs, and the model predicts the target value. The target
+/// column comes from the materialized task table, not from any column in the
+/// original database tables (though for cell-masking tasks they may coincide).
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub struct TaskMetadata {
+    /// Human-readable task name (e.g. "predict_vote_type").
+    pub name: String,
+
+    /// Which table anchors the subgraph sampling for this task.
+    pub anchor_table: TableIdx,
+
+    /// Semantic type of the prediction target.
+    /// Only `Numerical`, `Categorical`, `Boolean`, and `Timestamp` are valid here.
+    pub target_stype: SemanticType,
+
+    /// Whether this task has an explicit observation time per seed row.
+    /// If `false`, the sampler falls back to the anchor table's `temporal_column`
+    /// (if any), or disables temporal filtering entirely.
+    pub has_observation_time: bool,
+
+    /// Number of seed rows (anchor_row, target_value pairs) in the materialized task table.
+    pub num_seeds: u32,
+
+    /// Statistics for the target column, used for normalization and loss computation.
+    /// Variant matches `target_stype` (e.g. `ColumnStats::Numerical` for numerical targets).
+    pub target_stats: ColumnStats,
 }
 
 /// Per-column statistics, determined during preprocessing.
@@ -158,16 +198,23 @@ pub enum ColumnStats {
     /// Text: null count
     Text { num_nulls: u64 },
 
-    /// Unsupported columns carry no stats.
-    Unsupported,
+    /// Ignored columns carry no stats.
+    Ignored,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct DatabaseMetadata {
     pub table_metadata: Vec<TableMetadata>, // List of tables in the database, indexed by TableIdx
     pub column_metadata: Vec<ColumnMetadata>, // List of columns in the database, indexed by ColumnIdx
-    pub column_embeddings: Vec<Vec<f32>>, // List of column name+(description) embeddings, indexed by ColumnIdx
     pub column_stats: Vec<ColumnStats>,   // List of column stats, indexed by ColumnIdx
+    pub task_metadata: Vec<TaskMetadata>, // List of prediction tasks, indexed by TaskIdx
+
+    /// Global mean of all non-null timestamp values across every table (epoch microseconds).
+    /// Used for the z-score component of timestamp encoding so that all timestamps are
+    /// on the same scale regardless of which column they came from.
+    pub global_ts_mean_us: f64,
+    /// Global standard deviation of all non-null timestamp values across every table (microseconds).
+    pub global_ts_std_us: f64,
 }
 
 // ============================================================================
@@ -570,18 +617,21 @@ const TABLE_ALIGNMENT: usize = 8;
 
 /// Interned text embedding table backed by a memory-mapped flat binary file.
 ///
-/// The file contains a packed `[num_embeddings, EMBEDDING_DIM]` array of `f32`
+/// The file contains a packed `[num_embeddings, EMBEDDING_DIM]` array of `f16`
 /// values (little-endian, native byte order). The mmap is read-only and shared
 /// across processes.
+///
+/// The first `num_columns` entries are column-name embeddings (indexed by
+/// `ColumnIdx`), followed by vocab embeddings for categorical / text values.
 pub struct EmbeddingTable {
     /// Keeps the memory map alive for the lifetime of the table.
     _mmap: Arc<Mmap>,
-    /// View into the mmap as a flat f32 slice.
+    /// View into the mmap as a flat f16 slice.
     ///
     /// # Safety
     /// Lifetime is logically tied to `_mmap` which is kept alive by Arc.
     /// The `'static` lifetime is safe because the Arc prevents deallocation.
-    data: &'static [f32],
+    data: &'static [f16],
     /// Number of distinct embeddings in the table.
     num_embeddings: usize,
 }
@@ -589,28 +639,30 @@ pub struct EmbeddingTable {
 impl EmbeddingTable {
     /// Create an [`EmbeddingTable`] from a memory-mapped flat binary file.
     ///
-    /// The file must contain `num_embeddings * EMBEDDING_DIM` packed `f32` values
-    /// (i.e., its byte length must be a multiple of `EMBEDDING_DIM * 4`).
+    /// The file must contain `num_embeddings * EMBEDDING_DIM` packed `f16` values
+    /// (i.e., its byte length must be a multiple of `EMBEDDING_DIM * 2`).
     ///
     /// # Panics
-    /// Panics if the file size is not a multiple of `EMBEDDING_DIM * sizeof(f32)`.
+    /// Panics if the file size is not a multiple of `EMBEDDING_DIM * sizeof(f16)`.
     pub fn from_mmap(mmap: Arc<Mmap>) -> Self {
         let byte_len = mmap.len();
-        let stride = EMBEDDING_DIM * std::mem::size_of::<f32>();
+        let stride = EMBEDDING_DIM * std::mem::size_of::<f16>();
         assert!(
             byte_len % stride == 0,
             "embedding file size ({byte_len} bytes) is not a multiple of \
-             EMBEDDING_DIM ({EMBEDDING_DIM}) * sizeof(f32) = {stride} bytes",
+             EMBEDDING_DIM ({EMBEDDING_DIM}) * sizeof(f16) = {stride} bytes",
         );
         let num_embeddings = byte_len / stride;
-        let num_floats = num_embeddings * EMBEDDING_DIM;
+        let num_f16s = num_embeddings * EMBEDDING_DIM;
 
         // SAFETY: The mmap is read-only and immutable. The Arc keeps the
         // backing memory alive for as long as this struct exists. We extend
         // the slice lifetime to 'static because the Arc prevents deallocation.
-        let data: &'static [f32] = unsafe {
-            let ptr = mmap.as_ptr() as *const f32;
-            std::slice::from_raw_parts(ptr, num_floats)
+        // f16 is repr(transparent) over u16 (2-byte aligned), and mmap
+        // pointers are page-aligned, so alignment is satisfied.
+        let data: &'static [f16] = unsafe {
+            let ptr = mmap.as_ptr() as *const f16;
+            std::slice::from_raw_parts(ptr, num_f16s)
         };
 
         Self {
@@ -627,11 +679,11 @@ impl EmbeddingTable {
 
     /// Look up an embedding vector by index.
     ///
-    /// Returns a slice of [`EMBEDDING_DIM`] floats.
+    /// Returns a slice of [`EMBEDDING_DIM`] `f16` values.
     ///
     /// # Panics
     /// Panics if `idx` is out of bounds.
-    pub fn get(&self, idx: EmbeddingIdx) -> &[f32] {
+    pub fn get(&self, idx: EmbeddingIdx) -> &[f16] {
         let i = idx.0 as usize;
         assert!(
             i < self.num_embeddings,
@@ -650,7 +702,7 @@ impl EmbeddingTable {
 /// Typed, zero-copy view into a single column's data within a [`TableView`].
 ///
 /// Each variant holds `&'static` slices that point directly into the
-/// memory-mapped `table_XXXX.bin` file. The `Arc<Mmap>` in the parent
+/// memory-mapped `<table_name>.bin` file. The `Arc<Mmap>` in the parent
 /// [`TableView`] keeps the backing memory alive.
 ///
 /// ## Encoding summary
@@ -663,13 +715,11 @@ impl EmbeddingTable {
 /// | Boolean       | validity bitmap + packed bits      | true/false, null = DB NULL       |
 /// | Categorical   | validity bitmap + `[u32]`          | EmbeddingIdx, null = DB NULL     |
 /// | Text          | validity bitmap + `[u32]`          | EmbeddingIdx, null = DB NULL     |
-/// | Unsupported   | nothing stored                     | column is skipped entirely       |
+/// | Ignored   | nothing stored                     | column is skipped entirely       |
 pub enum ColumnSlice {
     /// Identifier: packed bits, non-nullable.
     /// `true` = value present in source DB, `false` = source DB NULL.
-    Identifier {
-        bits: &'static [u8],
-    },
+    Identifier { bits: &'static [u8] },
 
     /// Numerical: z-scored f32 values with validity bitmap.
     Numerical {
@@ -697,13 +747,13 @@ pub enum ColumnSlice {
         indices: &'static [u32],
     },
 
-    /// Unsupported columns store no data.
-    Unsupported,
+    /// Ignored columns store no data.
+    Ignored,
 }
 
 /// A zero-copy, memory-mapped view of a single preprocessed table.
 ///
-/// Backed by a flat binary file (`table_XXXX.bin`) containing a small header
+/// Backed by a flat binary file (`<table_name>.bin`) containing a small header
 /// followed by packed column data. Multiple processes mmapping the same file
 /// share the same physical pages via the OS page cache.
 ///
@@ -718,7 +768,7 @@ pub enum ColumnSlice {
 ///   For each column (in metadata col_range order):
 ///     [validity bitmap — ceil(num_rows/8) bytes, padded to 8B]  (nullable types only)
 ///     [values — type-dependent size, padded to 8B]
-///     (Unsupported columns contribute 0 bytes)
+///     (Ignored columns contribute 0 bytes)
 /// ```
 ///
 /// Column types are **not** stored in the file — they are read from
@@ -733,7 +783,7 @@ pub struct TableView {
 }
 
 impl TableView {
-    /// Create a [`TableView`] from a memory-mapped `table_XXXX.bin` file.
+    /// Create a [`TableView`] from a memory-mapped `<table_name>.bin` file.
     ///
     /// `column_types` must list the [`SemanticType`] for every column in the
     /// table (matching the metadata's `col_range`). The function walks the
@@ -752,8 +802,7 @@ impl TableView {
         );
 
         // SAFETY: Mmap is page-aligned (>= 4-byte aligned). Header is 2 u32s.
-        let header: &[u32] =
-            unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u32, 2) };
+        let header: &[u32] = unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u32, 2) };
         let num_rows = header[0] as usize;
         let num_cols = header[1] as usize;
         assert_eq!(
@@ -776,26 +825,20 @@ impl TableView {
             //     the Arc prevents deallocation.
             //   - Offsets are 8-byte aligned, satisfying alignment for u32/f32.
             match stype {
-                SemanticType::Unsupported => {
-                    columns.push(ColumnSlice::Unsupported);
+                SemanticType::Ignored => {
+                    columns.push(ColumnSlice::Ignored);
                 }
                 SemanticType::Identifier => {
-                    let bits = unsafe {
-                        std::slice::from_raw_parts(base.add(offset), bitmap_len)
-                    };
+                    let bits = unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
                     offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
                     columns.push(ColumnSlice::Identifier { bits });
                 }
                 SemanticType::Numerical => {
-                    let validity = unsafe {
-                        std::slice::from_raw_parts(base.add(offset), bitmap_len)
-                    };
+                    let validity =
+                        unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
                     offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
                     let values = unsafe {
-                        std::slice::from_raw_parts(
-                            base.add(offset) as *const f32,
-                            num_rows,
-                        )
+                        std::slice::from_raw_parts(base.add(offset) as *const f32, num_rows)
                     };
                     offset = align_up(
                         offset + num_rows * std::mem::size_of::<f32>(),
@@ -804,16 +847,12 @@ impl TableView {
                     columns.push(ColumnSlice::Numerical { validity, values });
                 }
                 SemanticType::Timestamp => {
-                    let validity = unsafe {
-                        std::slice::from_raw_parts(base.add(offset), bitmap_len)
-                    };
+                    let validity =
+                        unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
                     offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
                     let total_floats = num_rows * TIMESTAMP_DIM;
                     let values = unsafe {
-                        std::slice::from_raw_parts(
-                            base.add(offset) as *const f32,
-                            total_floats,
-                        )
+                        std::slice::from_raw_parts(base.add(offset) as *const f32, total_floats)
                     };
                     offset = align_up(
                         offset + total_floats * std::mem::size_of::<f32>(),
@@ -822,26 +861,19 @@ impl TableView {
                     columns.push(ColumnSlice::Timestamp { validity, values });
                 }
                 SemanticType::Boolean => {
-                    let validity = unsafe {
-                        std::slice::from_raw_parts(base.add(offset), bitmap_len)
-                    };
+                    let validity =
+                        unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
                     offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
-                    let bits = unsafe {
-                        std::slice::from_raw_parts(base.add(offset), bitmap_len)
-                    };
+                    let bits = unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
                     offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
                     columns.push(ColumnSlice::Boolean { validity, bits });
                 }
                 SemanticType::Categorical | SemanticType::Text => {
-                    let validity = unsafe {
-                        std::slice::from_raw_parts(base.add(offset), bitmap_len)
-                    };
+                    let validity =
+                        unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
                     offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
                     let indices = unsafe {
-                        std::slice::from_raw_parts(
-                            base.add(offset) as *const u32,
-                            num_rows,
-                        )
+                        std::slice::from_raw_parts(base.add(offset) as *const u32, num_rows)
                     };
                     offset = align_up(
                         offset + num_rows * std::mem::size_of::<u32>(),
@@ -869,7 +901,7 @@ impl TableView {
         self.num_rows
     }
 
-    /// Number of columns in this table (including Unsupported placeholders).
+    /// Number of columns in this table (including Ignored placeholders).
     pub fn num_columns(&self) -> usize {
         self.columns.len()
     }
@@ -882,7 +914,7 @@ impl TableView {
     /// Returns `true` if the cell at (`col`, `row`) is null.
     ///
     /// Identifier columns are never null (they use presence/absence encoding).
-    /// Unsupported columns always return `true` (treated as null).
+    /// Ignored columns always return `true` (treated as null).
     #[inline]
     pub fn is_null(&self, col: usize, row: usize) -> bool {
         match &self.columns[col] {
@@ -891,7 +923,7 @@ impl TableView {
             | ColumnSlice::Timestamp { validity, .. }
             | ColumnSlice::Boolean { validity, .. }
             | ColumnSlice::Embedded { validity, .. } => !bit_is_set(validity, row),
-            ColumnSlice::Unsupported => true,
+            ColumnSlice::Ignored => true,
         }
     }
 
@@ -981,18 +1013,27 @@ pub enum ColumnWriter<'a> {
     /// Identifier: packed presence bits, non-nullable.
     Identifier { bits: &'a [u8] },
     /// Numerical: validity bitmap + z-scored f32 values.
-    Numerical { validity: &'a [u8], values: &'a [f32] },
+    Numerical {
+        validity: &'a [u8],
+        values: &'a [f32],
+    },
     /// Timestamp: validity bitmap + `TIMESTAMP_DIM` × f32 per row.
-    Timestamp { validity: &'a [u8], values: &'a [f32] },
+    Timestamp {
+        validity: &'a [u8],
+        values: &'a [f32],
+    },
     /// Boolean: validity bitmap + packed value bits.
     Boolean { validity: &'a [u8], bits: &'a [u8] },
     /// Categorical or Text: validity bitmap + u32 embedding indices.
-    Embedded { validity: &'a [u8], indices: &'a [u32] },
-    /// Unsupported: nothing written.
-    Unsupported,
+    Embedded {
+        validity: &'a [u8],
+        indices: &'a [u32],
+    },
+    /// Ignored: nothing written.
+    Ignored,
 }
 
-/// Write a preprocessed table to a flat binary file (`table_XXXX.bin`).
+/// Write a preprocessed table to a flat binary file (`<table_name>.bin`).
 ///
 /// See [`TableView`] for the file layout. The column order must match the
 /// metadata's `col_range` for the table.
@@ -1035,7 +1076,10 @@ pub fn write_table_bin(
     fn f32_as_bytes(s: &[f32]) -> &[u8] {
         // SAFETY: f32 has no padding, well-defined layout.
         unsafe {
-            std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * std::mem::size_of::<f32>())
+            std::slice::from_raw_parts(
+                s.as_ptr() as *const u8,
+                s.len() * std::mem::size_of::<f32>(),
+            )
         }
     }
 
@@ -1043,13 +1087,16 @@ pub fn write_table_bin(
     fn u32_as_bytes(s: &[u32]) -> &[u8] {
         // SAFETY: u32 has no padding, well-defined layout.
         unsafe {
-            std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * std::mem::size_of::<u32>())
+            std::slice::from_raw_parts(
+                s.as_ptr() as *const u8,
+                s.len() * std::mem::size_of::<u32>(),
+            )
         }
     }
 
     for col in columns {
         match col {
-            ColumnWriter::Unsupported => {}
+            ColumnWriter::Ignored => {}
             ColumnWriter::Identifier { bits } => {
                 debug_assert_eq!(bits.len(), bitmap_len);
                 write_padded(&mut w, bits, &mut offset)?;
@@ -1086,17 +1133,365 @@ pub fn write_table_bin(
 }
 
 // ============================================================================
+// Task Storage (zero-copy mmap'd materialized task tables)
+// ============================================================================
+
+/// A zero-copy, memory-mapped view of a single materialized prediction task.
+///
+/// Each task is produced by executing a SQL query during preprocessing, yielding
+/// `(anchor_row, {observation_time}, target_value)` tuples. The binary file
+/// packs this data densely for zero-copy access at training time.
+///
+/// ## File layout
+///
+/// ```text
+/// Header (8 bytes, 8-byte aligned):
+///   num_seeds : u32     — number of (anchor_row, target) pairs
+///   flags     : u32     — bit 0: has_observation_time
+///
+/// Body (packed sequentially, each section 8-byte aligned):
+///   anchor_rows       : [u32; num_seeds]                  — global RowIdx per seed
+///   observation_times : [i64; num_seeds]                  — epoch μs (only if flag bit 0 set)
+///   target validity   : packed bits [ceil(num_seeds/8)]   — 1 = valid, 0 = null
+///   target values     : type-dependent:
+///     Numerical   → [f32; num_seeds]                      — z-scored values
+///     Categorical → [u32; num_seeds]                      — EmbeddingIdx
+///     Boolean     → packed bits [ceil(num_seeds/8)]       — true/false
+///     Timestamp   → [f32; num_seeds × TIMESTAMP_DIM]      — cyclic + z-epoch
+/// ```
+///
+/// The target's semantic type is **not** stored in the file — it is read from
+/// [`TaskMetadata::target_stype`] at load time.
+pub struct TaskView {
+    /// Keeps the memory map alive for the lifetime of the view.
+    _mmap: Arc<Mmap>,
+    /// Number of seed rows in this task.
+    num_seeds: usize,
+    /// Global RowIdx for each seed (length = num_seeds).
+    anchor_rows: &'static [u32],
+    /// Observation times in epoch microseconds, if the task has them.
+    observation_times: Option<&'static [i64]>,
+    /// The target column, encoded identically to a [`ColumnSlice`].
+    target: ColumnSlice,
+}
+
+/// Flag bit: task file includes observation times.
+const TASK_FLAG_HAS_OBS_TIME: u32 = 1;
+
+impl TaskView {
+    /// Create a [`TaskView`] from a memory-mapped `<task_name>.bin` file.
+    ///
+    /// `target_stype` must be the task's target semantic type from
+    /// [`TaskMetadata`]. Only `Numerical`, `Categorical`, `Boolean`, and
+    /// `Timestamp` are valid target types.
+    ///
+    /// # Panics
+    /// Panics if the file is too small, if `target_stype` is not a valid
+    /// target type, or if the computed file size doesn't match the actual size.
+    pub fn from_mmap(mmap: Arc<Mmap>, target_stype: SemanticType) -> Self {
+        let byte_len = mmap.len();
+        let header_bytes = 2 * std::mem::size_of::<u32>();
+        assert!(
+            byte_len >= header_bytes,
+            "task file too small for header ({byte_len} < {header_bytes} bytes)",
+        );
+
+        // SAFETY: Mmap is page-aligned (>= 4-byte aligned). Header is 2 u32s.
+        let header: &[u32] = unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u32, 2) };
+        let num_seeds = header[0] as usize;
+        let flags = header[1];
+        let has_obs_time = (flags & TASK_FLAG_HAS_OBS_TIME) != 0;
+
+        let bitmap_len = packed_bit_bytes(num_seeds);
+        let mut offset = align_up(header_bytes, TABLE_ALIGNMENT);
+        let base = mmap.as_ptr();
+
+        // SAFETY for all slices below:
+        //   - The mmap is read-only and immutable.
+        //   - The Arc keeps the backing memory alive for as long as this struct
+        //     exists. We extend slice lifetimes to 'static because the Arc
+        //     prevents deallocation.
+        //   - Offsets are 8-byte aligned, satisfying alignment for u32/f32/i64.
+
+        // -- anchor_rows: [u32; num_seeds] --
+        let anchor_rows: &'static [u32] =
+            unsafe { std::slice::from_raw_parts(base.add(offset) as *const u32, num_seeds) };
+        offset = align_up(
+            offset + num_seeds * std::mem::size_of::<u32>(),
+            TABLE_ALIGNMENT,
+        );
+
+        // -- observation_times: [i64; num_seeds] (optional) --
+        let observation_times = if has_obs_time {
+            let times: &'static [i64] =
+                unsafe { std::slice::from_raw_parts(base.add(offset) as *const i64, num_seeds) };
+            offset = align_up(
+                offset + num_seeds * std::mem::size_of::<i64>(),
+                TABLE_ALIGNMENT,
+            );
+            Some(times)
+        } else {
+            None
+        };
+
+        // -- target column: validity bitmap + typed values --
+        let target = match target_stype {
+            SemanticType::Numerical => {
+                let validity = unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
+                offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
+                let values = unsafe {
+                    std::slice::from_raw_parts(base.add(offset) as *const f32, num_seeds)
+                };
+                offset = align_up(
+                    offset + num_seeds * std::mem::size_of::<f32>(),
+                    TABLE_ALIGNMENT,
+                );
+                ColumnSlice::Numerical { validity, values }
+            }
+            SemanticType::Timestamp => {
+                let validity = unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
+                offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
+                let total_floats = num_seeds * TIMESTAMP_DIM;
+                let values = unsafe {
+                    std::slice::from_raw_parts(base.add(offset) as *const f32, total_floats)
+                };
+                offset = align_up(
+                    offset + total_floats * std::mem::size_of::<f32>(),
+                    TABLE_ALIGNMENT,
+                );
+                ColumnSlice::Timestamp { validity, values }
+            }
+            SemanticType::Boolean => {
+                let validity = unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
+                offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
+                let bits = unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
+                offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
+                ColumnSlice::Boolean { validity, bits }
+            }
+            SemanticType::Categorical => {
+                let validity = unsafe { std::slice::from_raw_parts(base.add(offset), bitmap_len) };
+                offset = align_up(offset + bitmap_len, TABLE_ALIGNMENT);
+                let indices = unsafe {
+                    std::slice::from_raw_parts(base.add(offset) as *const u32, num_seeds)
+                };
+                offset = align_up(
+                    offset + num_seeds * std::mem::size_of::<u32>(),
+                    TABLE_ALIGNMENT,
+                );
+                ColumnSlice::Embedded { validity, indices }
+            }
+            _ => panic!(
+                "invalid target_stype {:?} for task (must be Numerical, Categorical, Boolean, or Timestamp)",
+                target_stype,
+            ),
+        };
+
+        assert_eq!(
+            offset, byte_len,
+            "task file size mismatch: layout expects {offset} bytes, file is {byte_len}",
+        );
+
+        Self {
+            _mmap: mmap,
+            num_seeds,
+            anchor_rows,
+            observation_times,
+            target,
+        }
+    }
+
+    /// Number of seed rows in this task.
+    pub fn num_seeds(&self) -> usize {
+        self.num_seeds
+    }
+
+    /// Get the global [`RowIdx`] for a seed.
+    ///
+    /// # Panics
+    /// Panics if `seed` is out of bounds.
+    #[inline]
+    pub fn anchor_row(&self, seed: usize) -> RowIdx {
+        RowIdx(self.anchor_rows[seed])
+    }
+
+    /// Get the observation time (epoch microseconds) for a seed.
+    ///
+    /// Returns `None` if the task has no observation time column.
+    ///
+    /// # Panics
+    /// Panics if `seed` is out of bounds and observation times are present.
+    #[inline]
+    pub fn observation_time(&self, seed: usize) -> Option<i64> {
+        self.observation_times.map(|times| times[seed])
+    }
+
+    /// Whether this task has observation times.
+    pub fn has_observation_time(&self) -> bool {
+        self.observation_times.is_some()
+    }
+
+    /// Get the target column as a [`ColumnSlice`].
+    ///
+    /// The variant matches the task's `target_stype`:
+    /// - `Numerical` → [`ColumnSlice::Numerical`]
+    /// - `Categorical` → [`ColumnSlice::Embedded`]
+    /// - `Boolean` → [`ColumnSlice::Boolean`]
+    /// - `Timestamp` → [`ColumnSlice::Timestamp`]
+    pub fn target(&self) -> &ColumnSlice {
+        &self.target
+    }
+
+    /// Returns `true` if the target value at `seed` is null.
+    #[inline]
+    pub fn target_is_null(&self, seed: usize) -> bool {
+        match &self.target {
+            ColumnSlice::Numerical { validity, .. }
+            | ColumnSlice::Timestamp { validity, .. }
+            | ColumnSlice::Boolean { validity, .. }
+            | ColumnSlice::Embedded { validity, .. } => !bit_is_set(validity, seed),
+            _ => unreachable!("task targets are always nullable typed columns"),
+        }
+    }
+}
+
+// ============================================================================
+// Task Binary Writer (used by preprocessor)
+// ============================================================================
+
+/// Write a materialized task to a flat binary file (`<task_name>.bin`).
+///
+/// See [`TaskView`] for the file layout.
+///
+/// `target` must be a [`ColumnWriter`] variant matching the task's `target_stype`:
+/// `Numerical`, `Timestamp`, `Boolean`, or `Embedded` (for categoricals).
+///
+/// # Panics (debug builds)
+/// Panics if buffer lengths don't match `num_seeds`.
+pub fn write_task_bin(
+    path: &Path,
+    num_seeds: u32,
+    anchor_rows: &[u32],
+    observation_times: Option<&[i64]>,
+    target: &ColumnWriter,
+) -> std::io::Result<()> {
+    debug_assert_eq!(anchor_rows.len(), num_seeds as usize);
+    if let Some(times) = observation_times {
+        debug_assert_eq!(times.len(), num_seeds as usize);
+    }
+
+    let mut w = BufWriter::new(File::create(path)?);
+
+    // -- Header (8 bytes) ---------------------------------------------------
+    let flags: u32 = if observation_times.is_some() {
+        TASK_FLAG_HAS_OBS_TIME
+    } else {
+        0
+    };
+    w.write_all(&num_seeds.to_ne_bytes())?;
+    w.write_all(&flags.to_ne_bytes())?;
+    let mut offset = align_up(8, TABLE_ALIGNMENT); // already 8
+
+    let bitmap_len = packed_bit_bytes(num_seeds as usize);
+
+    fn write_padded(
+        w: &mut BufWriter<File>,
+        data: &[u8],
+        offset: &mut usize,
+    ) -> std::io::Result<()> {
+        w.write_all(data)?;
+        *offset += data.len();
+        let aligned = align_up(*offset, TABLE_ALIGNMENT);
+        let pad = aligned - *offset;
+        if pad > 0 {
+            w.write_all(&[0u8; 8][..pad])?;
+        }
+        *offset = aligned;
+        Ok(())
+    }
+
+    fn u32_as_bytes(s: &[u32]) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                s.as_ptr() as *const u8,
+                s.len() * std::mem::size_of::<u32>(),
+            )
+        }
+    }
+
+    fn i64_as_bytes(s: &[i64]) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                s.as_ptr() as *const u8,
+                s.len() * std::mem::size_of::<i64>(),
+            )
+        }
+    }
+
+    fn f32_as_bytes(s: &[f32]) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                s.as_ptr() as *const u8,
+                s.len() * std::mem::size_of::<f32>(),
+            )
+        }
+    }
+
+    // -- anchor_rows --
+    write_padded(&mut w, u32_as_bytes(anchor_rows), &mut offset)?;
+
+    // -- observation_times (optional) --
+    if let Some(times) = observation_times {
+        write_padded(&mut w, i64_as_bytes(times), &mut offset)?;
+    }
+
+    // -- target column --
+    match target {
+        ColumnWriter::Numerical { validity, values } => {
+            debug_assert_eq!(validity.len(), bitmap_len);
+            debug_assert_eq!(values.len(), num_seeds as usize);
+            write_padded(&mut w, validity, &mut offset)?;
+            write_padded(&mut w, f32_as_bytes(values), &mut offset)?;
+        }
+        ColumnWriter::Timestamp { validity, values } => {
+            debug_assert_eq!(validity.len(), bitmap_len);
+            debug_assert_eq!(values.len(), num_seeds as usize * TIMESTAMP_DIM);
+            write_padded(&mut w, validity, &mut offset)?;
+            write_padded(&mut w, f32_as_bytes(values), &mut offset)?;
+        }
+        ColumnWriter::Boolean { validity, bits } => {
+            debug_assert_eq!(validity.len(), bitmap_len);
+            debug_assert_eq!(bits.len(), bitmap_len);
+            write_padded(&mut w, validity, &mut offset)?;
+            write_padded(&mut w, bits, &mut offset)?;
+        }
+        ColumnWriter::Embedded { validity, indices } => {
+            debug_assert_eq!(validity.len(), bitmap_len);
+            debug_assert_eq!(indices.len(), num_seeds as usize);
+            write_padded(&mut w, validity, &mut offset)?;
+            write_padded(&mut w, u32_as_bytes(indices), &mut offset)?;
+        }
+        _ => panic!(
+            "invalid ColumnWriter variant for task target (must be Numerical, Timestamp, Boolean, or Embedded)"
+        ),
+    }
+
+    w.flush()?;
+    Ok(())
+}
+
+// ============================================================================
 // Database Wrapper
 // ============================================================================
 
 /// A preprocessed relational database, ready for training.
 ///
-/// Assembles four independently-stored components, **all** backed by
+/// Assembles five independently-stored components, **all** backed by
 /// memory-mapped files for zero-copy sharing across DDP processes:
 ///
-/// - **metadata** — schema, column stats, column-name embeddings (rkyv, deserialized into owned types; small KB)
+/// - **metadata** — schema, column stats, column-name embeddings, task definitions (rkyv, deserialized into owned types; small KB)
 /// - **graph** — bidirectional CSR topology (flat binary, mmap'd zero-copy via [`GraphView`])
 /// - **tables** — preprocessed column data (flat binary, mmap'd zero-copy via [`TableView`])
+/// - **tasks** — materialized prediction tasks (flat binary, mmap'd zero-copy via [`TaskView`])
 /// - **embeddings** — interned text embeddings for categorical/text columns (flat binary, mmap'd via [`EmbeddingTable`])
 ///
 /// The preprocessed database directory layout:
@@ -1105,22 +1500,30 @@ pub fn write_table_bin(
 /// db_out/
 ///   metadata.rkyv       — DatabaseMetadata (rkyv archive)
 ///   graph.bin           — bidirectional CSR (flat binary, see GraphView)
-///   embeddings.bin      — flat [N, 768] f32 array
+///   embeddings.bin      — flat [N, 768] f16 array (column embeddings first, then vocab)
 ///   tables/
-///     table_0000.bin    — flat binary column store for table 0 (see TableView)
-///     table_0001.bin    — flat binary column store for table 1
+///     badges.bin        — flat binary column store (see TableView)
+///     comments.bin
+///     ...
+///   tasks/
+///     predict_vote_type.bin  — materialized task (see TaskView)
+///     predict_post_type.bin
 ///     ...
 /// ```
 pub struct Database {
-    /// Schema, column stats, column name embeddings (deserialized, owned).
+    /// Schema, column stats, column name embeddings, task definitions (deserialized, owned).
     pub metadata: DatabaseMetadata,
 
     /// Bidirectional CSR graph topology, zero-copy from mmap'd `graph.bin`.
     pub graph: GraphView,
 
     /// Preprocessed column data: one [`TableView`] per table.
-    /// Each view is backed by a mmap'd `table_XXXX.bin` file.
+    /// Each view is backed by a mmap'd `<table_name>.bin` file.
     pub tables: Vec<TableView>,
+
+    /// Materialized prediction tasks: one [`TaskView`] per task.
+    /// Each view is backed by a mmap'd `<task_name>.bin` file.
+    pub tasks: Vec<TaskView>,
 
     /// Interned text embeddings for categorical and text columns.
     /// Indexed by [`EmbeddingIdx`] stored in Embedded columns of `tables`.
@@ -1134,7 +1537,6 @@ pub struct Database {
     /// One entry per table: `col_starts[i] = table_metadata[i].col_range.0`.
     col_starts: Vec<u32>,
 }
-
 
 impl Database {
     /// Load a preprocessed database from the given directory.
@@ -1162,12 +1564,12 @@ impl Database {
         let row_starts: Vec<u32> = metadata
             .table_metadata
             .iter()
-            .map(|t| t.row_range.0 .0)
+            .map(|t| t.row_range.0.0)
             .collect();
         let col_starts: Vec<u32> = metadata
             .table_metadata
             .iter()
-            .map(|t| t.col_range.0 .0)
+            .map(|t| t.col_range.0.0)
             .collect();
 
         // -- Tables (flat binary, mmap'd zero-copy) ---------------------------
@@ -1175,19 +1577,33 @@ impl Database {
         let num_tables = metadata.table_metadata.len();
         let mut tables = Vec::with_capacity(num_tables);
         for i in 0..num_tables {
-            let bin_path = tables_dir.join(format!("table_{i:04}.bin"));
+            let table_name = &metadata.table_metadata[i].name;
+            let bin_path = tables_dir.join(format!("{table_name}.bin"));
             let file = File::open(&bin_path)?;
             let mmap = Arc::new(unsafe { Mmap::map(&file)? });
 
             // Derive column types from metadata for this table.
             let tmeta = &metadata.table_metadata[i];
-            let col_start = tmeta.col_range.0 .0 as usize;
-            let col_end = tmeta.col_range.1 .0 as usize;
+            let col_start = tmeta.col_range.0.0 as usize;
+            let col_end = tmeta.col_range.1.0 as usize;
             let column_types: Vec<SemanticType> = (col_start..col_end)
                 .map(|ci| metadata.column_metadata[ci].stype)
                 .collect();
 
             tables.push(TableView::from_mmap(mmap, &column_types));
+        }
+
+        // -- Tasks (flat binary, mmap'd zero-copy) ----------------------------
+        let tasks_dir = dir.join("tasks");
+        let num_tasks = metadata.task_metadata.len();
+        let mut tasks = Vec::with_capacity(num_tasks);
+        for i in 0..num_tasks {
+            let task_name = &metadata.task_metadata[i].name;
+            let bin_path = tasks_dir.join(format!("{task_name}.bin"));
+            let file = File::open(&bin_path)?;
+            let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+            let target_stype = metadata.task_metadata[i].target_stype;
+            tasks.push(TaskView::from_mmap(mmap, target_stype));
         }
 
         // -- Embeddings (flat binary, mmap'd) --------------------------------
@@ -1200,6 +1616,7 @@ impl Database {
             metadata,
             graph,
             tables,
+            tasks,
             embeddings,
             row_starts,
             col_starts,
@@ -1239,9 +1656,17 @@ impl Database {
 
     /// Look up an embedding vector by index.
     ///
-    /// Returns a slice of [`EMBEDDING_DIM`] floats.
-    pub fn embedding(&self, idx: EmbeddingIdx) -> &[f32] {
+    /// Returns a slice of [`EMBEDDING_DIM`] `f16` values.
+    pub fn embedding(&self, idx: EmbeddingIdx) -> &[f16] {
         self.embeddings.get(idx)
+    }
+
+    /// Look up the column-name embedding for a given column.
+    ///
+    /// Column embeddings occupy the first `num_columns` entries of the
+    /// embedding table, so `ColumnIdx(i)` maps to `EmbeddingIdx(i)`.
+    pub fn column_embedding(&self, col: ColumnIdx) -> &[f16] {
+        self.embeddings.get(EmbeddingIdx(col.0))
     }
 
     /// Convert a global [`RowIdx`] to the local row offset within its table.
@@ -1249,7 +1674,7 @@ impl Database {
     /// This is the row index you pass to [`TableView`] accessor methods.
     pub fn local_row(&self, row: RowIdx) -> usize {
         let ti = self.row_table(row);
-        let row_start = self.metadata.table_metadata[ti.0 as usize].row_range.0 .0;
+        let row_start = self.metadata.table_metadata[ti.0 as usize].row_range.0.0;
         (row.0 - row_start) as usize
     }
 
@@ -1266,5 +1691,20 @@ impl Database {
         let ti = pos - 1;
         let local = (col.0 - self.col_starts[ti]) as usize;
         (ti, local)
+    }
+
+    /// Number of prediction tasks.
+    pub fn num_tasks(&self) -> usize {
+        self.metadata.task_metadata.len()
+    }
+
+    /// Get the [`TaskView`] for a specific task.
+    pub fn task(&self, idx: TaskIdx) -> &TaskView {
+        &self.tasks[idx.0 as usize]
+    }
+
+    /// Get the [`TaskMetadata`] for a specific task.
+    pub fn task_metadata(&self, idx: TaskIdx) -> &TaskMetadata {
+        &self.metadata.task_metadata[idx.0 as usize]
     }
 }

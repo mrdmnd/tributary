@@ -171,7 +171,7 @@ pub struct Model<B: Backend> {
 
     // Categorical projection layer: learn to separate category embeddings that may be too close in the frozen text
     // encoder space. For example, "status is A" and "status is B" have 0.93 cosine similarity with BGE.
-    // This project is applied to both input and target, so the loss becomes more discriminative as the projection
+    // This projection is applied to both input and target, so the loss becomes more discriminative as the projection
     // learns to push apart categories.
     category_projection: Linear<B>,
 
@@ -183,10 +183,11 @@ pub struct Model<B: Backend> {
     categorical_norm: RmsNorm<B>,
     text_norm: RmsNorm<B>,
 
-    // Mask embeddings - one per semantic type
-    // Shape is (num_semantic_types, dim_model)
-    // Indexed by SemanticType enum
-    // (for example, Numerical is 0, Timestamp is 1, Boolean is 2, Categorical is 3, Text is 4)
+    // Mask embeddings - one per maskable semantic type.
+    // Shape is (num_maskable_types, dim_model) where num_maskable_types = 5
+    // Index mapping (0-based into this table):
+    //   0 = Numerical, 1 = Timestamp, 2 = Boolean, 3 = Categorical, 4 = Text
+    // Note: Identifier and Ignored types are never masked, so they have no entry here.
     // Initialized to random normal.
     mask_embeddings: Param<Tensor<B, 2>>,
 

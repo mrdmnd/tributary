@@ -24,9 +24,9 @@ Pipeline
       using only CUDA-friendly primitives (Mul, ReduceSum, Sqrt, Clip, Div).
       The standard ONNX ``LpNormalization`` op is deliberately avoided because
       ORT lacks a CUDA kernel for it, which would force a GPU→CPU→GPU bounce.
-      A single FP16→FP32 cast is applied only on the reduced ``[B, 768]``
-      output, avoiding materialisation of the full ``[B, S, 768]`` tensor in
-      FP32.
+      The final ``[B, 768]`` output stays in FP16 — no cast to FP32.  This
+      halves the output transfer size and lets the Rust runtime store
+      embeddings natively in FP16.
 
 The final model (``model_fp16_pooled.onnx``) is the only artifact consumed by
 the tributary Rust runtime.  Intermediate files are retained for debugging.
@@ -35,8 +35,8 @@ Usage
 -----
 ::
 
-    uv run ort/scripts/export_onnx.py
-    uv run ort/scripts/export_onnx.py --model BAAI/bge-base-en-v1.5 \\
+    uv run scripts/export_onnx.py
+    uv run scripts/export_onnx.py --model BAAI/bge-base-en-v1.5 \\
         --output-dir ort/models/bge-base-en-v1.5-onnx
 
 Output files
@@ -46,7 +46,7 @@ Output files
     model.onnx              - Base ONNX export (FP32, debugging only)
     model_opt.onnx          - After graph optimisation (FP32, debugging only)
     model_fp16.onnx         - After FP16 conversion (debugging only)
-    model_fp16_pooled.onnx  - Final model used by tributary
+    model_fp16_pooled.onnx  - Final model (FP16 in/out, used by tributary)
 """
 
 import argparse
@@ -83,11 +83,7 @@ def optimize_inputs(model) -> None:
     cast_remap: dict[str, str] = {}  # cast_output → original_input
 
     for node in graph.node:
-        if (
-            node.op_type == "Cast"
-            and len(node.input) == 1
-            and node.input[0] in input_names
-        ):
+        if node.op_type == "Cast" and len(node.input) == 1 and node.input[0] in input_names:
             for attr in node.attribute:
                 if attr.name == "to" and attr.i == TensorProto.INT32:
                     cast_nodes_to_remove.append(node)
@@ -120,10 +116,11 @@ def fuse_mean_pool_l2_norm(model) -> None:
       - Old output  ``last_hidden_state  [B, S, 768]``
       - New output  ``embeddings         [B, 768]``
 
-    The pooling operations run entirely in **FP16** to avoid materialising
-    the full ``[B, S, 768]`` tensor in FP32.  A single FP16→FP32 cast is
-    applied only on the reduced ``[B, 768]`` output — saving ~2× memory
-    bandwidth through the reduction.
+    Mean-pooling is implemented as a **batched MatMul** rather than the naive
+    ``Mul([B,S,768]) + ReduceSum`` pattern.  The operation ``Σ_s h[b,s,d] *
+    mask[b,s]`` is expressed as ``MatMul(mask[B,1,S], hidden[B,S,768])``
+    which cuBLAS executes in a single fused kernel — no intermediate
+    ``[B,S,768]`` tensor is ever materialised.
 
     L2 normalisation is decomposed into ``Mul`` → ``ReduceSum`` → ``Sqrt``
     → ``Clip`` → ``Div`` rather than using the ONNX ``LpNormalization`` op,
@@ -132,7 +129,8 @@ def fuse_mean_pool_l2_norm(model) -> None:
     the entire pooling tail on-GPU.
 
     The ``attention_mask`` model input (already present) is reused as the
-    pooling weight.  All new ops use **opset 17** conventions.
+    pooling weight.  All new ops use **opset 17** conventions.  The final
+    output stays in FP16.
     """
     from onnx import TensorProto, helper, numpy_helper
 
@@ -152,7 +150,7 @@ def fuse_mean_pool_l2_norm(model) -> None:
     # ── Tap the FP16 tensor before the keep_io_types Cast ───────────────
     # convert_float_to_float16(keep_io_types=True) inserts a Cast(FP16→FP32)
     # at the output.  We remove it and feed the FP16 tensor directly into the
-    # pooling ops, casting to FP32 only on the much smaller [B, 768] result.
+    # pooling ops.  The final output stays in FP16 (no cast back to FP32).
     fp16_hidden_name = None
     cast_to_remove = None
     for node in graph.node:
@@ -172,77 +170,75 @@ def fuse_mean_pool_l2_norm(model) -> None:
         print("    Warning: no FP16→FP32 Cast found; pooling in output dtype")
 
     # ── Constant tensors (axes, epsilon) ────────────────────────────────
-    # Unsqueeze axes = [2]  (expand [B,S] → [B,S,1])
-    unsqueeze_axes = numpy_helper.from_array(
-        np.array([2], dtype=np.int64), name="pool_unsqueeze_axes"
-    )
-    # ReduceSum axes = [1]  (sum across seq_len dimension)
-    reduce_axes = numpy_helper.from_array(
-        np.array([1], dtype=np.int64), name="pool_reduce_axes"
-    )
+    # Unsqueeze axes = [1]  (expand [B,S] → [B,1,S] for MatMul)
+    unsqueeze_axes = numpy_helper.from_array(np.array([1], dtype=np.int64), name="pool_unsqueeze_axes")
+    # Squeeze axes = [1]  (collapse [B,1,H] → [B,H] after MatMul)
+    squeeze_axes = numpy_helper.from_array(np.array([1], dtype=np.int64), name="pool_squeeze_axes")
+    # ReduceSum axes = [1]  (sum across seq_len / hidden dimension)
+    reduce_axes = numpy_helper.from_array(np.array([1], dtype=np.int64), name="pool_reduce_axes")
     # Clip min in FP16 — use 1e-4 (safely in the FP16 normal range; smaller
     # values like 1e-7 fall into subnormal territory and some GPUs flush
     # subnormals to zero).  The mask sum is always >= 1 for valid inputs,
     # so this is purely a safety net.
-    clip_min = numpy_helper.from_array(
-        np.array(1e-4, dtype=np.float16), name="pool_clip_min"
-    )
+    clip_min = numpy_helper.from_array(np.array(1e-4, dtype=np.float16), name="pool_clip_min")
 
-    graph.initializer.extend([unsqueeze_axes, reduce_axes, clip_min])
+    graph.initializer.extend([unsqueeze_axes, squeeze_axes, reduce_axes, clip_min])
 
     # ── New nodes ───────────────────────────────────────────────────────
     new_nodes = []
 
-    # 1. Unsqueeze attention_mask: [B,S] → [B,S,1]
-    new_nodes.append(
-        helper.make_node(
-            "Unsqueeze",
-            inputs=["attention_mask", "pool_unsqueeze_axes"],
-            outputs=["pool_mask_3d"],
-            name="pool_Unsqueeze",
-        )
-    )
-
-    # 2. Cast mask to FP16 (not FP32 — pooling runs in FP16)
+    # 1. Cast attention_mask [B,S] INT32 → FP16 (before Unsqueeze so the
+    #    mask ReduceSum can branch off the [B,S] tensor directly).
     new_nodes.append(
         helper.make_node(
             "Cast",
-            inputs=["pool_mask_3d"],
+            inputs=["attention_mask"],
             outputs=["pool_mask_fp16"],
             name="pool_Cast",
             to=TensorProto.FLOAT16,
         )
     )
 
-    # 3. Mul: hidden_states * mask (both FP16) → zero out padding positions
+    # 2. Unsqueeze mask: [B,S] → [B,1,S] for the MatMul.
     new_nodes.append(
         helper.make_node(
-            "Mul",
-            inputs=[fp16_hidden_name, "pool_mask_fp16"],
-            outputs=["pool_masked_hidden"],
-            name="pool_Mul",
+            "Unsqueeze",
+            inputs=["pool_mask_fp16", "pool_unsqueeze_axes"],
+            outputs=["pool_mask_3d"],
+            name="pool_Unsqueeze",
         )
     )
 
-    # 4. ReduceSum(masked_hidden, axes=[1], keepdims=0) → [B, H] FP16
+    # 3. MatMul: [B,1,S] × [B,S,768] → [B,1,768]  (fused mask + reduce)
+    #    Replaces the old Mul([B,S,768]) + ReduceSum pattern — cuBLAS
+    #    executes this in a single kernel with no intermediate tensor.
     new_nodes.append(
         helper.make_node(
-            "ReduceSum",
-            inputs=["pool_masked_hidden", "pool_reduce_axes"],
+            "MatMul",
+            inputs=["pool_mask_3d", fp16_hidden_name],
+            outputs=["pool_sum_hidden_3d"],
+            name="pool_MatMul",
+        )
+    )
+
+    # 4. Squeeze: [B,1,768] → [B,768]
+    new_nodes.append(
+        helper.make_node(
+            "Squeeze",
+            inputs=["pool_sum_hidden_3d", "pool_squeeze_axes"],
             outputs=["pool_sum_hidden"],
-            name="pool_ReduceSum_hidden",
-            keepdims=0,
+            name="pool_Squeeze",
         )
     )
 
-    # 5. ReduceSum(mask_fp16, axes=[1], keepdims=0) → [B, 1] FP16
+    # 5. ReduceSum(mask_fp16[B,S], axes=[1], keepdims=1) → [B,1] FP16
     new_nodes.append(
         helper.make_node(
             "ReduceSum",
             inputs=["pool_mask_fp16", "pool_reduce_axes"],
             outputs=["pool_mask_sum"],
             name="pool_ReduceSum_mask",
-            keepdims=0,
+            keepdims=1,
         )
     )
 
@@ -317,19 +313,8 @@ def fuse_mean_pool_l2_norm(model) -> None:
         helper.make_node(
             "Div",
             inputs=["pool_mean", "pool_l2_safe"],
-            outputs=["pool_norm_fp16"],
-            name="pool_DivNorm",
-        )
-    )
-
-    # 13. Cast FP16 → FP32 on the reduced [B, 768] only (not [B, S, 768]!)
-    new_nodes.append(
-        helper.make_node(
-            "Cast",
-            inputs=["pool_norm_fp16"],
             outputs=["embeddings"],
-            name="pool_CastOutput",
-            to=TensorProto.FLOAT,
+            name="pool_DivNorm",
         )
     )
 
@@ -340,19 +325,13 @@ def fuse_mean_pool_l2_norm(model) -> None:
     while len(graph.output) > 0:
         graph.output.pop()
 
-    graph.output.append(
-        helper.make_tensor_value_info(
-            "embeddings", TensorProto.FLOAT, ["batch_size", 768]
-        )
-    )
+    graph.output.append(helper.make_tensor_value_info("embeddings", TensorProto.FLOAT16, ["batch_size", 768]))
 
-    print("    Fused FP16 mean-pooling + L2 norm → [B, 768] FP32 output")
+    print("    Fused FP16 mean-pooling + L2 norm → [B, 768] FP16 output")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Export BGE embedding model to optimized ONNX format"
-    )
+    parser = argparse.ArgumentParser(description="Export BGE embedding model to optimized ONNX format")
     parser.add_argument(
         "--model",
         default="BAAI/bge-base-en-v1.5",
@@ -393,9 +372,7 @@ def main():
 
     from optimum.onnxruntime import ORTModelForFeatureExtraction
 
-    model = ORTModelForFeatureExtraction.from_pretrained(
-        args.model, export=True
-    )
+    model = ORTModelForFeatureExtraction.from_pretrained(args.model, export=True)
     model.save_pretrained(str(output_dir))
     base_path = output_dir / "model.onnx"
     print(f"  Base ONNX model saved to: {base_path}")
@@ -471,18 +448,12 @@ def main():
     print(f"  Opset: {summary_model.opset_import[0].version}")
     print("  Inputs:")
     for inp in summary_model.graph.input:
-        shape = [
-            d.dim_param if d.dim_param else str(d.dim_value)
-            for d in inp.type.tensor_type.shape.dim
-        ]
+        shape = [d.dim_param if d.dim_param else str(d.dim_value) for d in inp.type.tensor_type.shape.dim]
         dtype = inp.type.tensor_type.elem_type
         print(f"    {inp.name}: [{', '.join(shape)}] (dtype={dtype})")
     print("  Outputs:")
     for out in summary_model.graph.output:
-        shape = [
-            d.dim_param if d.dim_param else str(d.dim_value)
-            for d in out.type.tensor_type.shape.dim
-        ]
+        shape = [d.dim_param if d.dim_param else str(d.dim_value) for d in out.type.tensor_type.shape.dim]
         dtype = out.type.tensor_type.elem_type
         print(f"    {out.name}: [{', '.join(shape)}] (dtype={dtype})")
 

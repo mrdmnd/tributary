@@ -5,7 +5,7 @@
 //!
 //! # Model
 //!
-//! The ONNX model is exported by `ort/scripts/export_onnx.py` and includes:
+//! The ONNX model is exported by `scripts/export_onnx.py` and includes:
 //!
 //! - **BERT graph fusions** — `Attention`, `BiasGelu`, `SkipLayerNormalization`,
 //!   and `EmbedLayerNormalization` (applied by ORT's BERT-specific optimizer).
@@ -17,9 +17,9 @@
 //!   graph using only CUDA-friendly primitives (Mul, ReduceSum, Sqrt, Clip,
 //!   Div).  The standard ONNX `LpNormalization` op is avoided because ORT
 //!   lacks a CUDA kernel for it, which would force a GPU→CPU→GPU bounce.
-//!   A single FP16→FP32 cast is applied only on the reduced `[B, 768]`
-//!   output, avoiding materialisation of the full `[B, S, 768]` tensor in
-//!   FP32.
+//!   The final `[B, 768]` output stays in FP16 — no cast to FP32.  This
+//!   halves the output transfer size and lets the Rust runtime store
+//!   embeddings natively as FP16 (`half::f16`).
 //!
 //! # Runtime optimizations
 //!
@@ -37,6 +37,7 @@
 
 use std::path::PathBuf;
 
+use half::f16;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use ort::io_binding::IoBinding;
 use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
@@ -72,9 +73,9 @@ pub const MAX_SEQ_LEN: usize = 512;
 
 /// Default ONNX model path (relative to the project root).
 ///
-/// Points to the final model produced by `ort/scripts/export_onnx.py`: FP16
+/// Points to the final model produced by `scripts/export_onnx.py`: FP16
 /// backbone, INT32 inputs, fused FP16 mean-pooling + L2 normalisation, with
-/// a single FP16→FP32 cast on the `[B, 768]` output.
+/// FP16 `[B, 768]` output.
 pub const DEFAULT_ONNX_MODEL_PATH: &str = "ort/models/bge-base-en-v1.5-onnx/model_fp16_pooled.onnx";
 
 // ============================================================================
@@ -142,6 +143,10 @@ pub struct EmbedderConfig {
     ///   across OS threads when this flag is set.
     /// - Models with control-flow ops (`If`, `Loop`, `Scan`) are unsupported.
     pub enable_cuda_graph: bool,
+    /// Enable ORT profiling.  When set, ORT records per-operator timing and
+    /// writes a JSON trace to the given directory.  Call
+    /// [`OrtEmbedder::end_profiling`] to flush the file and get its path.
+    pub profile_dir: Option<PathBuf>,
 }
 
 impl Default for EmbedderConfig {
@@ -155,6 +160,7 @@ impl Default for EmbedderConfig {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             max_seq_len: MAX_SEQ_LEN,
             enable_cuda_graph: false,
+            profile_dir: None,
         }
     }
 }
@@ -191,6 +197,12 @@ impl EmbedderConfig {
         self.enable_cuda_graph = enable;
         self
     }
+
+    /// Enable ORT profiling, writing the trace to `dir`.
+    pub fn with_profiling(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.profile_dir = Some(dir.into());
+        self
+    }
 }
 
 // ============================================================================
@@ -209,6 +221,9 @@ pub struct TokenizedBatch {
     pub attention_mask: Vec<i32>,
     pub batch_size: usize,
     pub seq_len: usize,
+    /// Total number of real (non-padding) tokens in this batch —
+    /// i.e. the sum of `attention_mask`.
+    pub num_tokens: usize,
 }
 
 // ============================================================================
@@ -237,11 +252,14 @@ pub fn tokenize_batch(tokenizer: &Tokenizer, texts: &[&str]) -> Result<Tokenized
         flat_mask.extend(enc.get_attention_mask().iter().map(|&x| x as i32));
     }
 
+    let num_tokens = flat_mask.iter().map(|&m| m as usize).sum();
+
     Ok(TokenizedBatch {
         input_ids: flat_ids,
         attention_mask: flat_mask,
         batch_size,
         seq_len: max_len,
+        num_tokens,
     })
 }
 
@@ -323,12 +341,13 @@ unsafe impl Send for InferenceCtx {}
 ///
 /// The model is expected to be **pooled** (output `[B, H]`) with fused
 /// mean-pooling and L2 normalisation baked into the ONNX graph.
-fn ort_infer(ctx: &mut InferenceCtx, batch: TokenizedBatch) -> Result<Vec<Vec<f32>>> {
+fn ort_infer(ctx: &mut InferenceCtx, batch: TokenizedBatch) -> Result<Vec<Vec<f16>>> {
     let TokenizedBatch {
         input_ids,
         attention_mask,
         batch_size,
         seq_len,
+        num_tokens: _,
     } = batch;
     let n = batch_size * seq_len;
 
@@ -393,8 +412,8 @@ fn ort_infer(ctx: &mut InferenceCtx, batch: TokenizedBatch) -> Result<Vec<Vec<f3
         .bind_input("token_type_ids", &cached.token_type)
         .map_err(|e| EmbedderError::EmbedError(format!("bind token_type_ids: {e}")))?;
 
-    // Allocate pinned output ([B, H]) and bind.
-    let output_tensor = Tensor::<f32>::new(&ctx.pinned_output_alloc, [batch_size, EMBEDDING_DIM])
+    // Allocate pinned output ([B, H]) and bind.  The ONNX model outputs FP16.
+    let output_tensor = Tensor::<f16>::new(&ctx.pinned_output_alloc, [batch_size, EMBEDDING_DIM])
         .map_err(|e| EmbedderError::EmbedError(format!("pinned output: {e}")))?;
     binding
         .bind_output(&ctx.output_name, output_tensor)
@@ -408,21 +427,21 @@ fn ort_infer(ctx: &mut InferenceCtx, batch: TokenizedBatch) -> Result<Vec<Vec<f3
 
     // ── Extract results ────────────────────────────────────────────────
     // The output tensor lives in CUDA_PINNED memory.  We downcast from
-    // `DynValue` → `TensorValueType<f32>` and use `data_ptr()` to get
+    // `DynValue` → `TensorValueType<f16>` and use `data_ptr()` to get
     // the raw host pointer (bypassing the `ort` crate's conservative
     // CPU-accessibility check).
     let output_ref = outputs[&*ctx.output_name]
-        .downcast_ref::<ort::value::TensorValueType<f32>>()
+        .downcast_ref::<ort::value::TensorValueType<f16>>()
         .map_err(|e| EmbedderError::EmbedError(format!("downcast output: {e}")))?;
 
-    // Output is already [B, H] (pooled + L2-normalised by the ONNX graph).
+    // Output is already [B, H] FP16 (pooled + L2-normalised by the ONNX graph).
     let total = batch_size * EMBEDDING_DIM;
     // SAFETY: CUDA_PINNED memory is CPU-accessible.
-    let data: &[f32] = unsafe {
-        let ptr = output_ref.data_ptr() as *const f32;
+    let data: &[f16] = unsafe {
+        let ptr = output_ref.data_ptr() as *const f16;
         std::slice::from_raw_parts(ptr, total)
     };
-    let embeddings: Vec<Vec<f32>> = data
+    let embeddings: Vec<Vec<f16>> = data
         .chunks_exact(EMBEDDING_DIM)
         .map(|chunk| chunk.to_vec())
         .collect();
@@ -442,7 +461,8 @@ fn ort_infer(ctx: &mut InferenceCtx, batch: TokenizedBatch) -> Result<Vec<Vec<f3
 /// the GPU processes chunk N.
 pub struct OrtEmbedder {
     /// ORT session + pinned allocator (wrapped in Mutex because
-    /// `Session::run` requires `&mut self`).
+    /// the cached pinned input tensors require `&mut` access for
+    /// data overwrites between inference calls).
     ctx: Mutex<InferenceCtx>,
     /// Shared tokenizer.
     tokenizer: Tokenizer,
@@ -485,7 +505,7 @@ impl OrtEmbedder {
 
         if !config.onnx_model_path.exists() {
             return Err(EmbedderError::InitError(format!(
-                "ONNX model file not found: {:?}. Run `uv run ort/scripts/export_onnx.py` first.",
+                "ONNX model file not found: {:?}. Run `uv run scripts/export_onnx.py` first.",
                 config.onnx_model_path
             )));
         }
@@ -498,12 +518,21 @@ impl OrtEmbedder {
             cuda_ep = cuda_ep.with_cuda_graph(true);
         }
 
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .map_err(|e| EmbedderError::InitError(format!("ORT session builder: {e}")))?
             .with_execution_providers([cuda_ep.build()])
             .map_err(|e| EmbedderError::InitError(format!("ORT execution providers: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| EmbedderError::InitError(format!("ORT optimization level: {e}")))?
+            .map_err(|e| EmbedderError::InitError(format!("ORT optimization level: {e}")))?;
+
+        if let Some(ref profile_dir) = config.profile_dir {
+            info!("ORT profiling enabled → {}", profile_dir.display());
+            builder = builder
+                .with_profiling(profile_dir)
+                .map_err(|e| EmbedderError::InitError(format!("ORT profiling: {e}")))?;
+        }
+
+        let session = builder
             .commit_from_file(&config.onnx_model_path)
             .map_err(|e| {
                 EmbedderError::InitError(format!(
@@ -568,7 +597,7 @@ impl OrtEmbedder {
                 if shape.len() != 2 {
                     return Err(EmbedderError::InitError(format!(
                         "Expected a pooled model with 2-dim output [B, H], but got {} dims. \
-                         Re-export with `uv run ort/scripts/export_onnx.py`.",
+                         Re-export with `uv run scripts/export_onnx.py`.",
                         shape.len()
                     )));
                 }
@@ -601,12 +630,22 @@ impl OrtEmbedder {
         EMBEDDING_DIM
     }
 
+    /// Flush the ORT profiler and return the path of the JSON trace file.
+    ///
+    /// Only useful when [`EmbedderConfig::profile_dir`] was set.
+    pub fn end_profiling(&self) -> Result<String> {
+        let mut ctx = self.ctx.lock();
+        ctx.session
+            .end_profiling()
+            .map_err(|e| EmbedderError::EmbedError(format!("end_profiling: {e}")))
+    }
+
     // ====================================================================
     // Single Embedding API
     // ====================================================================
 
-    /// Embed a single text string, returning f32 embeddings.
-    pub fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+    /// Embed a single text string, returning an FP16 embedding vector.
+    pub fn embed_one(&self, text: &str) -> Result<Vec<f16>> {
         let embeddings = self.embed_batch(&[text])?;
         embeddings
             .into_iter()
@@ -618,8 +657,8 @@ impl OrtEmbedder {
     // Batch Embedding API
     // ====================================================================
 
-    /// Embed a batch of text strings, returning f32 embeddings.
-    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    /// Embed a batch of text strings, returning FP16 embedding vectors.
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f16>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -630,7 +669,7 @@ impl OrtEmbedder {
     }
 
     /// Embed owned strings in batch.
-    pub fn embed_batch_owned(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_batch_owned(&self, texts: &[String]) -> Result<Vec<Vec<f16>>> {
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         self.embed_batch(&refs)
     }
@@ -649,7 +688,26 @@ impl OrtEmbedder {
     ///
     /// Tokenization of chunk N+1 runs on a **background thread** while the GPU
     /// processes chunk N, hiding most of the CPU tokenization latency.
-    pub fn embed_batch_chunked(&self, texts: &[&str], chunk_size: usize) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_batch_chunked(&self, texts: &[&str], chunk_size: usize) -> Result<Vec<Vec<f16>>> {
+        self.embed_batch_chunked_with_callback(texts, chunk_size, |_, _, _| {})
+    }
+
+    /// Like [`embed_batch_chunked`](Self::embed_batch_chunked), but invokes
+    /// `on_chunk(chunk_index, chunk_row_count, chunk_token_count)` after each
+    /// chunk completes.  This lets callers drive a progress bar or log
+    /// throughput in tokens/sec.
+    ///
+    /// `chunk_size` is used as the **token budget** per GPU batch: roughly
+    /// `chunk_size * 128` tokens.  Short strings get large batches (high GPU
+    /// parallelism), long strings get small batches (bounded VRAM / compute).
+    /// Strings are sorted by byte-length first so that each chunk contains
+    /// strings of similar length, minimising padding waste.
+    pub fn embed_batch_chunked_with_callback(
+        &self,
+        texts: &[&str],
+        chunk_size: usize,
+        mut on_chunk: impl FnMut(usize, usize, usize),
+    ) -> Result<Vec<Vec<f16>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -658,16 +716,37 @@ impl OrtEmbedder {
         indexed.sort_unstable_by_key(|&(_, s)| s.len());
 
         let sorted_texts: Vec<&str> = indexed.iter().map(|&(_, s)| s).collect();
-        let num_chunks = (sorted_texts.len() + chunk_size - 1) / chunk_size;
+
+        // Build variable-size chunks using a token budget.  We estimate
+        // tokens ≈ max(1, byte_len / 4) and target a budget of
+        // chunk_size * 128 tokens per batch.  This keeps GPU work roughly
+        // constant regardless of string length.
+        let token_budget: usize = chunk_size * 128;
+        let chunks_owned: Vec<Vec<String>> = {
+            let mut chunks = Vec::new();
+            let mut cur_chunk: Vec<String> = Vec::new();
+            let mut cur_budget_used: usize = 0;
+            for &text in &sorted_texts {
+                let est_tokens = (text.len() / 4).max(1).min(MAX_SEQ_LEN);
+                // If adding this string would exceed the budget and the chunk
+                // is non-empty, flush first.
+                if !cur_chunk.is_empty() && cur_budget_used + est_tokens > token_budget {
+                    chunks.push(std::mem::take(&mut cur_chunk));
+                    cur_budget_used = 0;
+                }
+                cur_chunk.push(text.to_string());
+                cur_budget_used += est_tokens;
+            }
+            if !cur_chunk.is_empty() {
+                chunks.push(cur_chunk);
+            }
+            chunks
+        };
+        let num_chunks = chunks_owned.len();
 
         // ── Pipelined tokenization ─────────────────────────────────────
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<TokenizedBatch>>(2);
         let tok = self.tokenizer.clone();
-
-        let chunks_owned: Vec<Vec<String>> = sorted_texts
-            .chunks(chunk_size)
-            .map(|c| c.iter().map(|s| s.to_string()).collect())
-            .collect();
 
         let tok_handle = std::thread::spawn(move || {
             for chunk_strings in chunks_owned {
@@ -680,15 +759,18 @@ impl OrtEmbedder {
         });
 
         // ── Inference on main thread ───────────────────────────────────
-        let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        let mut all_embeddings: Vec<Vec<f16>> = Vec::with_capacity(texts.len());
         {
             let mut ctx = self.ctx.lock();
-            for _ in 0..num_chunks {
+            for chunk_idx in 0..num_chunks {
                 let batch = rx.recv().map_err(|_| {
                     EmbedderError::EmbedError("Tokenization channel closed".into())
                 })??;
+                let batch_rows = batch.batch_size;
+                let batch_tokens = batch.num_tokens;
                 let embeddings = ort_infer(&mut ctx, batch)?;
                 all_embeddings.extend(embeddings);
+                on_chunk(chunk_idx, batch_rows, batch_tokens);
             }
         } // Mutex released before joining the tokenization thread.
 
@@ -697,7 +779,7 @@ impl OrtEmbedder {
             .map_err(|_| EmbedderError::EmbedError("Tokenization thread panicked".into()))?;
 
         // ── Scatter back to original order ─────────────────────────────
-        let mut result: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        let mut result: Vec<Vec<f16>> = Vec::with_capacity(texts.len());
         result.resize_with(texts.len(), Vec::new);
         for (sorted_idx, embedding) in all_embeddings.into_iter().enumerate() {
             let original_idx = indexed[sorted_idx].0;
@@ -706,7 +788,6 @@ impl OrtEmbedder {
 
         Ok(result)
     }
-
 }
 
 /// Backwards-compatible type alias.
@@ -717,8 +798,8 @@ pub type Embedder = OrtEmbedder;
 // ============================================================================
 
 /// Create a placeholder embedding (zeros) for lazy initialization.
-pub fn placeholder_embedding(dim: usize) -> Vec<f32> {
-    vec![0.0_f32; dim]
+pub fn placeholder_embedding(dim: usize) -> Vec<f16> {
+    vec![f16::ZERO; dim]
 }
 
 // ============================================================================
@@ -745,7 +826,7 @@ mod tests {
     fn test_placeholder_embedding() {
         let placeholder = placeholder_embedding(1024);
         assert_eq!(placeholder.len(), 1024);
-        assert!(placeholder.iter().all(|&v| v == 0.0_f32));
+        assert!(placeholder.iter().all(|&v| v == f16::ZERO));
     }
 
     // ========================================================================
@@ -808,10 +889,15 @@ mod tests {
             println!("Embedding dimension: {}", embedding.len());
             assert!(!embedding.is_empty(), "Embedding should not be empty");
 
-            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm: f32 = embedding
+                .iter()
+                .map(|x| x.to_f32())
+                .map(|x| x * x)
+                .sum::<f32>()
+                .sqrt();
             println!("L2 norm: {}", norm);
             assert!(
-                (norm - 1.0).abs() < 0.01,
+                (norm - 1.0).abs() < 0.02,
                 "Embedding should be normalized, got norm: {}",
                 norm
             );
@@ -845,9 +931,14 @@ mod tests {
             assert_eq!(embeddings.len(), texts.len());
             for (i, embedding) in embeddings.iter().enumerate() {
                 assert!(!embedding.is_empty(), "Embedding {} should not be empty", i);
-                let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let norm: f32 = embedding
+                    .iter()
+                    .map(|x| x.to_f32())
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt();
                 assert!(
-                    (norm - 1.0).abs() < 0.01,
+                    (norm - 1.0).abs() < 0.02,
                     "Embedding {} should be normalized, got norm: {}",
                     i,
                     norm
@@ -883,9 +974,14 @@ mod tests {
 
             assert_eq!(embeddings.len(), 1000);
             for (i, embedding) in embeddings.iter().enumerate() {
-                let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let norm: f32 = embedding
+                    .iter()
+                    .map(|x| x.to_f32())
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt();
                 assert!(
-                    (norm - 1.0).abs() < 0.01,
+                    (norm - 1.0).abs() < 0.02,
                     "Embedding {} should be normalized, got norm: {}",
                     i,
                     norm
@@ -910,8 +1006,12 @@ mod tests {
 
             let embeddings = embedder.embed_batch(&texts).expect("Failed to embed");
 
-            let cosine_sim =
-                |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b.iter()).map(|(x, y)| x * y).sum() };
+            let cosine_sim = |a: &[f16], b: &[f16]| -> f32 {
+                a.iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| x.to_f32() * y.to_f32())
+                    .sum()
+            };
 
             let sim_0_1 = cosine_sim(&embeddings[0], &embeddings[1]);
             let sim_0_4 = cosine_sim(&embeddings[0], &embeddings[4]);

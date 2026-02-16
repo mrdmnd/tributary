@@ -148,17 +148,25 @@ fn ort_model_path() -> String {
 }
 
 /// Create an ORT embedder, or panic with a helpful message if the model is missing.
+///
+/// Set `ORT_PROFILE_DIR` to enable ORT's built-in profiler (writes a JSON
+/// trace to the given directory).  Call [`OrtEmbedder::end_profiling`] to
+/// flush after the benchmark completes.
 fn create_ort_embedder() -> OrtEmbedder {
     let path = ort_model_path();
     if !std::path::Path::new(&path).exists() {
         panic!(
-            "ONNX model not found at '{}'. Run `uv run ort/scripts/export_onnx.py` first, \
+            "ONNX model not found at '{}'. Run `uv run scripts/export_onnx.py` first, \
              or set ONNX_MODEL_PATH.",
             path
         );
     }
-    OrtEmbedder::new(EmbedderConfig::default().with_onnx_model(&path))
-        .expect("Failed to create ORT embedder")
+    let mut config = EmbedderConfig::default().with_onnx_model(&path);
+    if let Ok(profile_prefix) = std::env::var("ORT_PROFILE_PREFIX") {
+        eprintln!("[profile] ORT profiling enabled → {profile_prefix}");
+        config = config.with_profiling(&profile_prefix);
+    }
+    OrtEmbedder::new(config).expect("Failed to create ORT embedder")
 }
 
 fn bench_chunk_size_sweep(c: &mut Criterion) {
