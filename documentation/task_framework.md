@@ -163,31 +163,33 @@ unconditionally reads `observation_times[seed]` and uses it as the BFS cutoff.
 
 ## Train / Validation / Test Splits
 
-### With timestamps (temporal split)
+### Hash-based splitting (all tasks)
 
-Choose cutoffs T_train and T_val. Partition each task's anchor rows by
-observation time:
+All tasks use the same split mechanism: a deterministic hash of
+`(task_idx, anchor_row_id, split_seed)` assigns each seed to train, val,
+or test at configurable ratios (default 80/10/10).
 
-| Split | Condition                              |
-|-------|----------------------------------------|
-| Train | observation_time <= T_train             |
-| Val   | T_train < observation_time <= T_val    |
-| Test  | observation_time > T_val               |
+Observation times and split assignment are **independent concerns**:
+- **Observation time** governs what each seed's BFS can see (temporal
+  filtering). A seed with `obs_time = June 2022` only sees data from
+  before that date, regardless of whether the seed is train or val.
+- **Split assignment** governs which seeds contribute to training loss
+  vs. validation loss. Determined solely by the hash.
 
-Mirrors deployment (predict the future from the past). Leak-proof by
-construction because the BFS temporal filtering already enforces the
-observation time boundary.
+This means temporal tasks don't need a special split mechanism. Every
+seed already carries its own temporal cutoff. Whether a seed is used for
+training or validation doesn't change what context the model sees for
+that seed.
 
-### Without timestamps (random split)
-
-Randomly assign anchor rows to train/val/test (e.g. 80/10/10). The full graph
-is available to all splits (transductive). Standard in GNN literature.
+See [system_architecture.md](system_architecture.md) §2b for the hash
+mechanism, properties (cross-rank determinism, stability across runs,
+per-task independence), and discussion of transductive evaluation.
 
 ### Task-level holdout
 
 Hold out entire tasks for evaluation. Train on cell masking tasks, evaluate on
 derived tasks (or vice versa). Tests whether learned representations transfer
-to novel prediction objectives. Works with or without timestamps.
+to novel prediction objectives.
 
 ### Cross-database holdout
 
@@ -213,7 +215,7 @@ representations generalize across schemas, domains, and data distributions.
 
 ### Phase 3: Evaluate (held-out tasks and/or held-out databases)
 
-- Temporal split within tasks for standard evaluation.
+- Hash-based split within tasks for standard evaluation.
 - Task-level holdout for transfer evaluation.
 - Cross-database holdout for generalization evaluation.
 
