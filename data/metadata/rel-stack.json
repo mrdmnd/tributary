@@ -1,0 +1,417 @@
+{
+    "name": "rel-stack",
+    "tables": {
+        "badges": {
+            "primary_key": "Id",
+            "temporal_column": "Date",
+            "columns": {
+                "Id": {
+                    "stype": "identifier",
+                    "description": "Unique identifier for each badge award"
+                },
+                "UserId": {
+                    "stype": "identifier",
+                    "foreign_key": "users.Id",
+                    "description": "Reference to the user who received the badge"
+                },
+                "Class": {
+                    "stype": "categorical",
+                    "description": "Badge tier: 1=Gold, 2=Silver, 3=Bronze"
+                },
+                "Name": {
+                    "stype": "categorical",
+                    "description": "Name of the badge (e.g., Teacher, Student, Autobiographer); 389 distinct badges"
+                },
+                "TagBased": {
+                    "stype": "boolean",
+                    "description": "Whether the badge is awarded for activity on a specific tag"
+                },
+                "Date": {
+                    "stype": "timestamp",
+                    "description": "When the badge was awarded to the user"
+                }
+            }
+        },
+        "comments": {
+            "primary_key": "Id",
+            "temporal_column": "CreationDate",
+            "columns": {
+                "Id": {
+                    "stype": "identifier",
+                    "description": "Unique identifier for each comment"
+                },
+                "PostId": {
+                    "stype": "identifier",
+                    "foreign_key": "posts.Id",
+                    "description": "Reference to the post being commented on"
+                },
+                "UserId": {
+                    "stype": "identifier",
+                    "foreign_key": "users.Id",
+                    "description": "Reference to the user who wrote the comment (null for anonymous)"
+                },
+                "ContentLicense": {
+                    "stype": "categorical",
+                    "description": "License for the comment content: CC BY-SA 2.5, CC BY-SA 3.0, or CC BY-SA 4.0"
+                },
+                "UserDisplayName": {
+                    "stype": "identifier",
+                    "description": "Display name for anonymous users who don't have a UserId"
+                },
+                "Text": {
+                    "stype": "text",
+                    "description": "The comment text content"
+                },
+                "CreationDate": {
+                    "stype": "timestamp",
+                    "description": "When the comment was posted"
+                }
+            }
+        },
+        "postHistory": {
+            "primary_key": "Id",
+            "temporal_column": "CreationDate",
+            "columns": {
+                "Id": {
+                    "stype": "identifier",
+                    "description": "Unique identifier for each post history event"
+                },
+                "PostId": {
+                    "stype": "identifier",
+                    "foreign_key": "posts.Id",
+                    "description": "Reference to the post being edited or modified"
+                },
+                "UserId": {
+                    "stype": "identifier",
+                    "foreign_key": "users.Id",
+                    "description": "Reference to the user who performed the action (null for anonymous)"
+                },
+                "PostHistoryTypeId": {
+                    "stype": "categorical",
+                    "description": "Type of history event: 1=Initial Title, 2=Initial Body, 3=Initial Tags, 4=Edit Title, 5=Edit Body, 6=Edit Tags, 10=Close/Reopen, and others"
+                },
+                "UserDisplayName": {
+                    "stype": "identifier",
+                    "description": "Display name for anonymous users who don't have a UserId"
+                },
+                "ContentLicense": {
+                    "stype": "categorical",
+                    "description": "License for the content: CC BY-SA 2.5, CC BY-SA 3.0, or CC BY-SA 4.0"
+                },
+                "RevisionGUID": {
+                    "stype": "identifier",
+                    "description": "GUID identifying the revision"
+                },
+                "Text": {
+                    "stype": "ignored",
+                    "description": "The text content from the history event (title, body, or tags)"
+                },
+                "Comment": {
+                    "stype": "ignored",
+                    "description": "User's comment explaining the edit or change"
+                },
+                "CreationDate": {
+                    "stype": "timestamp",
+                    "description": "When the history event occurred"
+                }
+            }
+        },
+        "postLinks": {
+            "primary_key": "Id",
+            "temporal_column": "CreationDate",
+            "columns": {
+                "Id": {
+                    "stype": "identifier",
+                    "description": "Unique identifier for each post link"
+                },
+                "RelatedPostId": {
+                    "stype": "identifier",
+                    "foreign_key": "posts.Id",
+                    "description": "Reference to the related post"
+                },
+                "PostId": {
+                    "stype": "identifier",
+                    "foreign_key": "posts.Id",
+                    "description": "Reference to the post containing the link"
+                },
+                "LinkTypeId": {
+                    "stype": "categorical",
+                    "description": "Type of link relationship: 1=Linked, 3=Duplicate"
+                },
+                "CreationDate": {
+                    "stype": "timestamp",
+                    "description": "When the link was created"
+                }
+            }
+        },
+        "posts": {
+            "primary_key": "Id",
+            "temporal_column": "CreationDate",
+            "columns": {
+                "Id": {
+                    "stype": "identifier",
+                    "description": "Unique identifier for each post"
+                },
+                "OwnerUserId": {
+                    "stype": "identifier",
+                    "foreign_key": "users.Id",
+                    "description": "Reference to the user who created the post"
+                },
+                "PostTypeId": {
+                    "stype": "categorical",
+                    "description": "Type of post: 1=Question, 2=Answer, 3=Orphaned tag wiki, 4=Tag wiki excerpt, 5=Tag wiki, 6=Moderator nomination, 7=Wiki placeholder"
+                },
+                "AcceptedAnswerId": {
+                    "stype": "identifier",
+                    "foreign_key": "posts.Id",
+                    "description": "Reference to the accepted answer for questions (null if no accepted answer)"
+                },
+                "ParentId": {
+                    "stype": "identifier",
+                    "foreign_key": "posts.Id",
+                    "description": "Reference to the parent question for answers (null for questions)"
+                },
+                "OwnerDisplayName": {
+                    "stype": "identifier",
+                    "description": "Display name for anonymous post owners who don't have a UserId"
+                },
+                "Title": {
+                    "stype": "text",
+                    "description": "Question title (null for answers and other non-question posts)"
+                },
+                "Tags": {
+                    "stype": "text",
+                    "description": "Space-delimited tags in angle brackets (e.g., <r><regression>) for questions only"
+                },
+                "ContentLicense": {
+                    "stype": "categorical",
+                    "description": "License for the post content: CC BY-SA 2.5, CC BY-SA 3.0, or CC BY-SA 4.0"
+                },
+                "Body": {
+                    "stype": "text",
+                    "description": "HTML content of the post body"
+                },
+                "CreationDate": {
+                    "stype": "timestamp",
+                    "description": "When the post was created"
+                }
+            }
+        },
+        "users": {
+            "primary_key": "Id",
+            "temporal_column": "CreationDate",
+            "columns": {
+                "Id": {
+                    "stype": "identifier",
+                    "description": "Unique identifier for each user"
+                },
+                "AccountId": {
+                    "stype": "identifier",
+                    "description": "Cross-site Stack Exchange network account identifier"
+                },
+                "DisplayName": {
+                    "stype": "identifier",
+                    "description": "User's chosen display name"
+                },
+                "Location": {
+                    "stype": "identifier",
+                    "description": "User's self-reported location"
+                },
+                "ProfileImageUrl": {
+                    "stype": "ignored",
+                    "description": "URL to user's profile image (all null in this dataset)"
+                },
+                "WebsiteUrl": {
+                    "stype": "identifier",
+                    "description": "User's personal website URL"
+                },
+                "AboutMe": {
+                    "stype": "text",
+                    "description": "User's self-written biography or about section"
+                },
+                "CreationDate": {
+                    "stype": "timestamp",
+                    "description": "When the user account was created"
+                }
+            }
+        },
+        "votes": {
+            "primary_key": "Id",
+            "temporal_column": "CreationDate",
+            "columns": {
+                "Id": {
+                    "stype": "identifier",
+                    "description": "Unique identifier for each vote"
+                },
+                "UserId": {
+                    "stype": "identifier",
+                    "foreign_key": "users.Id",
+                    "description": "Reference to the user who cast the vote (null for anonymous votes)"
+                },
+                "PostId": {
+                    "stype": "identifier",
+                    "foreign_key": "posts.Id",
+                    "description": "Reference to the post being voted on (null for some vote types like spam flags)"
+                },
+                "VoteTypeId": {
+                    "stype": "categorical",
+                    "description": "Type of vote: 1=AcceptedByOriginator, 2=UpMod, 3=DownMod, 4=Offensive, 5=Favorite, 6=Close, 8=BountyStart, 9=BountyClose, 10=Deletion, 11=Undeletion, 12=Spam, 15=ModeratorReview, 16=ApproveEditSuggestion"
+                },
+                "CreationDate": {
+                    "stype": "timestamp",
+                    "description": "When the vote was cast"
+                }
+            }
+        }
+    },
+    "tasks": {
+        "predict_vote_type": {
+            "query": "SELECT Id, VoteTypeId FROM 'votes.parquet'",
+            "anchor_table": "votes",
+            "anchor_key": "Id",
+            "target_column": "VoteTypeId",
+            "target_stype": "categorical"
+        },
+        "predict_post_type": {
+            "query": "SELECT Id, PostTypeId FROM 'posts.parquet'",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "PostTypeId",
+            "target_stype": "categorical"
+        },
+        "predict_badge_class": {
+            "query": "SELECT Id, Class FROM 'badges.parquet'",
+            "anchor_table": "badges",
+            "anchor_key": "Id",
+            "target_column": "Class",
+            "target_stype": "categorical"
+        },
+        "predict_has_accepted_answer": {
+            "query": "SELECT Id, (AcceptedAnswerId IS NOT NULL) AS has_accepted FROM 'posts.parquet' WHERE PostTypeId = 1",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "has_accepted",
+            "target_stype": "boolean"
+        },
+        "predict_num_comments_7d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '7 days' AS obs_time, COUNT(c.Id) AS num_comments FROM 'posts.parquet' p LEFT JOIN 'comments.parquet' c ON c.PostId = p.Id AND c.CreationDate <= p.CreationDate + INTERVAL '7 days' GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "num_comments",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_comments_30d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '30 days' AS obs_time, COUNT(c.Id) AS num_comments FROM 'posts.parquet' p LEFT JOIN 'comments.parquet' c ON c.PostId = p.Id AND c.CreationDate <= p.CreationDate + INTERVAL '30 days' GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "num_comments",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_answers_7d": {
+            "query": "SELECT q.Id, q.CreationDate + INTERVAL '7 days' AS obs_time, COUNT(a.Id) AS num_answers FROM 'posts.parquet' q LEFT JOIN 'posts.parquet' a ON a.ParentId = q.Id AND a.CreationDate <= q.CreationDate + INTERVAL '7 days' WHERE q.PostTypeId = 1 GROUP BY q.Id, q.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "num_answers",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_answers_30d": {
+            "query": "SELECT q.Id, q.CreationDate + INTERVAL '30 days' AS obs_time, COUNT(a.Id) AS num_answers FROM 'posts.parquet' q LEFT JOIN 'posts.parquet' a ON a.ParentId = q.Id AND a.CreationDate <= q.CreationDate + INTERVAL '30 days' WHERE q.PostTypeId = 1 GROUP BY q.Id, q.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "num_answers",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_score_7d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '7 days' AS obs_time, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS score FROM 'posts.parquet' p LEFT JOIN 'votes.parquet' v ON v.PostId = p.Id AND v.CreationDate <= p.CreationDate + INTERVAL '7 days' GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "score",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_score_30d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '30 days' AS obs_time, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS score FROM 'posts.parquet' p LEFT JOIN 'votes.parquet' v ON v.PostId = p.Id AND v.CreationDate <= p.CreationDate + INTERVAL '30 days' GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "score",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_has_accepted_answer_30d": {
+            "query": "SELECT q.Id, q.CreationDate + INTERVAL '30 days' AS obs_time, (a.Id IS NOT NULL) AS has_accepted FROM 'posts.parquet' q LEFT JOIN 'posts.parquet' a ON q.AcceptedAnswerId = a.Id AND a.CreationDate <= q.CreationDate + INTERVAL '30 days' WHERE q.PostTypeId = 1",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "has_accepted",
+            "target_stype": "boolean",
+            "observation_time_column": "obs_time"
+        },
+        "predict_answer_is_accepted": {
+            "query": "SELECT a.Id, a.CreationDate + INTERVAL '7 days' AS obs_time, (p.AcceptedAnswerId IS NOT NULL AND p.AcceptedAnswerId = a.Id) AS is_accepted FROM 'posts.parquet' a INNER JOIN 'posts.parquet' p ON a.ParentId = p.Id WHERE a.PostTypeId = 2",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "is_accepted",
+            "target_stype": "boolean",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_upvotes_30d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '30 days' AS obs_time, COUNT(v.Id) AS num_upvotes FROM 'posts.parquet' p LEFT JOIN 'votes.parquet' v ON v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate <= p.CreationDate + INTERVAL '30 days' GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "num_upvotes",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_downvotes_30d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '30 days' AS obs_time, COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS num_downvotes FROM 'posts.parquet' p LEFT JOIN 'votes.parquet' v ON v.PostId = p.Id AND v.CreationDate <= p.CreationDate + INTERVAL '30 days' GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "num_downvotes",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_badges_30d": {
+            "query": "SELECT u.Id, u.CreationDate + INTERVAL '30 days' AS obs_time, COUNT(b.Id) AS num_badges FROM 'users.parquet' u LEFT JOIN 'badges.parquet' b ON b.UserId = u.Id AND b.Date <= u.CreationDate + INTERVAL '30 days' GROUP BY u.Id, u.CreationDate",
+            "anchor_table": "users",
+            "anchor_key": "Id",
+            "target_column": "num_badges",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_posts_30d": {
+            "query": "SELECT u.Id, u.CreationDate + INTERVAL '30 days' AS obs_time, COUNT(p.Id) AS num_posts FROM 'users.parquet' u LEFT JOIN 'posts.parquet' p ON p.OwnerUserId = u.Id AND p.CreationDate <= u.CreationDate + INTERVAL '30 days' GROUP BY u.Id, u.CreationDate",
+            "anchor_table": "users",
+            "anchor_key": "Id",
+            "target_column": "num_posts",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_was_closed_30d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '30 days' AS obs_time, (COUNT(v.Id) > 0) AS was_closed FROM 'posts.parquet' p LEFT JOIN 'votes.parquet' v ON v.PostId = p.Id AND v.VoteTypeId = 6 AND v.CreationDate <= p.CreationDate + INTERVAL '30 days' WHERE p.PostTypeId = 1 GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "was_closed",
+            "target_stype": "boolean",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_favorites_30d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '30 days' AS obs_time, COUNT(v.Id) AS num_favorites FROM 'posts.parquet' p LEFT JOIN 'votes.parquet' v ON v.PostId = p.Id AND v.VoteTypeId = 5 AND v.CreationDate <= p.CreationDate + INTERVAL '30 days' WHERE p.PostTypeId = 1 GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "num_favorites",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        },
+        "predict_num_edits_30d": {
+            "query": "SELECT p.Id, p.CreationDate + INTERVAL '30 days' AS obs_time, COUNT(DISTINCT ph.Id) AS num_edits FROM 'posts.parquet' p LEFT JOIN 'postHistory.parquet' ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6) AND ph.CreationDate <= p.CreationDate + INTERVAL '30 days' GROUP BY p.Id, p.CreationDate",
+            "anchor_table": "posts",
+            "anchor_key": "Id",
+            "target_column": "num_edits",
+            "target_stype": "numerical",
+            "observation_time_column": "obs_time"
+        }
+    }
+}

@@ -3,23 +3,24 @@
 //!
 //! ## Input
 //!
-//! A directory containing:
-//! - `metadata.json` — human-annotated schema (tables, columns, semantic types, FKs, tasks)
-//! - `<table_name>.parquet` — one parquet file per table
+//! A data directory with the following layout:
+//! - `metadata/<dataset>.json` — human-annotated schema (tables, columns, semantic types, FKs, tasks)
+//! - `raw/<dataset>/<table_name>.parquet` — one parquet file per table
 //!
 //! ## Output
 //!
-//! A directory containing:
-//! - `metadata.rkyv`      — serialized `DatabaseMetadata`
-//! - `graph.bin`          — bidirectional CSR graph (FK edges)
-//! - `embeddings.bin`     — flat `[N, 768]` f16 array (column embeddings first, then vocab)
-//! - `tables/<table_name>.bin` — packed column store per table
-//! - `tasks/<task_name>.bin`   — materialized prediction task per task
+//! Written to `processed/<dataset>/` under the data directory:
+//! - `metadata.json`             — serialized `DatabaseMetadata` (JSON, schema + stats + tasks)
+//! - `column_embeddings.bin`     — flat `[C, EMBEDDING_DIM]` f16 array (one per global column)
+//! - `vocab_embeddings.bin`      — flat `[V, EMBEDDING_DIM]` f16 array (categorical/text value embeddings)
+//! - `graph.bin`                 — bidirectional CSR graph (FK edges)
+//! - `tables/<table_name>.bin`   — packed column store per table
+//! - `tasks/<task_name>.bin`     — materialized prediction task per task
 //!
 //! ## Usage
 //!
 //! ```sh
-//! cargo run --release --bin preprocess -- --input-dir data/rel-stack
+//! cargo run --release --bin preprocess -- --data-dir data --dataset rel-stack
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -33,15 +34,16 @@ use arrow::datatypes::{DataType, Int32Type, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use clap::Parser;
+use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Deserialize;
 use tracing::{info, warn};
 
 use half::f16;
+use headwater::common::*;
+use headwater::embedder::{EMBEDDING_DIM, Embedder, EmbedderConfig, EmbedderError, EmbedderTrait};
 use indicatif::{HumanCount, HumanDuration, ProgressBar, ProgressStyle};
-use tributary::common::*;
-use tributary::embedder::{EMBEDDING_DIM, EmbedderConfig, MAX_SEQ_LEN, OrtEmbedder};
 
 // ============================================================================
 // CLI
@@ -50,25 +52,27 @@ use tributary::embedder::{EMBEDDING_DIM, EmbedderConfig, MAX_SEQ_LEN, OrtEmbedde
 #[derive(Parser, Debug)]
 #[command(about = "Preprocess a parquet database into binary training format")]
 struct Args {
-    /// Path to the input database directory (contains *.parquet + metadata.json)
+    /// Name of the dataset (e.g. "rel-stack"). Parquets are read from
+    /// `<data-dir>/raw/<dataset>/`, metadata from `<data-dir>/metadata/<dataset>.json`,
+    /// and output is written to `<data-dir>/processed/<dataset>/`.
     #[arg(long)]
-    input_dir: PathBuf,
+    dataset: String,
 
-    /// Output directory for processed files (default: <input_dir>_processed)
+    /// Path to the top-level data directory (contains raw/, metadata/, processed/).
     #[arg(long)]
-    output_dir: Option<PathBuf>,
+    data_dir: PathBuf,
 
-    /// Embedding batch size (rows per GPU forward pass). Smaller values reduce
-    /// peak VRAM and per-batch latency on long sequences; 256 is a good default.
-    #[arg(long, default_value_t = 256)]
+    /// Embedding batch size (strings per API request). The Baseten embedding
+    /// API enforces a limit of 128 strings per request.
+    #[arg(long, default_value_t = 128)]
     batch_size: usize,
 
-    /// CUDA device ordinal for embedding
-    #[arg(long, default_value_t = 0)]
-    cuda_device: usize,
+    /// Maximum number of concurrent embedding API requests.
+    #[arg(long, default_value_t = 1024)]
+    max_concurrent: usize,
 
-    /// Skip GPU embedding (use zero vectors). Useful for testing the pipeline
-    /// without an ONNX model or CUDA.
+    /// Skip embedding (use zero vectors). Useful for testing the pipeline
+    /// without the embedding API.
     #[arg(long, default_value_t = false)]
     skip_embeddings: bool,
 }
@@ -82,7 +86,7 @@ struct RawMetadata {
     #[allow(dead_code)]
     name: String,
     tables: IndexMap<String, RawTable>,
-    tasks: Vec<RawTask>,
+    tasks: IndexMap<String, RawTask>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -101,7 +105,6 @@ struct RawColumn {
 
 #[derive(Deserialize, Debug)]
 struct RawTask {
-    name: String,
     query: String,
     anchor_table: String,
     anchor_key: String,
@@ -314,14 +317,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let input_dir = &args.input_dir;
-    let output_dir = args
-        .output_dir
-        .clone()
-        .unwrap_or_else(|| input_dir.with_extension("processed"));
+    let raw_dir = args.data_dir.join("raw").join(&args.dataset);
+    let metadata_path = args
+        .data_dir
+        .join("metadata")
+        .join(format!("{}.json", &args.dataset));
+    let output_dir = args.data_dir.join("processed").join(&args.dataset);
 
-    info!("Input:  {}", input_dir.display());
-    info!("Output: {}", output_dir.display());
+    info!("Dataset:  {}", args.dataset);
+    info!("Raw dir:  {}", raw_dir.display());
+    info!("Metadata: {}", metadata_path.display());
+    info!("Output:   {}", output_dir.display());
 
     // Create output directories
     fs::create_dir_all(&output_dir)?;
@@ -330,9 +336,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pipeline_start = std::time::Instant::now();
 
-    // ── Step 1: Parse metadata.json ──────────────────────────────────────
-    info!("Step 1: Parsing metadata.json...");
-    let metadata_path = input_dir.join("metadata.json");
+    // ── Step 1: Parse metadata ─────────────────────────────────────────
+    info!("Step 1: Parsing metadata...");
     let metadata_text = fs::read_to_string(&metadata_path)?;
     let raw_meta: RawMetadata = serde_json::from_str(&metadata_text)?;
     info!(
@@ -372,7 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut table_pkey_col_names: Vec<Option<String>> = Vec::new();
 
     for (table_name, raw_table) in &raw_meta.tables {
-        let parquet_path = input_dir.join(format!("{table_name}.parquet"));
+        let parquet_path = raw_dir.join(format!("{table_name}.parquet"));
         info!("  Loading {}", parquet_path.display());
 
         let file = File::open(&parquet_path)?;
@@ -687,7 +692,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for lt in loaded_tables.iter() {
             for (col_name, _) in &lt.raw_table.columns {
                 if all_col_stypes[ci] == SemanticType::Timestamp {
-                    if let Some(arr) = lt.schema.index_of(col_name).ok().map(|i| lt.batch.column(i)) {
+                    if let Some(arr) = lt
+                        .schema
+                        .index_of(col_name)
+                        .ok()
+                        .map(|i| lt.batch.column(i))
+                    {
                         if let Some(ts_arr) = cast_to_timestamp_us(arr.as_ref()) {
                             for i in 0..ts_arr.len() {
                                 if !ts_arr.is_null(i) {
@@ -720,24 +730,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // English), so anything beyond this is wasted work.  Truncating here also
     // makes the length-sort more representative of actual token counts, which
     // reduces padding waste in GPU batches.
-    let max_chars: usize = MAX_SEQ_LEN * 4; // 512 * 4 = 2048
+    let max_chars: usize = 512 * 4; // ≈ 512 tokens
 
     // Vocabulary: ordered list of unique strings to embed.
-    // col_name_strings: one per global column — these become the first entries in embeddings.bin
+    // col_name_strings: one per global column — these become ColumnMetadata.embedding
     let mut col_name_strings: Vec<String> = Vec::with_capacity(total_cols);
 
     // Shared embedding vocab: maps string -> EmbeddingIdx.
-    // Vocab entries are offset by total_cols because column-name embeddings
-    // occupy the first total_cols slots in embeddings.bin.
-    let num_col_embeddings = total_cols as u32;
+    // Vocab indices are 0-based (column-name embeddings are stored separately
+    // in ColumnMetadata, not in the vocab embedding table).
     let mut vocab_map: HashMap<String, EmbeddingIdx> = HashMap::new();
     let mut vocab_list: Vec<String> = Vec::new();
 
     let insert_vocab = |s: String,
                         map: &mut HashMap<String, EmbeddingIdx>,
                         list: &mut Vec<String>,
-                        limit: usize,
-                        offset: u32|
+                        limit: usize|
      -> EmbeddingIdx {
         let s = if s.len() > limit {
             let end = s.floor_char_boundary(limit);
@@ -748,7 +756,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(&idx) = map.get(&s) {
             idx
         } else {
-            let idx = EmbeddingIdx(offset + list.len() as u32);
+            let idx = EmbeddingIdx(list.len() as u32);
             map.insert(s.clone(), idx);
             list.push(s);
             idx
@@ -775,7 +783,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let ColumnStats::Categorical { categories, .. } = &all_col_stats[ci] {
                     for cat_val in categories {
                         let s = format!("{col_name} is {cat_val}");
-                        insert_vocab(s, &mut vocab_map, &mut vocab_list, max_chars, num_col_embeddings);
+                        insert_vocab(s, &mut vocab_map, &mut vocab_list, max_chars);
                     }
                 }
                 ci += 1;
@@ -798,7 +806,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let strings = array_to_strings(arr.as_ref());
                         for s in strings {
                             if let Some(v) = s {
-                                insert_vocab(v, &mut vocab_map, &mut vocab_list, max_chars, num_col_embeddings);
+                                insert_vocab(v, &mut vocab_map, &mut vocab_list, max_chars);
                             }
                         }
                     }
@@ -814,8 +822,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vocab_list.len()
     );
 
-    // ── GPU embedding ────────────────────────────────────────────────────
-    info!("Step 4b: Computing embeddings on GPU...");
+    // ── Embedding via API ─────────────────────────────────────────────────
+    info!("Step 4b: Computing embeddings via API...");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
 
     // Combine column name strings + vocab list for a single embedding pass.
     // Column name embeddings are at indices [0, col_name_strings.len())
@@ -828,9 +840,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let total_to_embed = all_strings_to_embed.len();
     info!(
-        "  Embedding {} strings (batch_size={})...",
+        "  Embedding {} strings (batch_size={}, max_concurrent={})...",
         HumanCount(total_to_embed as u64),
         args.batch_size,
+        args.max_concurrent,
     );
 
     let all_embeddings: Vec<Vec<f16>> = if total_to_embed == 0 {
@@ -839,11 +852,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("  --skip-embeddings: using zero vectors");
         vec![vec![f16::ZERO; EMBEDDING_DIM]; total_to_embed]
     } else {
-        let embedder = OrtEmbedder::new(
-            EmbedderConfig::default()
-                .with_batch_size(args.batch_size)
-                .with_cuda_device(args.cuda_device),
-        )?;
+        let config = EmbedderConfig::from_baseten_env()?;
+        let embedder = Embedder::new(config)?;
         let refs: Vec<&str> = all_strings_to_embed.iter().map(|s| s.as_str()).collect();
 
         let pb = ProgressBar::new(total_to_embed as u64);
@@ -854,60 +864,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .progress_chars("##-"),
         );
+        pb.enable_steady_tick(std::time::Duration::from_secs(1));
         let embed_start = std::time::Instant::now();
-        let mut embedded_so_far: u64 = 0;
-        let mut tokens_so_far: u64 = 0;
-        let mut next_log_pct: f64 = 5.0; // log at every 5% milestone
-        let result = embedder.embed_batch_chunked_with_callback(
-            &refs,
-            args.batch_size,
-            |_chunk_idx, chunk_rows, chunk_tokens| {
-                pb.inc(chunk_rows as u64);
-                embedded_so_far += chunk_rows as u64;
-                tokens_so_far += chunk_tokens as u64;
+
+        let batch_ranges: Vec<(usize, usize)> = {
+            let mut ranges = Vec::new();
+            let mut start = 0;
+            while start < refs.len() {
+                let end = (start + args.batch_size).min(refs.len());
+                ranges.push((start, end));
+                start = end;
+            }
+            ranges
+        };
+        let num_batches = batch_ranges.len();
+
+        let result: Vec<Vec<f16>> = rt.block_on(async {
+            let embedder_ref = &embedder;
+            let pb_ref = &pb;
+            let mut all_vecs: Vec<Vec<f16>> = Vec::with_capacity(total_to_embed);
+            let mut embedded_so_far: u64 = 0;
+            let mut next_log_pct: f64 = 5.0;
+
+            let mut result_stream = stream::iter(batch_ranges.into_iter())
+                .map(|(start, end)| {
+                    let chunk: Vec<&str> = refs[start..end].to_vec();
+                    async move {
+                        let n = chunk.len();
+                        let flat = embedder_ref.embed_texts(&chunk).await?;
+                        Ok::<_, EmbedderError>((n, flat))
+                    }
+                })
+                .buffered(args.max_concurrent.max(1));
+
+            while let Some(batch_result) = result_stream.next().await {
+                let (n, flat): (usize, Vec<f16>) = batch_result?;
+                for emb in flat.chunks_exact(EMBEDDING_DIM) {
+                    all_vecs.push(emb.to_vec());
+                }
+                embedded_so_far += n as u64;
+                pb_ref.inc(n as u64);
+
                 let pct = embedded_so_far as f64 / total_to_embed as f64 * 100.0;
                 if pct >= next_log_pct {
-                    let elapsed = embed_start.elapsed();
-                    let tok_rate = tokens_so_far as f64 / elapsed.as_secs_f64();
-                    let avg_tok_per_str =
-                        tokens_so_far as f64 / (embedded_so_far as f64).max(1.0);
-                    let remaining_strings =
-                        total_to_embed as f64 - embedded_so_far as f64;
-                    let remaining_tokens = remaining_strings * avg_tok_per_str;
-                    let remaining_secs = remaining_tokens / tok_rate.max(1.0);
+                    let elapsed = embed_start.elapsed().as_secs_f64();
+                    let rate = embedded_so_far as f64 / elapsed;
+                    let remaining = (total_to_embed as f64 - embedded_so_far as f64) / rate;
                     info!(
-                        "  Embedding progress: {}/{} ({:.1}%) — {} tokens so far, {:.0} tokens/sec, ~{:.0}s remaining",
+                        "  Embedding progress: {}/{} ({:.0}%) — {:.0} strings/sec, ~{:.0}s remaining",
                         HumanCount(embedded_so_far),
                         HumanCount(total_to_embed as u64),
                         pct,
-                        HumanCount(tokens_so_far),
-                        tok_rate,
-                        remaining_secs,
+                        rate,
+                        remaining,
                     );
                     next_log_pct = (pct / 5.0).floor() * 5.0 + 5.0;
                 }
-            },
-        )?;
+            }
+
+            Ok::<_, Box<dyn std::error::Error>>(all_vecs)
+        })?;
+
         pb.finish_with_message("done");
         let embed_elapsed = embed_start.elapsed();
         info!(
-            "  Embedding complete: {} strings ({} tokens) in {} ({:.0} tokens/sec)",
+            "  Embedding complete: {} strings in {} batches, {} ({:.0} strings/sec)",
             HumanCount(total_to_embed as u64),
-            HumanCount(tokens_so_far),
+            num_batches,
             HumanDuration(embed_elapsed),
-            tokens_so_far as f64 / embed_elapsed.as_secs_f64(),
+            total_to_embed as f64 / embed_elapsed.as_secs_f64(),
         );
         result
     };
 
-    // Split embeddings — column-name embeddings first, then vocab embeddings.
-    // Both go into embeddings.bin (column embeddings at indices 0..num_cols,
-    // vocab embeddings at indices num_cols..).
+    // Split results: column-name embeddings go into column_embeddings.bin,
+    // vocab embeddings go into vocab_embeddings.bin.
     let column_embeddings: &[Vec<f16>] = &all_embeddings[..col_name_strings.len()];
     let vocab_embeddings: &[Vec<f16>] = &all_embeddings[col_name_strings.len()..];
 
     info!(
-        "  Got {} column embeddings, {} vocab embeddings",
+        "  Got {} column embeddings (→ column_embeddings.bin), {} vocab embeddings (→ vocab_embeddings.bin)",
         column_embeddings.len(),
         vocab_embeddings.len()
     );
@@ -1055,10 +1091,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .progress_chars("##-"),
     );
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
     let mut task_metadata_list: Vec<TaskMetadata> = Vec::new();
 
     // Build table name -> TableIdx lookup
@@ -1079,7 +1111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // normalization disabled), preserving the exact table name casing
         // (e.g. "postHistory") in the catalog.
         for (table_name, _) in &raw_meta.tables {
-            let path = input_dir.join(format!("{table_name}.parquet"));
+            let path = raw_dir.join(format!("{table_name}.parquet"));
             let path_str = path.to_str().unwrap();
             let create_sql = format!(
                 "CREATE EXTERNAL TABLE \"{table_name}\" STORED AS PARQUET LOCATION '{path_str}'"
@@ -1087,8 +1119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ctx.sql(&create_sql).await?;
         }
 
-        for raw_task in raw_meta.tasks.iter() {
-            pb_tasks.set_message(raw_task.name.clone());
+        for (task_name, raw_task) in raw_meta.tasks.iter() {
+            pb_tasks.set_message(task_name.clone());
 
             // Rewrite SQL: replace 'tableName.parquet' string literals with
             // the double-quoted table name (matching the registered name above).
@@ -1104,7 +1136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let batches = df.collect().await?;
 
             if batches.is_empty() {
-                warn!("    Task {} returned no results, skipping", raw_task.name);
+                warn!("    Task {} returned no results, skipping", task_name);
                 pb_tasks.inc(1);
                 continue;
             }
@@ -1160,38 +1192,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let num_valid = valid_indices.len();
             if num_valid == 0 {
-                warn!("    No valid seeds for task {}, skipping", raw_task.name);
+                warn!("    No valid seeds for task {}, skipping", task_name);
                 pb_tasks.inc(1);
                 continue;
             }
             let anchor_rows_valid: Vec<u32> =
                 valid_indices.iter().map(|&i| anchor_rows[i]).collect();
 
-            // Extract observation_time column (if present)
-            let observation_times: Option<Vec<i64>> =
-                if let Some(obs_col_name) = &raw_task.observation_time_column {
-                    let obs_col_idx = result_schema.index_of(obs_col_name)?;
-                    let obs_arr = result_batch.column(obs_col_idx);
-                    let obs_ts = cast_to_timestamp_us(obs_arr.as_ref()).ok_or_else(|| {
+            // Resolve observation time for every seed row. The cascade:
+            // 1. Task has observation_time_column → use that value.
+            // 2. Anchor table has temporal_column → use anchor row's temporal value.
+            // 3. Neither → i64::MAX (no temporal filtering).
+            let observation_times: Vec<i64> = if let Some(obs_col_name) =
+                &raw_task.observation_time_column
+            {
+                let obs_col_idx = result_schema.index_of(obs_col_name)?;
+                let obs_arr = result_batch.column(obs_col_idx);
+                let obs_ts = cast_to_timestamp_us(obs_arr.as_ref()).ok_or_else(|| {
+                    format!(
+                        "cannot cast observation_time '{}' to timestamp",
+                        obs_col_name
+                    )
+                })?;
+                valid_indices
+                    .iter()
+                    .map(|&i| {
+                        if obs_ts.is_null(i) {
+                            i64::MAX
+                        } else {
+                            obs_ts.value(i)
+                        }
+                    })
+                    .collect()
+            } else if let Some(tc_name) = &raw_meta.tables[&raw_task.anchor_table].temporal_column {
+                // Fall back to anchor table's temporal_column value.
+                let anchor_lt = loaded_tables
+                    .iter()
+                    .find(|lt| lt.name == raw_task.anchor_table)
+                    .ok_or_else(|| {
                         format!(
-                            "cannot cast observation_time '{}' to timestamp",
-                            obs_col_name
+                            "anchor table '{}' not found in loaded tables",
+                            raw_task.anchor_table
                         )
                     })?;
-                    let times: Vec<i64> = valid_indices
-                        .iter()
-                        .map(|&i| {
-                            if obs_ts.is_null(i) {
-                                i64::MAX
-                            } else {
-                                obs_ts.value(i)
-                            }
-                        })
-                        .collect();
-                    Some(times)
-                } else {
-                    None
-                };
+                let tc_arr_idx = anchor_lt.schema.index_of(tc_name).map_err(|_| {
+                    format!(
+                        "temporal_column '{}' not found in table '{}'",
+                        tc_name, raw_task.anchor_table
+                    )
+                })?;
+                let tc_arr = anchor_lt.batch.column(tc_arr_idx);
+                let tc_ts = cast_to_timestamp_us(tc_arr.as_ref()).ok_or_else(|| {
+                    format!("cannot cast temporal_column '{}' to timestamp", tc_name)
+                })?;
+                let anchor_row_start = table_row_ranges[anchor_table_idx].0.0;
+                valid_indices
+                    .iter()
+                    .map(|&i| {
+                        let global_row = anchor_rows[i];
+                        let local_row = (global_row - anchor_row_start) as usize;
+                        if tc_ts.is_null(local_row) {
+                            i64::MAX
+                        } else {
+                            tc_ts.value(local_row)
+                        }
+                    })
+                    .collect()
+            } else {
+                // Static task: no temporal filtering.
+                vec![i64::MAX; num_valid]
+            };
 
             // Extract and encode target column
             let target_col_idx = result_schema.index_of(&raw_task.target_column)?;
@@ -1209,21 +1279,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let target_writer = target_writer_data.as_writer();
-            let obs_times_ref = observation_times.as_deref();
 
-            let task_path = output_dir.join(format!("tasks/{}.bin", raw_task.name));
+            let task_path = output_dir.join(format!("tasks/{}.bin", task_name));
             write_task_bin(
                 &task_path,
                 num_valid as u32,
                 &anchor_rows_valid,
-                obs_times_ref,
+                &observation_times,
                 &target_writer,
             )?;
             task_metadata_list.push(TaskMetadata {
-                name: raw_task.name.clone(),
+                name: task_name.clone(),
                 anchor_table: TableIdx(anchor_table_idx as u32),
                 target_stype,
-                has_observation_time: observation_times.is_some(),
                 num_seeds: num_valid as u32,
                 target_stats,
             });
@@ -1235,7 +1303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pb_tasks.finish_and_clear();
     info!("  Materialized {} tasks", task_metadata_list.len());
 
-    // ── Step 8: Build and write metadata.rkyv + embeddings.bin ───────────
+    // ── Step 8: Build and write metadata.json + embedding .bin files ─────
     info!("Step 8: Writing metadata and embeddings...");
 
     // 8a) Resolve FK targets to ColumnIdx
@@ -1267,6 +1335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name: all_col_names[i].clone(),
                 stype: all_col_stypes[i],
                 fkey_target_col,
+                embedding: Vec::new(), // populated at load time from column_embeddings.bin
             }
         })
         .collect();
@@ -1297,27 +1366,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         global_ts_std_us,
     };
 
-    // Write metadata.rkyv
-    let metadata_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&db_metadata)
-        .map_err(|e| format!("rkyv serialization failed: {e}"))?;
-    fs::write(output_dir.join("metadata.rkyv"), &metadata_bytes)?;
-    info!("  Wrote metadata.rkyv ({} bytes)", metadata_bytes.len());
+    // Write metadata.json
+    let metadata_json = serde_json::to_string_pretty(&db_metadata)?;
+    fs::write(output_dir.join("metadata.json"), &metadata_json)?;
+    info!("  Wrote metadata.json ({} bytes)", metadata_json.len());
 
-    // Write embeddings.bin — column embeddings first, then vocab embeddings (all f16).
-    let total_embeddings = column_embeddings.len() + vocab_embeddings.len();
-    let mut emb_data: Vec<u8> = Vec::with_capacity(total_embeddings * EMBEDDING_DIM * 2);
-    for emb in column_embeddings.iter().chain(vocab_embeddings.iter()) {
+    // Write column_embeddings.bin — one embedding per global column (flat f16 array).
+    let mut col_emb_data: Vec<u8> = Vec::with_capacity(column_embeddings.len() * EMBEDDING_DIM * 2);
+    for emb in column_embeddings.iter() {
         for &v in emb {
-            emb_data.extend_from_slice(&f16::to_ne_bytes(v));
+            col_emb_data.extend_from_slice(&f16::to_ne_bytes(v));
         }
     }
-    fs::write(output_dir.join("embeddings.bin"), &emb_data)?;
+    fs::write(output_dir.join("column_embeddings.bin"), &col_emb_data)?;
     info!(
-        "  Wrote embeddings.bin ({} column + {} vocab = {} embeddings, {} bytes)",
+        "  Wrote column_embeddings.bin ({} column embeddings, {} bytes)",
         column_embeddings.len(),
+        col_emb_data.len()
+    );
+
+    // Write vocab_embeddings.bin — vocab embeddings only (categorical/text values).
+    let mut vocab_emb_data: Vec<u8> =
+        Vec::with_capacity(vocab_embeddings.len() * EMBEDDING_DIM * 2);
+    for emb in vocab_embeddings.iter() {
+        for &v in emb {
+            vocab_emb_data.extend_from_slice(&f16::to_ne_bytes(v));
+        }
+    }
+    fs::write(output_dir.join("vocab_embeddings.bin"), &vocab_emb_data)?;
+    info!(
+        "  Wrote vocab_embeddings.bin ({} vocab embeddings, {} bytes)",
         vocab_embeddings.len(),
-        total_embeddings,
-        emb_data.len()
+        vocab_emb_data.len()
     );
 
     let elapsed = pipeline_start.elapsed();
@@ -1443,7 +1523,8 @@ fn encode_column(
                 if let Some(ta) = &ts_arr {
                     for i in 0..num_rows {
                         if !ta.is_null(i) {
-                            let encoded = encode_timestamp(ta.value(i), global_ts_mean_us, global_ts_std_us);
+                            let encoded =
+                                encode_timestamp(ta.value(i), global_ts_mean_us, global_ts_std_us);
                             values[i * TIMESTAMP_DIM..(i + 1) * TIMESTAMP_DIM]
                                 .copy_from_slice(&encoded);
                         }
@@ -1668,7 +1749,8 @@ fn encode_task_target(
             if let Some(ref ta) = ts_arr {
                 for (out_idx, &i) in valid_indices.iter().enumerate() {
                     if !ta.is_null(i) {
-                        let encoded = encode_timestamp(ta.value(i), global_ts_mean_us, global_ts_std_us);
+                        let encoded =
+                            encode_timestamp(ta.value(i), global_ts_mean_us, global_ts_std_us);
                         values[out_idx * TIMESTAMP_DIM..(out_idx + 1) * TIMESTAMP_DIM]
                             .copy_from_slice(&encoded);
                     }

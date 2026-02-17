@@ -59,7 +59,6 @@ class TableMeta(BaseModel):
 class TaskDef(BaseModel):
     """A prediction task defined as a SQL query."""
 
-    name: str
     query: str
     anchor_table: str
     anchor_key: str
@@ -73,7 +72,7 @@ class DatasetMetadata(BaseModel):
 
     name: str
     tables: dict[str, TableMeta]
-    tasks: list[TaskDef]
+    tasks: dict[str, TaskDef]
 
 
 # ============================================================================
@@ -176,7 +175,9 @@ In your SQL queries, reference tables as quoted parquet filenames:
 
 ### Task fields
 
-- name: unique human-readable identifier (e.g. "predict_vote_type")
+Tasks are an object mapping task name (a unique human-readable identifier,
+e.g. "predict_vote_type") to its definition:
+
 - query: SQL query returning at least anchor_key and target_column (and
   observation_time_column if the task specifies one)
 - anchor_table: which table the sampler roots its subgraph sampling on
@@ -191,11 +192,12 @@ In your SQL queries, reference tables as quoted parquet filenames:
 
 For each interesting non-identifier column, create a trivial task:
 
-    name: "predict_<column>"
-    query: "SELECT <pk>, <column> FROM '<table>.parquet'"
-    anchor_table: "<table>"
-    anchor_key: "<pk>"
-    target_column: "<column>"
+    "predict_<column>": {
+        query: "SELECT <pk>, <column> FROM '<table>.parquet'"
+        anchor_table: "<table>"
+        anchor_key: "<pk>"
+        target_column: "<column>"
+    }
 
 Cell masking tasks do NOT need observation_time_column — the sampler will
 automatically use the anchor table's temporal_column as the observation

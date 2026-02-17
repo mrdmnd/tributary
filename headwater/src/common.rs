@@ -7,58 +7,22 @@ use std::sync::Arc;
 
 use half::f16;
 use memmap2::Mmap;
-use rkyv::{Archive, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::embedder::EMBEDDING_DIM;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
+/// Database columns have "data types" — the primitive types a column is stored as.
+/// They also have "semantic types" — the *meaning* of the data.
+/// The preprocessor assigns semantic types based on a human-annotated metadata JSON file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
-
-// Database columns have "data types" - these are the primitive types that the column is stored as.
-// Database columns ALSO have "semantic types" - these are the "meaning" of the data.
-// Our preprocessor assigns semantic types to columns based on the contents of a (human-annotated) metadata.json file.
-// The metadata.json file actually captures "overrides" -- most of the time, the semantic type can be inferred from the
-// underlying data type, but sometimes the human annotator needs to override the inferred type.
-
 pub enum SemanticType {
-    /// Identifiers that uniquely (or almost uniquely) identify a row in the database.
-    /// The purpose is mostly to "distinguish entities", not describe attributes of them.
-    /// For example, customer_id is an identifier, but age is not.
-    /// "First Name" and "Last Name" are arguably identifiers (very high cardinality categoricals?)
-    /// Phone Number is a categorical - you're not going to be predicting things from full phone numbers.
-    /// It's up to the human metadata annotator to use their judgement to determine if a column is an identifier.
-    /// Text fields that are also identifiers are *not* embedded with the text embedding model.
-    /// HOWEVER, these fields *are* included at the "presence / absence" level -- if the value is NULL, our model learns
-    /// whatever it can.
     Identifier = 0,
-
-    /// Integers and floating point numbers where the numerical ordering and magnitude have meaning.
-    /// Example: age, product_price, discount_percentage, etc.
-    /// Normalization: we use z-score normalization to scale and center the numerical values per-column
     Numerical = 1,
-
-    /// Timestamps are a special case of numerical values. Specifically, numeric values that represent an instant.
-    /// Example: birth date, transaction time, etc. These are treated differently from numerical values because
-    /// there as some implicit cyclic normalization done during encoding.
     Timestamp = 2,
-
-    /// True or false values.
-    /// Example: is_active, has_discount, etc.
-    /// Normalization: map each boolean to 0 or 1
     Boolean = 3,
-
-    /// Values that are drawn from a (small-to-medium-sized) fixed set of possible values.
-    /// Example: product category, subscription status, etc.
-    /// Example: country code (1, 99, 241) -- categorical values don't always have to be string dtypes.
-    /// We encode these as *embedded text* -- for example, "category is ELECTRONICS"
     Categorical = 4,
-
-    /// Multi-token strings where semantic meaning is important
-    /// Example: product descriptions, reviews, etc
-    /// Normalization: embed each cell value with frozen text embedding model
     Text = 5,
-
-    /// Column is deliberately ignored — no data is stored or processed.
     Ignored = 6,
 }
 
@@ -66,42 +30,57 @@ pub enum SemanticType {
 // Index NewTypes
 // ============================================================================
 /// Global table index in the database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
-#[rkyv(derive(Debug, Hash, PartialEq, Eq))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TableIdx(pub u32);
 
 /// Global column index (unique across all tables) in the database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
-#[rkyv(derive(Debug, Hash, PartialEq, Eq))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ColumnIdx(pub u32);
 
 /// Global row index (unique across all tables) in the database.
 /// Uses `u32` to match the CSR graph representation, supporting up to ~4B total rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
-#[rkyv(derive(Debug, Hash, PartialEq, Eq))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct RowIdx(pub u32);
 
 /// Global task index in the database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
-#[rkyv(derive(Debug, Hash, PartialEq, Eq))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TaskIdx(pub u32);
 
-/// Index into the interned text embedding vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
-#[rkyv(derive(Debug, Hash, PartialEq, Eq))]
+/// Index into the interned vocabulary embedding table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EmbeddingIdx(pub u32);
 
 // ============================================================================
 // Metadata / Schema Objects
 // ============================================================================
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnMetadata {
     pub name: String,
     pub stype: SemanticType,
     pub fkey_target_col: Option<ColumnIdx>,
+
+    /// Pre-computed text embedding for this column's name (+ table name + description).
+    ///
+    /// The embedded text is `"<col_name> of <table_name>: <description>"` (or
+    /// `"<col_name> of <table_name>"` if no description). This vector has length
+    /// [`EMBEDDING_DIM`] and contains L2-normalized f16 values.
+    ///
+    /// **Not serialized to JSON.** Column embeddings are stored in a separate
+    /// binary file (`column_embeddings.bin`) and populated at load time by
+    /// [`Database::load`].
+    ///
+    /// At training time, the full set of column embeddings is uploaded to GPU
+    /// shared memory once and kept resident for the entire run.
+    #[serde(skip)]
+    pub embedding: Vec<f16>,
 }
 
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMetadata {
     pub name: String,
     pub col_range: (ColumnIdx, ColumnIdx), // The range of global column indices for the table [start, end)
@@ -112,14 +91,14 @@ pub struct TableMetadata {
 /// Metadata for a single prediction task.
 ///
 /// Each task is defined by a SQL query that materializes ground-truth labels as
-/// `(anchor_row, {observation_time}, target_value)` tuples. The preprocessor
+/// `(anchor_row, observation_time, target_value)` tuples. The preprocessor
 /// executes the query and stores the results in a `<task_name>.bin` file.
 ///
 /// During training, the sampler picks a task, draws seeds from its anchor rows,
-/// builds BFS subgraphs, and the model predicts the target value. The target
-/// column comes from the materialized task table, not from any column in the
-/// original database tables (though for cell-masking tasks they may coincide).
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+/// builds BFS subgraphs, and constructs batches. The target column comes from
+/// the materialized task table, not from any column in the original database tables
+/// (though for simple cell-masking tasks, they may coincide).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskMetadata {
     /// Human-readable task name (e.g. "predict_vote_type").
     pub name: String,
@@ -130,11 +109,6 @@ pub struct TaskMetadata {
     /// Semantic type of the prediction target.
     /// Only `Numerical`, `Categorical`, `Boolean`, and `Timestamp` are valid here.
     pub target_stype: SemanticType,
-
-    /// Whether this task has an explicit observation time per seed row.
-    /// If `false`, the sampler falls back to the anchor table's `temporal_column`
-    /// (if any), or disables temporal filtering entirely.
-    pub has_observation_time: bool,
 
     /// Number of seed rows (anchor_row, target_value pairs) in the materialized task table.
     pub num_seeds: u32,
@@ -147,7 +121,7 @@ pub struct TaskMetadata {
 /// Per-column statistics, determined during preprocessing.
 /// Each variant carries only the stats meaningful for that semantic type.
 /// This lives in the DatabaseMetadata object.
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ColumnStats {
     /// Identifiers: we only care about null rate.
     Identifier { num_nulls: u64 },
@@ -202,12 +176,12 @@ pub enum ColumnStats {
     Ignored,
 }
 
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseMetadata {
     pub table_metadata: Vec<TableMetadata>, // List of tables in the database, indexed by TableIdx
     pub column_metadata: Vec<ColumnMetadata>, // List of columns in the database, indexed by ColumnIdx
-    pub column_stats: Vec<ColumnStats>,   // List of column stats, indexed by ColumnIdx
-    pub task_metadata: Vec<TaskMetadata>, // List of prediction tasks, indexed by TaskIdx
+    pub column_stats: Vec<ColumnStats>,       // List of column stats, indexed by ColumnIdx
+    pub task_metadata: Vec<TaskMetadata>,     // List of prediction tasks, indexed by TaskIdx
 
     /// Global mean of all non-null timestamp values across every table (epoch microseconds).
     /// Used for the z-score component of timestamp encoding so that all timestamps are
@@ -612,18 +586,21 @@ const fn align_up(offset: usize, alignment: usize) -> usize {
 const TABLE_ALIGNMENT: usize = 8;
 
 // ============================================================================
-// Embedding Table
+// Vocab Embedding Table
 // ============================================================================
 
-/// Interned text embedding table backed by a memory-mapped flat binary file.
+/// Interned vocabulary embedding table backed by a memory-mapped flat binary file.
 ///
-/// The file contains a packed `[num_embeddings, EMBEDDING_DIM]` array of `f16`
-/// values (little-endian, native byte order). The mmap is read-only and shared
+/// Contains embeddings for categorical and text cell **values** only.
+/// Column-name embeddings are stored separately in [`ColumnMetadata::embedding`].
+///
+/// The file (`vocab_embeddings.bin`) contains a packed `[num_embeddings, EMBEDDING_DIM]`
+/// array of `f16` values (native byte order). The mmap is read-only and shared
 /// across processes.
 ///
-/// The first `num_columns` entries are column-name embeddings (indexed by
-/// `ColumnIdx`), followed by vocab embeddings for categorical / text values.
-pub struct EmbeddingTable {
+/// Indices stored in [`ColumnSlice::Embedded`] point directly into this table
+/// (0-based, no offset).
+pub struct VocabEmbeddingTable {
     /// Keeps the memory map alive for the lifetime of the table.
     _mmap: Arc<Mmap>,
     /// View into the mmap as a flat f16 slice.
@@ -636,8 +613,8 @@ pub struct EmbeddingTable {
     num_embeddings: usize,
 }
 
-impl EmbeddingTable {
-    /// Create an [`EmbeddingTable`] from a memory-mapped flat binary file.
+impl VocabEmbeddingTable {
+    /// Create a [`VocabEmbeddingTable`] from a memory-mapped flat binary file.
     ///
     /// The file must contain `num_embeddings * EMBEDDING_DIM` packed `f16` values
     /// (i.e., its byte length must be a multiple of `EMBEDDING_DIM * 2`).
@@ -649,7 +626,7 @@ impl EmbeddingTable {
         let stride = EMBEDDING_DIM * std::mem::size_of::<f16>();
         assert!(
             byte_len % stride == 0,
-            "embedding file size ({byte_len} bytes) is not a multiple of \
+            "vocab embedding file size ({byte_len} bytes) is not a multiple of \
              EMBEDDING_DIM ({EMBEDDING_DIM}) * sizeof(f16) = {stride} bytes",
         );
         let num_embeddings = byte_len / stride;
@@ -672,12 +649,12 @@ impl EmbeddingTable {
         }
     }
 
-    /// Number of distinct embeddings in the table.
+    /// Number of distinct vocabulary embeddings in the table.
     pub fn num_embeddings(&self) -> usize {
         self.num_embeddings
     }
 
-    /// Look up an embedding vector by index.
+    /// Look up a vocabulary embedding vector by index.
     ///
     /// Returns a slice of [`EMBEDDING_DIM`] `f16` values.
     ///
@@ -687,7 +664,7 @@ impl EmbeddingTable {
         let i = idx.0 as usize;
         assert!(
             i < self.num_embeddings,
-            "EmbeddingIdx {i} out of bounds (num_embeddings = {})",
+            "EmbeddingIdx {i} out of bounds (num_vocab_embeddings = {})",
             self.num_embeddings,
         );
         let start = i * EMBEDDING_DIM;
@@ -741,7 +718,7 @@ pub enum ColumnSlice {
         bits: &'static [u8],
     },
 
-    /// Categorical or Text: `u32` embedding indices with validity bitmap.
+    /// Categorical or Text: `u32` indices into [`VocabEmbeddingTable`], with validity bitmap.
     Embedded {
         validity: &'static [u8],
         indices: &'static [u32],
@@ -1024,7 +1001,7 @@ pub enum ColumnWriter<'a> {
     },
     /// Boolean: validity bitmap + packed value bits.
     Boolean { validity: &'a [u8], bits: &'a [u8] },
-    /// Categorical or Text: validity bitmap + u32 embedding indices.
+    /// Categorical or Text: validity bitmap + u32 indices into [`VocabEmbeddingTable`].
     Embedded {
         validity: &'a [u8],
         indices: &'a [u32],
@@ -1139,19 +1116,26 @@ pub fn write_table_bin(
 /// A zero-copy, memory-mapped view of a single materialized prediction task.
 ///
 /// Each task is produced by executing a SQL query during preprocessing, yielding
-/// `(anchor_row, {observation_time}, target_value)` tuples. The binary file
+/// `(anchor_row, observation_time, target_value)` tuples. The binary file
 /// packs this data densely for zero-copy access at training time.
+///
+/// Observation times are **always** present. The preprocessor resolves the
+/// observation time for every seed row at preprocessing time:
+/// - If the task defines an `observation_time_column`, that value is used.
+/// - Otherwise, if the anchor table has a `temporal_column`, the anchor row's
+///   temporal value is used.
+/// - Otherwise, `i64::MAX` is stored (no temporal filtering).
 ///
 /// ## File layout
 ///
 /// ```text
-/// Header (8 bytes, 8-byte aligned):
-///   num_seeds : u32     — number of (anchor_row, target) pairs
-///   flags     : u32     — bit 0: has_observation_time
+/// Header (4 bytes, 8-byte aligned):
+///   num_seeds : u32     — number of (anchor_row, observation_time, target) triples
+///   _reserved : u32     — reserved (must be 0)
 ///
 /// Body (packed sequentially, each section 8-byte aligned):
 ///   anchor_rows       : [u32; num_seeds]                  — global RowIdx per seed
-///   observation_times : [i64; num_seeds]                  — epoch μs (only if flag bit 0 set)
+///   observation_times : [i64; num_seeds]                  — epoch μs (always present)
 ///   target validity   : packed bits [ceil(num_seeds/8)]   — 1 = valid, 0 = null
 ///   target values     : type-dependent:
 ///     Numerical   → [f32; num_seeds]                      — z-scored values
@@ -1169,14 +1153,12 @@ pub struct TaskView {
     num_seeds: usize,
     /// Global RowIdx for each seed (length = num_seeds).
     anchor_rows: &'static [u32],
-    /// Observation times in epoch microseconds, if the task has them.
-    observation_times: Option<&'static [i64]>,
+    /// Observation times in epoch microseconds (length = num_seeds, always present).
+    /// `i64::MAX` means no temporal filtering for that seed.
+    observation_times: &'static [i64],
     /// The target column, encoded identically to a [`ColumnSlice`].
     target: ColumnSlice,
 }
-
-/// Flag bit: task file includes observation times.
-const TASK_FLAG_HAS_OBS_TIME: u32 = 1;
 
 impl TaskView {
     /// Create a [`TaskView`] from a memory-mapped `<task_name>.bin` file.
@@ -1199,8 +1181,7 @@ impl TaskView {
         // SAFETY: Mmap is page-aligned (>= 4-byte aligned). Header is 2 u32s.
         let header: &[u32] = unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u32, 2) };
         let num_seeds = header[0] as usize;
-        let flags = header[1];
-        let has_obs_time = (flags & TASK_FLAG_HAS_OBS_TIME) != 0;
+        let _reserved = header[1];
 
         let bitmap_len = packed_bit_bytes(num_seeds);
         let mut offset = align_up(header_bytes, TABLE_ALIGNMENT);
@@ -1221,18 +1202,13 @@ impl TaskView {
             TABLE_ALIGNMENT,
         );
 
-        // -- observation_times: [i64; num_seeds] (optional) --
-        let observation_times = if has_obs_time {
-            let times: &'static [i64] =
-                unsafe { std::slice::from_raw_parts(base.add(offset) as *const i64, num_seeds) };
-            offset = align_up(
-                offset + num_seeds * std::mem::size_of::<i64>(),
-                TABLE_ALIGNMENT,
-            );
-            Some(times)
-        } else {
-            None
-        };
+        // -- observation_times: [i64; num_seeds] (always present) --
+        let observation_times: &'static [i64] =
+            unsafe { std::slice::from_raw_parts(base.add(offset) as *const i64, num_seeds) };
+        offset = align_up(
+            offset + num_seeds * std::mem::size_of::<i64>(),
+            TABLE_ALIGNMENT,
+        );
 
         // -- target column: validity bitmap + typed values --
         let target = match target_stype {
@@ -1316,18 +1292,13 @@ impl TaskView {
 
     /// Get the observation time (epoch microseconds) for a seed.
     ///
-    /// Returns `None` if the task has no observation time column.
+    /// A value of `i64::MAX` means no temporal filtering applies for this seed.
     ///
     /// # Panics
-    /// Panics if `seed` is out of bounds and observation times are present.
+    /// Panics if `seed` is out of bounds.
     #[inline]
-    pub fn observation_time(&self, seed: usize) -> Option<i64> {
-        self.observation_times.map(|times| times[seed])
-    }
-
-    /// Whether this task has observation times.
-    pub fn has_observation_time(&self) -> bool {
-        self.observation_times.is_some()
+    pub fn observation_time(&self, seed: usize) -> i64 {
+        self.observation_times[seed]
     }
 
     /// Get the target column as a [`ColumnSlice`].
@@ -1362,6 +1333,9 @@ impl TaskView {
 ///
 /// See [`TaskView`] for the file layout.
 ///
+/// `observation_times` must always be provided (one `i64` per seed). Use
+/// `i64::MAX` for seeds with no temporal constraint.
+///
 /// `target` must be a [`ColumnWriter`] variant matching the task's `target_stype`:
 /// `Numerical`, `Timestamp`, `Boolean`, or `Embedded` (for categoricals).
 ///
@@ -1371,24 +1345,18 @@ pub fn write_task_bin(
     path: &Path,
     num_seeds: u32,
     anchor_rows: &[u32],
-    observation_times: Option<&[i64]>,
+    observation_times: &[i64],
     target: &ColumnWriter,
 ) -> std::io::Result<()> {
     debug_assert_eq!(anchor_rows.len(), num_seeds as usize);
-    if let Some(times) = observation_times {
-        debug_assert_eq!(times.len(), num_seeds as usize);
-    }
+    debug_assert_eq!(observation_times.len(), num_seeds as usize);
 
     let mut w = BufWriter::new(File::create(path)?);
 
     // -- Header (8 bytes) ---------------------------------------------------
-    let flags: u32 = if observation_times.is_some() {
-        TASK_FLAG_HAS_OBS_TIME
-    } else {
-        0
-    };
+    let reserved: u32 = 0;
     w.write_all(&num_seeds.to_ne_bytes())?;
-    w.write_all(&flags.to_ne_bytes())?;
+    w.write_all(&reserved.to_ne_bytes())?;
     let mut offset = align_up(8, TABLE_ALIGNMENT); // already 8
 
     let bitmap_len = packed_bit_bytes(num_seeds as usize);
@@ -1439,10 +1407,8 @@ pub fn write_task_bin(
     // -- anchor_rows --
     write_padded(&mut w, u32_as_bytes(anchor_rows), &mut offset)?;
 
-    // -- observation_times (optional) --
-    if let Some(times) = observation_times {
-        write_padded(&mut w, i64_as_bytes(times), &mut offset)?;
-    }
+    // -- observation_times (always present) --
+    write_padded(&mut w, i64_as_bytes(observation_times), &mut offset)?;
 
     // -- target column --
     match target {
@@ -1488,30 +1454,37 @@ pub fn write_task_bin(
 /// Assembles five independently-stored components, **all** backed by
 /// memory-mapped files for zero-copy sharing across DDP processes:
 ///
-/// - **metadata** — schema, column stats, column-name embeddings, task definitions (rkyv, deserialized into owned types; small KB)
+/// - **metadata** — schema, column stats, task definitions (JSON, deserialized into owned types; small KB)
+/// - **column_embeddings** — pre-computed column-name embeddings (flat binary, read at load into [`ColumnMetadata::embedding`])
 /// - **graph** — bidirectional CSR topology (flat binary, mmap'd zero-copy via [`GraphView`])
 /// - **tables** — preprocessed column data (flat binary, mmap'd zero-copy via [`TableView`])
 /// - **tasks** — materialized prediction tasks (flat binary, mmap'd zero-copy via [`TaskView`])
-/// - **embeddings** — interned text embeddings for categorical/text columns (flat binary, mmap'd via [`EmbeddingTable`])
+/// - **vocab_embeddings** — interned text embeddings for categorical/text values (flat binary, mmap'd via [`VocabEmbeddingTable`])
+///
+/// Column-name embeddings are loaded from `column_embeddings.bin` and populated
+/// into [`ColumnMetadata::embedding`] at load time, so they can be uploaded to
+/// GPU shared memory once at training start.
 ///
 /// The preprocessed database directory layout:
 ///
 /// ```text
 /// db_out/
-///   metadata.rkyv       — DatabaseMetadata (rkyv archive)
-///   graph.bin           — bidirectional CSR (flat binary, see GraphView)
-///   embeddings.bin      — flat [N, 768] f16 array (column embeddings first, then vocab)
+///   metadata.json              — DatabaseMetadata (JSON, schema + stats + tasks)
+///   column_embeddings.bin      — flat [C, EMBEDDING_DIM] f16 array (one per column)
+///   vocab_embeddings.bin       — flat [V, EMBEDDING_DIM] f16 array (categorical/text value embeddings)
+///   graph.bin                  — bidirectional CSR (flat binary, see GraphView)
 ///   tables/
-///     badges.bin        — flat binary column store (see TableView)
+///     badges.bin               — flat binary column store (see TableView)
 ///     comments.bin
 ///     ...
 ///   tasks/
-///     predict_vote_type.bin  — materialized task (see TaskView)
+///     predict_vote_type.bin    — materialized task (see TaskView)
 ///     predict_post_type.bin
 ///     ...
 /// ```
 pub struct Database {
-    /// Schema, column stats, column name embeddings, task definitions (deserialized, owned).
+    /// Schema, column stats, column-name embeddings, task definitions.
+    /// Deserialized from `metadata.json`; column embeddings populated from `column_embeddings.bin`.
     pub metadata: DatabaseMetadata,
 
     /// Bidirectional CSR graph topology, zero-copy from mmap'd `graph.bin`.
@@ -1525,9 +1498,11 @@ pub struct Database {
     /// Each view is backed by a mmap'd `<task_name>.bin` file.
     pub tasks: Vec<TaskView>,
 
-    /// Interned text embeddings for categorical and text columns.
+    /// Interned vocabulary embeddings for categorical and text cell values.
     /// Indexed by [`EmbeddingIdx`] stored in Embedded columns of `tables`.
-    pub embeddings: EmbeddingTable,
+    /// Column-name embeddings are **not** in this table — they live in
+    /// [`ColumnMetadata::embedding`].
+    pub vocab_embeddings: VocabEmbeddingTable,
 
     /// Sorted table row-range starts for O(log T) row-to-table lookup.
     /// One entry per table: `row_starts[i] = table_metadata[i].row_range.0`.
@@ -1543,16 +1518,34 @@ impl Database {
     ///
     /// Expects the directory layout described in the [`Database`] docs.
     pub fn load(dir: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // -- Metadata (rkyv, deserialized into owned types) ------------------
-        let metadata_path = dir.join("metadata.rkyv");
-        let metadata_file = File::open(&metadata_path)?;
-        let metadata_mmap = unsafe { Mmap::map(&metadata_file)? };
-        // SAFETY: The preprocessor wrote a valid rkyv archive.
-        let metadata: DatabaseMetadata = unsafe {
-            rkyv::from_bytes_unchecked::<DatabaseMetadata, rkyv::rancor::Error>(&metadata_mmap)
+        // -- Metadata (JSON, deserialized into owned types) ------------------
+        let metadata_path = dir.join("metadata.json");
+        let metadata_bytes = std::fs::read(&metadata_path)?;
+        let mut metadata: DatabaseMetadata = serde_json::from_slice(&metadata_bytes)
+            .map_err(|e| format!("failed to deserialize metadata: {e}"))?;
+
+        // -- Column embeddings (flat binary) --------------------------------
+        // Populate ColumnMetadata.embedding from the separate binary file.
+        let col_emb_path = dir.join("column_embeddings.bin");
+        let col_emb_bytes = std::fs::read(&col_emb_path)?;
+        let stride = EMBEDDING_DIM * std::mem::size_of::<f16>();
+        let num_col_embeddings = col_emb_bytes.len() / stride;
+        assert_eq!(
+            num_col_embeddings,
+            metadata.column_metadata.len(),
+            "column_embeddings.bin has {} embeddings but metadata has {} columns",
+            num_col_embeddings,
+            metadata.column_metadata.len(),
+        );
+        for (i, cmeta) in metadata.column_metadata.iter_mut().enumerate() {
+            let start = i * stride;
+            let chunk = &col_emb_bytes[start..start + stride];
+            // SAFETY: f16 is repr(transparent) over u16 (2 bytes), and the
+            // slice is properly aligned because stride is a multiple of 2.
+            let f16_slice: &[f16] =
+                unsafe { std::slice::from_raw_parts(chunk.as_ptr() as *const f16, EMBEDDING_DIM) };
+            cmeta.embedding = f16_slice.to_vec();
         }
-        .map_err(|e| format!("failed to deserialize metadata: {e}"))?;
-        // metadata_mmap is dropped here — the deserialized data is fully owned.
 
         // -- Graph (flat binary, mmap'd zero-copy) --------------------------
         let graph_path = dir.join("graph.bin");
@@ -1606,18 +1599,18 @@ impl Database {
             tasks.push(TaskView::from_mmap(mmap, target_stype));
         }
 
-        // -- Embeddings (flat binary, mmap'd) --------------------------------
-        let embeddings_path = dir.join("embeddings.bin");
-        let embeddings_file = File::open(&embeddings_path)?;
-        let embeddings_mmap = Arc::new(unsafe { Mmap::map(&embeddings_file)? });
-        let embeddings = EmbeddingTable::from_mmap(embeddings_mmap);
+        // -- Vocab embeddings (flat binary, mmap'd) ---------------------------
+        let vocab_path = dir.join("vocab_embeddings.bin");
+        let vocab_file = File::open(&vocab_path)?;
+        let vocab_mmap = Arc::new(unsafe { Mmap::map(&vocab_file)? });
+        let vocab_embeddings = VocabEmbeddingTable::from_mmap(vocab_mmap);
 
         Ok(Self {
             metadata,
             graph,
             tables,
             tasks,
-            embeddings,
+            vocab_embeddings,
             row_starts,
             col_starts,
         })
@@ -1654,19 +1647,18 @@ impl Database {
         &self.tables[idx.0 as usize]
     }
 
-    /// Look up an embedding vector by index.
+    /// Look up a vocabulary embedding (categorical / text value) by index.
     ///
     /// Returns a slice of [`EMBEDDING_DIM`] `f16` values.
-    pub fn embedding(&self, idx: EmbeddingIdx) -> &[f16] {
-        self.embeddings.get(idx)
+    pub fn vocab_embedding(&self, idx: EmbeddingIdx) -> &[f16] {
+        self.vocab_embeddings.get(idx)
     }
 
     /// Look up the column-name embedding for a given column.
     ///
-    /// Column embeddings occupy the first `num_columns` entries of the
-    /// embedding table, so `ColumnIdx(i)` maps to `EmbeddingIdx(i)`.
+    /// Column embeddings are stored directly in [`ColumnMetadata`].
     pub fn column_embedding(&self, col: ColumnIdx) -> &[f16] {
-        self.embeddings.get(EmbeddingIdx(col.0))
+        &self.metadata.column_metadata[col.0 as usize].embedding
     }
 
     /// Convert a global [`RowIdx`] to the local row offset within its table.

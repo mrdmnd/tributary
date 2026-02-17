@@ -1,14 +1,27 @@
-# tributary
+# Tributary
 
 A foundation model for learning internal representations of relational databases.
 
 ## Overview
 
-Tributary is a system that is design to train models against relational databases such
-that the underlying model, through the process of masked-cell regression/classification,
-learns internal representations of the database schema and the data itself.
+Tributary is a system that is design to train a foundation models to understand relational databases, via prediction.
+The underlying model derives signal from human-annotated "tasks", which correspond to regression or classification
+problems. As the model learns, it should get better at these tasks across databases.
 
-This is a work in progress! I'm still figuring out the best way to do this.
+## Setup
+
+To preprocess your own databases, you need to have a frozen text embedder endpoint available.
+The default in this project is to use an OpenAI compatible endpoint; how you get this hosted is up to you.
+I've found that Baseten is a really good high speed host for throughput-sensitive applications like this preprocessing.
+
+If you want to use the Baseten hosted endpoint, you need to set the following environment variables:
+- `BASETEN_EMBEDDER_URL` - the base URL of the Baseten endpoint
+- `BASETEN_API_KEY` - the API key for the Baseten endpoint
+
+If you want to use the OpenRouter endpoint for the "metadata generation agent", you need to set the following variable:
+- `OPENROUTER_API_KEY` - the base URL of the OpenRouter endpoint
+
+
 
 ## Representations
 
@@ -80,13 +93,13 @@ z-score normalized to an f32 based on all timestamp values across all tables in 
 
 Boolean values are encoded as 0 / 1 values, with a validity bitmap (null / present).
 
-Categorical values are encoded as an _index_ into an embedding table, for the string
+Categorical values are encoded as an _index_ into a vocabulary embedding table, for the string
 "column name is X". For example, if the column name is "color", and the value is "red",
-we use a frozen text embedder to embed "color is red", put that embedding into a lookup
-table, and use the index of that embedding in the binary representation.
+we use a frozen text embedder to embed "color is red", put that embedding into a shared
+vocabulary table (`vocab_embeddings.bin`), and store the index into that table.
 
-Text values are similarly encoded - we use a frozen text embedder for non-identifier
-(semantically meaningful) text values.
+Text values are similarly encoded — we use the same frozen text embedder for non-identifier
+(semantically meaningful) text values, sharing the same vocabulary table.
 
 ## Training
 
@@ -96,87 +109,45 @@ For numeric and timestamp values, we use Huber regression loss.
 For boolean values, we use binary cross-entropy loss.
 For categorical values, we use InfoNCE loss
 
-## Prerequisites
-
-TODO(mrdmnd): Add prerequisites.
-
-## Setup
-
-### 1. Download ONNX Runtime
-
-The project dynamically loads ONNX Runtime with the CUDA execution provider.
-Download the pre-built binary and extract it:
+## Building
 
 ```bash
-mkdir -p ort/ort-libs && cd ort/ort-libs
-curl -L -o ort-cuda13.tgz \
-  https://github.com/microsoft/onnxruntime/releases/download/v1.24.1/onnxruntime-linux-x64-gpu_cuda13-1.24.1.tgz
-tar xzf ort-cuda13.tgz
-cd ../..
-```
-
-The library path is configured automatically via `.cargo/config.toml`.
-
-### 2. Export the ONNX model
-
-```bash
-uv run scripts/export_onnx.py
-```
-
-This runs a four-step pipeline (export, BERT graph fusion, FP16 conversion,
-post-processing) and produces `ort/models/bge-base-en-v1.5-onnx/model_fp16_pooled.onnx`
-(~105 MB). See the script's docstring for details.
-
-The final model includes:
-
-- **BERT-specific graph fusions** — `Attention`, `BiasGelu`,
-  `SkipLayerNormalization`, `EmbedLayerNormalization`.
-- **FP16 weights and activations** — enables tensor-core acceleration.
-- **INT32 inputs** — halves host-to-device transfer size vs the default INT64.
-- **Fused FP16 mean-pooling + L2 normalisation** — output is `[B, 768]` FP32.
-  Uses only CUDA-friendly primitives to avoid a CPU fallback on
-  `LpNormalization`.
-
-### 3. Build
-
-```bash
+cd headwater
 cargo build --release
 ```
 
 ## Project structure
 
 ```
-src/
-  lib.rs            — crate root (mimalloc global allocator)
-  common.rs         — shared types, graph structures, binary format I/O
-  embedder.rs       — ORT-backed GPU embedding (tokenization, IoBinding, pipelining)
-  model.rs          — transformer model definition (WIP)
-  training.rs       — training configuration (WIP)
-  bin/
-    preprocess.rs   — data preprocessing binary
-    inspect.rs      — preprocessed database inspector / debugger
-    train.rs        — model training binary (WIP)
-benches/
-  embedder_throughput.rs — Criterion benchmarks (chunk-size sweep + mixed-length)
-ort/
-  ort-libs/         — ONNX Runtime shared library (gitignored)
-  models/           — exported ONNX models (gitignored)
+headwater/                  — Rust crate (preprocessing, sampling, inspection)
+  src/
+    lib.rs                  — crate root (mimalloc global allocator)
+    common.rs               — shared types, graph structures, binary format I/O
+    embedder.rs             — API-based text embedding (OpenAI-compatible endpoint)
+    sampler.rs              — batch sampler for training (WIP)
+    bin/
+      preprocess.rs         — data preprocessing binary
+      inspect.rs            — preprocessed database inspector / debugger
+      single_sample.rs      — single-sample debugging tool (WIP)
+confluence/                 — Python/JAX model (WIP)
+documentation/              — design docs (architecture, preprocessing, sampling, etc.)
+scripts/                    — helper scripts (metadata generation, etc.)
+data/
+  metadata/                 — human-annotated schema JSON files
+  raw/                      — source parquet files
+  processed/                — preprocessed binary output
 ```
 
-## Benchmarking
+## Preprocessed output layout
 
-```bash
-cargo bench --bench embedder_throughput
 ```
-
-For reproducible results, lock GPU clocks before benchmarking:
-
-```bash
-# Lock clocks (pick a frequency your GPU supports):
-sudo nvidia-smi -lgc <freq>,<freq>
-
-cargo bench --bench embedder_throughput
-
-# Reset when done:
-sudo nvidia-smi -rgc
+data/processed/<dataset>/
+  metadata.json             — schema, column stats, task definitions (JSON)
+  column_embeddings.bin     — flat [C, 256] f16 array (one per global column)
+  vocab_embeddings.bin      — flat [V, 256] f16 array (one per distinct categorical/text value)
+  graph.bin                 — bidirectional CSR graph (FK edges)
+  tables/
+    <table_name>.bin        — packed column store per table
+  tasks/
+    <task_name>.bin         — materialized prediction task
 ```

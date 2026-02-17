@@ -11,14 +11,14 @@ We specify at training-time the set of tasks we're interested in solving for our
 Every task is a SQL query that materializes ground-truth labels as tuples:
 
 ```
-(anchor_row, {observation_time}, target_value)
+(anchor_row, observation_time, target_value)
 ```
 
 - **anchor_row**: which row to root the BFS subgraph on.
-- **observation_time**: the point in time the model observes from.
+- **observation_time**: the point in time the model observes from (epoch microseconds, `i64`).
   The sampler will only include rows that existed at or before this time (temporal filtering).
-  Not all tasks will necessarily have an "observation" time.
-- **target_value**: a (derived) quantity that the model predicts. 
+  Every task always has an observation time per seed — the preprocessor resolves it at materialization time (see below).
+- **target_value**: a (derived) quantity that the model predicts.
   Semantically interpreted as an instance of `target_stype` (numerical, categorical, boolean, or timestamp).
   Loss computation is determined by this value and semantic type.
 
@@ -66,7 +66,11 @@ task: {
 
 The target is a cell (VoteTypeId) that already exists in the table.
 During training, the model will materialize this task table, sample anchor/seed rows from it,
-mask out the VoteTypeId cell, and predicts it from the surrounding subgraph.
+mask out the VoteTypeId cell, and predict it from the surrounding subgraph.
+
+No `observation_time_column` is needed — the preprocessor falls back to the
+anchor table's `temporal_column` (if any), or `i64::MAX` for static tables.
+See "Observation time resolution" above.
 
 ### Filtered cell tasks
 
@@ -143,11 +147,18 @@ rows came into existence. During BFS, rows in tables with a `temporal_column` ar
 only included if their temporal value <= the seed's observation time. Tables
 without `temporal_column` (static/dimension data) are always traversable.
 
-Observation time resolution:
+### Observation time resolution
 
-1. If the task has `observation_time_column` -> use that column from query results.
-2. Else if the anchor table has `temporal_column` -> use that column's value.
-3. Else -> no temporal filtering (i64::MAX).
+The preprocessor resolves an observation time for **every** seed row at
+materialization time, so the sampler just reads a concrete `i64` per seed:
+
+1. If the task defines `observation_time_column` → use that column's value from the query results.
+2. Else if the anchor table has a `temporal_column` → use the anchor row's temporal value.
+3. Else → `i64::MAX` (no temporal filtering; the entire database is visible).
+
+This cascade is resolved once during preprocessing and stored in the task
+binary file. The sampler never needs to implement fallback logic — it
+unconditionally reads `observation_times[seed]` and uses it as the BFS cutoff.
 
 ---
 

@@ -4,22 +4,27 @@
 //! ## Usage
 //!
 //! ```sh
-//! cargo run --release --bin inspect -- --db-dir data/rel-stack.processed
-//! cargo run --release --bin inspect -- --db-dir data/rel-stack.processed --sample-rows 10
+//! cargo run --release --bin inspect -- --data-dir data --dataset rel-stack
+//! cargo run --release --bin inspect -- --data-dir data --dataset rel-stack --sample-rows 10
 //! ```
 
 use std::path::PathBuf;
 
 use clap::Parser;
-use tributary::common::*;
-use tributary::embedder::EMBEDDING_DIM;
+use headwater::common::*;
+use headwater::embedder::EMBEDDING_DIM;
 
 #[derive(Parser, Debug)]
 #[command(about = "Inspect a preprocessed database")]
 struct Args {
-    /// Path to the preprocessed database directory.
+    /// Name of the dataset to inspect (e.g. "rel-stack"). The preprocessed
+    /// data is loaded from `<data-dir>/processed/<dataset>/`.
     #[arg(long)]
-    db_dir: PathBuf,
+    dataset: String,
+
+    /// Path to the top-level data directory (contains raw/, metadata/, processed/).
+    #[arg(long)]
+    data_dir: PathBuf,
 
     /// Number of sample rows to dump per table (0 to skip).
     #[arg(long, default_value_t = 5)]
@@ -36,7 +41,8 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
-    let db = Database::load(&args.db_dir)?;
+    let db_dir = args.data_dir.join("processed").join(&args.dataset);
+    let db = Database::load(&db_dir)?;
     let meta = &db.metadata;
 
     let num_tables = meta.table_metadata.len();
@@ -50,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // ── Overview ──────────────────────────────────────────────────────────
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  Database: {}", args.db_dir.display());
+    println!("║  Database: {} ({})", args.dataset, db_dir.display());
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║  Tables:     {num_tables:>10}");
     println!("║  Columns:    {num_cols:>10}");
@@ -61,13 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         db.graph.num_nodes(),
         db.graph.num_edges()
     );
-    let num_vocab = db.embeddings.num_embeddings() - num_cols;
+    let num_vocab = db.vocab_embeddings.num_embeddings();
     println!(
-        "║  Embeddings: {:>10} total ({} column + {} vocab), {:>10} dim (f16)",
-        db.embeddings.num_embeddings(),
-        num_cols,
-        num_vocab,
-        EMBEDDING_DIM
+        "║  Embeddings: {:>10} column (in metadata), {:>10} vocab (in vocab_embeddings.bin), {:>3} dim (f16)",
+        num_cols, num_vocab, EMBEDDING_DIM
     );
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
@@ -295,14 +298,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("┌─ Task {task_idx}: \"{}\"", tmeta.name);
         println!("│  Anchor table: {anchor_table}");
         println!("│  Target stype: {:?}", tmeta.target_stype);
-        println!(
-            "│  Observation time: {}",
-            if tmeta.has_observation_time {
-                "yes"
-            } else {
-                "no"
-            }
-        );
         println!("│  Seeds: {}", tmeta.num_seeds);
         println!("│  Target stats:");
         print_stats(&tmeta.target_stats, "│    ");
@@ -326,17 +321,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let anchor_table_name = &meta.table_metadata[anchor_ti.0 as usize].name;
                 let anchor_local = db.local_row(anchor);
 
-                let obs_str = match tv.observation_time(seed) {
-                    Some(us) => {
-                        if us == i64::MAX {
-                            "MAX".to_string()
-                        } else if let Some(dt) = chrono::DateTime::from_timestamp_micros(us) {
-                            dt.format("%Y-%m-%d %H:%M").to_string()
-                        } else {
-                            format!("{us}")
-                        }
-                    }
-                    None => "-".to_string(),
+                let obs_us = tv.observation_time(seed);
+                let obs_str = if obs_us == i64::MAX {
+                    "MAX".to_string()
+                } else if let Some(dt) = chrono::DateTime::from_timestamp_micros(obs_us) {
+                    dt.format("%Y-%m-%d %H:%M").to_string()
+                } else {
+                    format!("{obs_us}")
                 };
 
                 let target_str = if tv.target_is_null(seed) {
@@ -362,28 +353,44 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!();
     }
 
-    // ── Embedding Table ──────────────────────────────────────────────────
-    println!("┌─ Embedding Table (f16)");
-    println!(
-        "│  Total: {}  ({} column + {} vocab)  Dim: {}",
-        db.embeddings.num_embeddings(),
-        num_cols,
-        num_vocab,
-        EMBEDDING_DIM,
-    );
-    if db.embeddings.num_embeddings() > 0 {
-        let show = db.embeddings.num_embeddings().min(5);
-        println!("│  Sample embedding L2 norms:");
+    // ── Column-Name Embeddings (from metadata) ─────────────────────────
+    println!("┌─ Column-Name Embeddings (from metadata, f16)");
+    println!("│  Count: {}  Dim: {}", num_cols, EMBEDDING_DIM);
+    if num_cols > 0 {
+        let show = num_cols.min(5);
+        println!("│  Sample L2 norms:");
         for i in 0..show {
-            let emb = db.embeddings.get(EmbeddingIdx(i as u32));
+            let emb = &meta.column_metadata[i].embedding;
             let norm: f32 = emb
                 .iter()
                 .map(|v| v.to_f32())
                 .map(|v| v * v)
                 .sum::<f32>()
                 .sqrt();
-            let kind = if i < num_cols { "col" } else { "vocab" };
-            println!("│    [{i}] ({kind}) L2 norm = {norm:.4}");
+            println!(
+                "│    [{i}] \"{}\" L2 norm = {norm:.4}",
+                meta.column_metadata[i].name
+            );
+        }
+    }
+    println!("└──────────────────────────────────────────────────────────────");
+    println!();
+
+    // ── Vocab Embedding Table ─────────────────────────────────────────
+    println!("┌─ Vocab Embedding Table (vocab_embeddings.bin, f16)");
+    println!("│  Count: {}  Dim: {}", num_vocab, EMBEDDING_DIM);
+    if num_vocab > 0 {
+        let show = num_vocab.min(5);
+        println!("│  Sample L2 norms:");
+        for i in 0..show {
+            let emb = db.vocab_embeddings.get(EmbeddingIdx(i as u32));
+            let norm: f32 = emb
+                .iter()
+                .map(|v| v.to_f32())
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt();
+            println!("│    [{i}] L2 norm = {norm:.4}");
         }
     }
     println!("└──────────────────────────────────────────────────────────────");

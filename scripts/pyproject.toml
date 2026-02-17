@@ -1,7 +1,7 @@
 [project]
 name = "scripts"
 version = "0.1.0"
-description = "Add your description here"
+description = "Some useful scripts for the tributary repository"
 requires-python = ">=3.13"
 dependencies = [
     "duckdb>=1.4.4",

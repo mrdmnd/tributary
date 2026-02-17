@@ -1,43 +1,38 @@
 [package]
-name = "tributary"
+name = "headwater"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 arrow = { version = "57.3", default-features = true, features = ["ipc"] }
-burn = { version = "0.20.1", features = ["std", "tui", "train", "vision", "cuda", "wgpu", "fusion", "collective"] }
 chrono = "0.4"
 clap = { version = "4.5.57", features = ["derive"] }
 datafusion = "52.1"
-half = { version = "2", features = ["bytemuck"] }
-hf-hub = "0.4.3"
+half = { version = "2", features = ["bytemuck", "serde"] }
 indexmap = { version = "2", features = ["serde"] }
 indicatif = "0.18.3"
 itertools = "0.14.0"
 memmap2 = "0.9.9"
 mimalloc = "0.1.48"
-ort = { version = "2.0.0-rc.11", features = ["load-dynamic", "half"] }
 parking_lot = "0.12.5"
 parquet = "57.2"
-rand = "0.9.2"
+rand = "0.10.0"
+rand_distr = "0.6.0"
 rayon = "1.11.0"
 regex = "1"
-rkyv = { version = "0.8.14", features = ["pointer_width_64"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
-tokenizers = { version = "0.22.2", features = ["hf-hub"] }
-tokio = { version = "1", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-rand_distr = "0.5"
-
-[[bench]]
-name = "embedder_throughput"
-harness = false
+criterion = { version = "0.8.2", features = ["html_reports"] }
+rand_distr = "0.6.0"
 
 [profile.dev]
 debug = 0
@@ -47,7 +42,7 @@ lto = "thin"
 panic = "abort"
 
 [lib]
-name = "tributary"
+name = "headwater"
 path = "src/lib.rs"
 
 [[bin]]
@@ -55,5 +50,5 @@ name = "preprocess"
 path = "src/bin/preprocess.rs"
 
 [[bin]]
-name = "train"
-path = "src/bin/train.rs"
+name = "inspect"
+path = "src/bin/inspect.rs"
