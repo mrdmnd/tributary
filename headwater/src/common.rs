@@ -93,6 +93,13 @@ pub struct TableMetadata {
     pub col_range: (ColumnIdx, ColumnIdx), // The range of global column indices for the table [start, end)
     pub row_range: (RowIdx, RowIdx), // The range of global row indices for the table [start, end)
     pub pkey_col: Option<ColumnIdx>, // The primary key column index for the table, if it has one.
+
+    /// The global column index of this table's temporal column, if it has one.
+    /// Used by the BFS sampler for temporal filtering: rows in tables with a
+    /// `temporal_col` are only included when their temporal value <= the seed's
+    /// observation time. Tables without a temporal column are always traversable.
+    #[serde(default)]
+    pub temporal_col: Option<ColumnIdx>,
 }
 
 /// Metadata for a single prediction task.
@@ -527,10 +534,7 @@ pub fn write_graph_bin(
     fn write_u32_slice(w: &mut BufWriter<File>, s: &[u32]) -> std::io::Result<()> {
         // SAFETY: u32 has no padding and a well-defined memory layout.
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                s.as_ptr() as *const u8,
-                s.len() * std::mem::size_of::<u32>(),
-            )
+            std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s))
         };
         w.write_all(bytes)
     }
@@ -573,7 +577,7 @@ pub const TS_ZSCORE_EPOCH: usize = 14; // slot 14
 
 /// Number of bytes needed to store `num_bits` packed bits (little-endian bit order).
 pub const fn packed_bit_bytes(num_bits: usize) -> usize {
-    (num_bits + 7) / 8
+    num_bits.div_ceil(8)
 }
 
 /// Check if bit `index` is set in a packed little-endian bitmap.
@@ -633,7 +637,7 @@ impl EmbeddingTable {
         let byte_len = mmap.len();
         let stride = EMBEDDING_DIM * std::mem::size_of::<f16>();
         assert!(
-            byte_len % stride == 0,
+            byte_len.is_multiple_of(stride),
             "{label} embedding file size ({byte_len} bytes) is not a multiple of \
              EMBEDDING_DIM ({EMBEDDING_DIM}) * sizeof(f16) = {stride} bytes",
         );
@@ -958,6 +962,19 @@ impl TableView {
         }
     }
 
+    /// Returns the z-scored epoch microsecond value (element 14 of the 15-dim
+    /// timestamp encoding) for a Timestamp column at the given row.
+    ///
+    /// To recover raw epoch microseconds, use:
+    /// `raw_us = (z * global_ts_std_us + global_ts_mean_us) as i64`
+    ///
+    /// # Panics
+    /// Panics if column `col` is not Timestamp.
+    #[inline]
+    pub fn timestamp_zscore_epoch(&self, col: usize, row: usize) -> f32 {
+        self.timestamp(col, row)[TIMESTAMP_DIM - 1]
+    }
+
     /// Returns the boolean value at (`col`, `row`).
     ///
     /// Caller should check [`is_null`](Self::is_null) first.
@@ -1076,23 +1093,13 @@ pub fn write_table_bin(
     /// Reinterpret a `&[f32]` as raw bytes.
     fn f32_as_bytes(s: &[f32]) -> &[u8] {
         // SAFETY: f32 has no padding, well-defined layout.
-        unsafe {
-            std::slice::from_raw_parts(
-                s.as_ptr() as *const u8,
-                s.len() * std::mem::size_of::<f32>(),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
     }
 
     /// Reinterpret a `&[u32]` as raw bytes.
     fn u32_as_bytes(s: &[u32]) -> &[u8] {
         // SAFETY: u32 has no padding, well-defined layout.
-        unsafe {
-            std::slice::from_raw_parts(
-                s.as_ptr() as *const u8,
-                s.len() * std::mem::size_of::<u32>(),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
     }
 
     for col in columns {
@@ -1347,6 +1354,45 @@ impl TaskView {
             _ => unreachable!("task targets are always nullable typed columns"),
         }
     }
+
+    /// Returns the numerical target value (z-score) at `seed`.
+    #[inline]
+    pub fn target_numerical(&self, seed: usize) -> f32 {
+        match &self.target {
+            ColumnSlice::Numerical { values, .. } => values[seed],
+            _ => panic!("target is not Numerical"),
+        }
+    }
+
+    /// Returns the 15-dim timestamp target encoding at `seed`.
+    #[inline]
+    pub fn target_timestamp(&self, seed: usize) -> &[f32] {
+        match &self.target {
+            ColumnSlice::Timestamp { values, .. } => {
+                let start = seed * TIMESTAMP_DIM;
+                &values[start..start + TIMESTAMP_DIM]
+            }
+            _ => panic!("target is not Timestamp"),
+        }
+    }
+
+    /// Returns the boolean target value at `seed`.
+    #[inline]
+    pub fn target_boolean(&self, seed: usize) -> bool {
+        match &self.target {
+            ColumnSlice::Boolean { bits, .. } => bit_is_set(bits, seed),
+            _ => panic!("target is not Boolean"),
+        }
+    }
+
+    /// Returns the categorical embedding index for the target at `seed`.
+    #[inline]
+    pub fn target_categorical_idx(&self, seed: usize) -> CategoricalEmbeddingIdx {
+        match &self.target {
+            ColumnSlice::Embedded { indices, .. } => CategoricalEmbeddingIdx(indices[seed]),
+            _ => panic!("target is not Categorical (Embedded)"),
+        }
+    }
 }
 
 // ============================================================================
@@ -1402,30 +1448,15 @@ pub fn write_task_bin(
     }
 
     fn u32_as_bytes(s: &[u32]) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                s.as_ptr() as *const u8,
-                s.len() * std::mem::size_of::<u32>(),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
     }
 
     fn i64_as_bytes(s: &[i64]) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                s.as_ptr() as *const u8,
-                s.len() * std::mem::size_of::<i64>(),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
     }
 
     fn f32_as_bytes(s: &[f32]) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                s.as_ptr() as *const u8,
-                s.len() * std::mem::size_of::<f32>(),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
     }
 
     // -- anchor_rows --

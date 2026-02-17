@@ -376,6 +376,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Table-level info
     let mut table_names: Vec<String> = Vec::new();
     let mut table_pkey_col_names: Vec<Option<String>> = Vec::new();
+    let mut table_temporal_col_names: Vec<Option<String>> = Vec::new();
 
     for (table_name, raw_table) in &raw_meta.tables {
         let parquet_path = raw_dir.join(format!("{table_name}.parquet"));
@@ -408,6 +409,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         table_names.push(table_name.clone());
         table_pkey_col_names.push(raw_table.primary_key.clone());
+        table_temporal_col_names.push(raw_table.temporal_column.clone());
 
         for (col_name, raw_col) in &raw_table.columns {
             all_col_names.push(col_name.clone());
@@ -777,7 +779,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut ci = 0usize;
         for lt in loaded_tables.iter() {
             for (col_name, _) in &lt.raw_table.columns {
-                if let ColumnStats::Categorical { categories, cat_emb_start, .. } = &mut all_col_stats[ci] {
+                if let ColumnStats::Categorical {
+                    categories,
+                    cat_emb_start,
+                    ..
+                } = &mut all_col_stats[ci]
+                {
                     // Record the start offset for this column's block in the categorical table.
                     *cat_emb_start = cat_list.len() as u32;
                     for cat_val in categories.iter() {
@@ -1361,11 +1368,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .get(&(table_names[ti].clone(), pk_name.clone()))
                     .copied()
             });
+            let temporal_col = table_temporal_col_names[ti].as_ref().and_then(|tc_name| {
+                col_lookup
+                    .get(&(table_names[ti].clone(), tc_name.clone()))
+                    .copied()
+            });
             TableMetadata {
                 name: table_names[ti].clone(),
                 col_range: table_col_ranges[ti],
                 row_range: table_row_ranges[ti],
                 pkey_col,
+                temporal_col,
             }
         })
         .collect();
@@ -1414,8 +1427,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Write text_embeddings.bin — text value embeddings (per-batch subsets shipped to GPU).
-    let mut text_emb_data: Vec<u8> =
-        Vec::with_capacity(text_embeddings.len() * EMBEDDING_DIM * 2);
+    let mut text_emb_data: Vec<u8> = Vec::with_capacity(text_embeddings.len() * EMBEDDING_DIM * 2);
     for emb in text_embeddings.iter() {
         for &v in emb {
             text_emb_data.extend_from_slice(&f16::to_ne_bytes(v));

@@ -1,0 +1,18 @@
+[project]
+name = "confluence"
+version = "0.1.0"
+description = "Relational transformer model for database learning"
+requires-python = ">=3.13"
+dependencies = [
+    "jax[cuda13]",
+    "flax",
+    "optax",
+    "numpy",
+    "headwater",
+]
+
+[project.scripts]
+train = "confluence.train:main"
+
+[tool.uv.sources]
+headwater = { path = "../headwater", editable = true }

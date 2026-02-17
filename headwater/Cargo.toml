@@ -3,10 +3,15 @@ name = "headwater"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+python = ["pyo3", "numpy"]
+
 [dependencies]
 arrow = { version = "57.3", default-features = true, features = ["ipc"] }
 chrono = "0.4"
 clap = { version = "4.5.57", features = ["derive"] }
+crossbeam = "0.8"
 datafusion = "52.1"
 half = { version = "2", features = ["bytemuck", "serde"] }
 indexmap = { version = "2", features = ["serde"] }
@@ -14,8 +19,10 @@ indicatif = "0.18.3"
 itertools = "0.14.0"
 memmap2 = "0.9.9"
 mimalloc = "0.1.48"
+numpy = { version = "0.28", optional = true }
 parking_lot = "0.12.5"
 parquet = "57.2"
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
 rand = "0.10.0"
 rand_distr = "0.6.0"
 rayon = "1.11.0"
@@ -44,6 +51,7 @@ panic = "abort"
 [lib]
 name = "headwater"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "preprocess"
@@ -52,3 +60,7 @@ path = "src/bin/preprocess.rs"
 [[bin]]
 name = "inspect"
 path = "src/bin/inspect.rs"
+
+[[bin]]
+name = "single_sample"
+path = "src/bin/single_sample.rs"
