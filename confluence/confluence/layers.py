@@ -10,8 +10,6 @@ Implements:
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Optional
-
 from confluence.config import ModelConfig
 
 
@@ -62,9 +60,15 @@ class QKNormedMultiHeadAttention(nn.Module):
         k = k.reshape(b, s, cfg.n_heads, cfg.d_head).transpose(0, 2, 1, 3)
         v = v.reshape(b, s, cfg.n_heads, cfg.d_head).transpose(0, 2, 1, 3)
 
-        # L2 normalize Q and K
-        q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-8)
-        k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-8)
+        # Upcast to float32 for numerically-safe QK normalization and softmax.
+        # The L2 norm gradient at zero vectors overflows in bfloat16.
+        q = q.astype(jnp.float32)
+        k = k.astype(jnp.float32)
+
+        # L2 normalize Q and K. Use jnp.maximum to avoid 0/0 — the standard
+        # jnp.where trick doesn't work because JAX traces both branches.
+        q = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-6)
+        k = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-6)
 
         # Learnable temperature per head, initialized to sqrt(d_head)
         init_tau = float(cfg.d_head ** 0.5)
@@ -81,12 +85,16 @@ class QKNormedMultiHeadAttention(nn.Module):
         # Apply mask
         if mask.ndim == 3:
             mask = mask[:, None, :, :]  # [B, 1, S, S]
-        attn_logits = jnp.where(mask, attn_logits, jnp.finfo(attn_logits.dtype).min)
+        attn_logits = jnp.where(mask, attn_logits, -1e9)
 
         attn_weights = jax.nn.softmax(attn_logits, axis=-1)
 
-        # Weighted sum: [B, H, S, D_head]
-        attn_out = jnp.matmul(attn_weights, v)
+        # Weighted sum: [B, H, S, D_head]  — keep V in its original dtype
+        v_f32 = v.astype(jnp.float32)
+        attn_out = jnp.matmul(attn_weights, v_f32)
+
+        # Cast back to the input dtype
+        attn_out = attn_out.astype(x.dtype)
 
         # Reshape back: [B, S, D]
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(b, s, d)

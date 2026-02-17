@@ -157,8 +157,10 @@ class ValueEncoder(nn.Module):
             col_enc + val_final
         )
 
-        # Zero out padding positions
-        h0 = h0 * (1.0 - is_padding[..., None])
+        # Note: we intentionally do NOT zero out padding positions here.
+        # Attention masks already exclude padding from affecting non-padding
+        # positions, and zeroing creates exact-zero hidden states whose
+        # gradients through L2 norm / RMSNorm produce NaN.
 
         return h0
 
@@ -250,6 +252,14 @@ def build_attention_masks(batch, max_rows):
     outbound_mask = outbound_mask & valid_mask
     inbound_mask = inbound_mask & valid_mask
     column_mask = column_mask & valid_mask
+
+    # Ensure every position can attend to itself so softmax never gets an
+    # all-masked row (which produces NaN gradients).  For padding positions
+    # this is harmless because their hidden states are already zeroed out.
+    diag = jnp.eye(s, dtype=jnp.bool_)[None, :, :]  # [1, S, S]
+    outbound_mask = outbound_mask | diag
+    inbound_mask = inbound_mask | diag
+    column_mask = column_mask | diag
 
     return outbound_mask, inbound_mask, column_mask
 

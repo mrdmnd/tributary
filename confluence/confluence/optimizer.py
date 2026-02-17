@@ -41,12 +41,6 @@ def create_optimizer(config: TrainingConfig):
         config.num_steps,
         config.lr_min_ratio,
     )
-    adamw_schedule = make_schedule(
-        config.adamw_lr_peak,
-        config.warmup_steps,
-        config.num_steps,
-        config.lr_min_ratio,
-    )
 
     return optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
@@ -54,7 +48,6 @@ def create_optimizer(config: TrainingConfig):
             learning_rate=muon_schedule,
             beta=config.muon_beta1,
             ns_steps=config.muon_ns_iters,
-            adam_learning_rate=adamw_schedule,
             adam_b1=config.adamw_beta1,
             adam_b2=config.adamw_beta2,
             adam_weight_decay=config.adamw_weight_decay,

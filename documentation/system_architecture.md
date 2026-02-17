@@ -468,7 +468,49 @@ The val prefetch channel can use a smaller capacity (e.g., 1–2) since validati
 and doesn't need deep pipelining. The Rust producer thread for validation batches runs at lower
 priority, yielding rayon workers to the training producer when both are active.
 
-### 4e. Loss Dispatch
+### 4e. Numerical Stability in Mixed Precision
+
+The model operates in bfloat16 for most computation, with targeted float32 upcasts where
+low-precision gradients would produce NaN or overflow. Three design decisions enforce this:
+
+**1. No explicit padding zeroing in the value encoder.**  
+The original design zeroed padding positions via `h0 = h0 * (1 - is_padding)`. This created
+exact-zero hidden states whose gradients through L2 normalization and RMSNorm produced NaN
+(the gradient of `x / ||x||` at `x = 0` is `I / eps`, which overflows in bf16). Since attention
+masks already exclude padding from affecting non-padding positions, the zeroing was redundant
+and is omitted.
+
+**2. Float32 attention with safe L2 normalization.**  
+QK-normalized attention (Q and K are L2-normalized before the dot product) is particularly
+sensitive to low-precision gradients. The QKV projections use no bias, so padding positions
+produce zero Q/K vectors after projection. The attention layer:
+- Upcasts Q and K to float32 before normalization and softmax.
+- Uses `q / max(||q||, 1e-6)` instead of `q / (||q|| + eps)` for L2 normalization. The
+  `jnp.maximum` form is both more numerically stable and avoids the JAX `jnp.where` gradient
+  trap (JAX traces both branches of `jnp.where`, so guarding with a condition doesn't prevent
+  NaN gradients in the masked branch).
+- Uses `-1e9` instead of `jnp.finfo(dtype).min` as the mask fill value, avoiding extreme
+  softmax inputs that could cause numerical issues in the backward pass.
+- Casts back to the input dtype (bf16) after the softmax-weighted sum.
+
+**3. Diagonal self-attention in all masks.**  
+Every attention mask (outbound, inbound, column) includes the identity diagonal, ensuring
+every position can attend to at least itself. Without this, padding positions whose mask rows
+are all-False produce softmax over all-`-inf` inputs → `0/0 = NaN` in the backward pass.
+The diagonal is harmless for non-padding positions (self-attention is semantically valid) and
+for padding positions (their hidden states don't contribute to the loss).
+
+### 4f. Optimizer
+
+The optimizer uses `optax.contrib.muon`, which automatically partitions parameters: 2D weight
+matrices use Muon (momentum + Newton-Schulz orthogonalization), and everything else (biases,
+norms, embeddings, 1D/3D params) uses AdamW. A single `learning_rate` schedule governs Muon;
+AdamW's hyperparameters (`adam_b1`, `adam_b2`, `adam_weight_decay`) are set separately.
+
+The LR schedule is linear warmup + cosine decay to 10% of peak. Gradient clipping
+(`clip_by_global_norm`) is applied before the optimizer step.
+
+### 4g. Loss Dispatch
 
 Every batch is homogeneous (one `target_stype`). The forward pass computes all decoder heads
 unconditionally, and the loss function selects the right one via masking (no graph breaks):
@@ -481,6 +523,19 @@ batch_loss = jnp.mean(null_loss + (1 - is_null_at_target) * type_loss)
 ```
 
 See `decoder_heads_and_loss.md` for full details.
+
+### 4h. Smoke Test
+
+A self-contained smoke test (`confluence/smoke_test.py`) verifies the full JAX pipeline
+end-to-end without the Rust sampler. It generates synthetic dummy batches with random values,
+initializes a small model (2 layers, d=128), and runs 30 training steps. This exercises:
+- Model initialization and JIT compilation
+- Forward pass through value encoder, attention masks, transformer layers, and decoder heads
+- Loss computation (null loss + type-specific loss with one-hot dispatch)
+- Backward pass (gradient computation)
+- Optimizer step (Muon for 2D matrices, AdamW for the rest)
+
+Run with: `uv run --project confluence python confluence/smoke_test.py`
 
 ---
 
@@ -649,8 +704,9 @@ during normalization and lets XLA fuse the cast with the first operation that co
 | Index tensors (`column_ids`, `*_embed_ids`, `*_perm`) | u16/u32/i32 | Same | Used as integer indices |
 | Mask tensors (`is_null`, `is_target`, `is_padding`) | u8 | u8 | Cast to bool or bf16 as needed |
 
-The model's `encode_values()` function handles all casts at the boundary of the value encoding
-layer, after which everything is bf16 throughout the transformer.
+The model's value encoder handles all casts at the boundary of the value encoding layer, after
+which everything is bf16 throughout the transformer — except for attention QK normalization and
+softmax, which are computed in float32 for numerical stability (see §4e).
 
 ---
 
@@ -674,9 +730,9 @@ layer, after which everything is bf16 throughout the transformer.
 
 ### Training Configuration (Python-side)
 
-See `training_config.md` for optimizer, precision, LR schedule, and regularization settings.
-These are independent of the sampler — the sampler produces batches, and the training loop
-consumes them.
+See `confluence/confluence/config.py` for optimizer, precision, LR schedule, and regularization
+settings. These are independent of the sampler — the sampler produces batches, and the training
+loop consumes them.
 
 ---
 
@@ -685,7 +741,7 @@ consumes them.
 | Scenario | Behavior |
 |----------|----------|
 | Sampler channel drained after `shutdown()` | `next_train_batch()` raises `SamplerShutdown` |
-| BFS finds fewer than S cells | Sequence is padded; `is_padding` marks unused positions |
+| BFS finds fewer than S cells | Sequence is padded; `is_padding` marks unused positions. Padding positions retain non-zero hidden states (no explicit zeroing) to avoid NaN gradients; attention masks exclude them from computation. |
 | Task has zero seeds for this rank's shard | Sampler skips the task; warns via `tracing` |
 | mmap'd file is corrupted or truncated | Rust returns `io::Error` at mmap creation; Python sees an exception |
 | One process crashes mid-training | NCCL allreduce will hang on other ranks; use a watchdog/timeout to detect and abort |
