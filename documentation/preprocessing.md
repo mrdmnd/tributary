@@ -29,7 +29,8 @@ data/
       - ...
     - metadata.json
     - column_embeddings.bin
-    - vocab_embeddings.bin
+    - categorical_embeddings.bin
+    - text_embeddings.bin
     - graph.bin
 
 ## Raw Input Data 
@@ -58,10 +59,17 @@ this helper script (generate_metadata.py) will use an LLM to generate a plausibl
 Use the helper script to auto-generate a starting point from parquet schemas:
 
 ```
-uv run scripts/generate_metadata.py data/raw/<dataset_dir>
+uv run --project scripts scripts/generate_metadata.py data/raw/<dataset_dir>
 ```
 
 This uses an LLM agent to introspect the parquet files and produce an initial annotation.
+The script writes `metadata.json` into the given data directory; you'll need to move it to the
+expected location afterwards:
+
+```
+mv data/raw/<dataset_dir>/metadata.json data/metadata/<dataset_dir>.json
+```
+
 The human annotator then reviews and corrects the output.
 
 This metadata is source-controlled.
@@ -144,7 +152,7 @@ details, and guidance on assigning types.
 ## Tasks
 
 Prediction tasks are defined as SQL queries executed against the parquet files.
-Each task specifies what to predict and which table anchors the GNN subgraph sampling.
+Each task specifies what to predict and which table anchors the subgraph sampling.
 
 See [task_framework.md](task_framework.md) for the conceptual overview of tasks,
 the task spectrum (cell masking → derived predictions), temporal correctness,
@@ -167,7 +175,7 @@ The key in the `tasks` map is the unique human-readable task name. The value is:
 | Field                      | Type   | Required | Description                                                         |
 |----------------------------|--------|----------|---------------------------------------------------------------------|
 | `query`                    | string | yes      | SQL query (DataFusion-compatible) against the parquet files. Must return at least `anchor_key` and `target_column`. |
-| `anchor_table`             | string | yes      | Table that the GNN roots its subgraph sampling on.                  |
+| `anchor_table`             | string | yes      | Table that roots the subgraph sampling on.                          |
 | `anchor_key`               | string | yes      | Column in query results that joins back to anchor_table rows.       |
 | `target_column`            | string | yes      | Column in query results that the model predicts.                    |
 | `target_stype`             | string | yes      | Semantic type of the target. One of: `numerical`, `categorical`, `boolean`, `timestamp`. |
@@ -276,7 +284,7 @@ like nullability and data types are read from the parquet files themselves.
                 },
                 "anchor_table": {
                     "type": "string",
-                    "description": "Table that the GNN roots its subgraph sampling on."
+                    "description": "Table that roots the subgraph sampling on."
                 },
                 "anchor_key": {
                     "type": "string",

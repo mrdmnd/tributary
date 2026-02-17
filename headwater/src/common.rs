@@ -50,10 +50,17 @@ pub struct RowIdx(pub u32);
 #[serde(transparent)]
 pub struct TaskIdx(pub u32);
 
-/// Index into the interned vocabulary embedding table.
+/// Index into the categorical embedding table (`categorical_embeddings.bin`).
+/// Each categorical column's categories occupy a contiguous block in this table,
+/// starting at the offset stored in `ColumnStats::Categorical::cat_emb_start`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct EmbeddingIdx(pub u32);
+pub struct CategoricalEmbeddingIdx(pub u32);
+
+/// Index into the text embedding table (`text_embeddings.bin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TextEmbeddingIdx(pub u32);
 
 // ============================================================================
 // Metadata / Schema Objects
@@ -167,6 +174,10 @@ pub enum ColumnStats {
     Categorical {
         num_nulls: u64,
         categories: Vec<String>,
+        /// Starting index of this column's category embeddings in the
+        /// categorical embedding table. Category `i` (in the sorted
+        /// `categories` list) maps to `CategoricalEmbeddingIdx(cat_emb_start + i)`.
+        cat_emb_start: u32,
     },
 
     /// Text: null count
@@ -586,21 +597,18 @@ const fn align_up(offset: usize, alignment: usize) -> usize {
 const TABLE_ALIGNMENT: usize = 8;
 
 // ============================================================================
-// Vocab Embedding Table
+// Embedding Tables (zero-copy mmap'd)
 // ============================================================================
 
-/// Interned vocabulary embedding table backed by a memory-mapped flat binary file.
+/// Memory-mapped flat binary embedding table.
 ///
-/// Contains embeddings for categorical and text cell **values** only.
-/// Column-name embeddings are stored separately in [`ColumnMetadata::embedding`].
+/// Backed by a `[num_embeddings, EMBEDDING_DIM]` array of `f16` values
+/// (native byte order). The mmap is read-only and shared across processes.
 ///
-/// The file (`vocab_embeddings.bin`) contains a packed `[num_embeddings, EMBEDDING_DIM]`
-/// array of `f16` values (native byte order). The mmap is read-only and shared
-/// across processes.
-///
-/// Indices stored in [`ColumnSlice::Embedded`] point directly into this table
-/// (0-based, no offset).
-pub struct VocabEmbeddingTable {
+/// Used for both categorical and text value embeddings (stored in separate
+/// files). Column-name embeddings are stored separately in
+/// [`ColumnMetadata::embedding`].
+pub struct EmbeddingTable {
     /// Keeps the memory map alive for the lifetime of the table.
     _mmap: Arc<Mmap>,
     /// View into the mmap as a flat f16 slice.
@@ -613,20 +621,20 @@ pub struct VocabEmbeddingTable {
     num_embeddings: usize,
 }
 
-impl VocabEmbeddingTable {
-    /// Create a [`VocabEmbeddingTable`] from a memory-mapped flat binary file.
+impl EmbeddingTable {
+    /// Create an [`EmbeddingTable`] from a memory-mapped flat binary file.
     ///
     /// The file must contain `num_embeddings * EMBEDDING_DIM` packed `f16` values
     /// (i.e., its byte length must be a multiple of `EMBEDDING_DIM * 2`).
     ///
     /// # Panics
     /// Panics if the file size is not a multiple of `EMBEDDING_DIM * sizeof(f16)`.
-    pub fn from_mmap(mmap: Arc<Mmap>) -> Self {
+    pub fn from_mmap(mmap: Arc<Mmap>, label: &str) -> Self {
         let byte_len = mmap.len();
         let stride = EMBEDDING_DIM * std::mem::size_of::<f16>();
         assert!(
             byte_len % stride == 0,
-            "vocab embedding file size ({byte_len} bytes) is not a multiple of \
+            "{label} embedding file size ({byte_len} bytes) is not a multiple of \
              EMBEDDING_DIM ({EMBEDDING_DIM}) * sizeof(f16) = {stride} bytes",
         );
         let num_embeddings = byte_len / stride;
@@ -649,22 +657,22 @@ impl VocabEmbeddingTable {
         }
     }
 
-    /// Number of distinct vocabulary embeddings in the table.
+    /// Number of distinct embeddings in the table.
     pub fn num_embeddings(&self) -> usize {
         self.num_embeddings
     }
 
-    /// Look up a vocabulary embedding vector by index.
+    /// Look up an embedding vector by raw `u32` index.
     ///
     /// Returns a slice of [`EMBEDDING_DIM`] `f16` values.
     ///
     /// # Panics
     /// Panics if `idx` is out of bounds.
-    pub fn get(&self, idx: EmbeddingIdx) -> &[f16] {
-        let i = idx.0 as usize;
+    pub fn get(&self, idx: u32) -> &[f16] {
+        let i = idx as usize;
         assert!(
             i < self.num_embeddings,
-            "EmbeddingIdx {i} out of bounds (num_vocab_embeddings = {})",
+            "embedding index {i} out of bounds (num_embeddings = {})",
             self.num_embeddings,
         );
         let start = i * EMBEDDING_DIM;
@@ -690,8 +698,8 @@ impl VocabEmbeddingTable {
 /// | Numerical     | validity bitmap + `[f32]`          | z-scored value, null = DB NULL   |
 /// | Timestamp     | validity bitmap + `[f32; 15/row]`  | cyclic + z-epoch, null = DB NULL |
 /// | Boolean       | validity bitmap + packed bits      | true/false, null = DB NULL       |
-/// | Categorical   | validity bitmap + `[u32]`          | EmbeddingIdx, null = DB NULL     |
-/// | Text          | validity bitmap + `[u32]`          | EmbeddingIdx, null = DB NULL     |
+/// | Categorical   | validity bitmap + `[u32]`          | CategoricalEmbeddingIdx, null = DB NULL |
+/// | Text          | validity bitmap + `[u32]`          | TextEmbeddingIdx, null = DB NULL |
 /// | Ignored   | nothing stored                     | column is skipped entirely       |
 pub enum ColumnSlice {
     /// Identifier: packed bits, non-nullable.
@@ -718,7 +726,9 @@ pub enum ColumnSlice {
         bits: &'static [u8],
     },
 
-    /// Categorical or Text: `u32` indices into [`VocabEmbeddingTable`], with validity bitmap.
+    /// Categorical or Text: `u32` indices into the corresponding embedding table, with validity bitmap.
+    /// For Categorical columns, indices are [`CategoricalEmbeddingIdx`] into `categorical_embeddings.bin`.
+    /// For Text columns, indices are [`TextEmbeddingIdx`] into `text_embeddings.bin`.
     Embedded {
         validity: &'static [u8],
         indices: &'static [u32],
@@ -962,17 +972,31 @@ impl TableView {
         }
     }
 
-    /// Returns the [`EmbeddingIdx`] for a Categorical or Text column at the given row.
+    /// Returns the [`CategoricalEmbeddingIdx`] for a Categorical column at the given row.
     ///
     /// Caller should check [`is_null`](Self::is_null) first.
     ///
     /// # Panics
     /// Panics if column `col` is not Categorical/Text (Embedded).
     #[inline]
-    pub fn embedding_idx(&self, col: usize, row: usize) -> EmbeddingIdx {
+    pub fn categorical_embedding_idx(&self, col: usize, row: usize) -> CategoricalEmbeddingIdx {
         match &self.columns[col] {
-            ColumnSlice::Embedded { indices, .. } => EmbeddingIdx(indices[row]),
-            _ => panic!("column {col} is not Categorical/Text"),
+            ColumnSlice::Embedded { indices, .. } => CategoricalEmbeddingIdx(indices[row]),
+            _ => panic!("column {col} is not Categorical (Embedded)"),
+        }
+    }
+
+    /// Returns the [`TextEmbeddingIdx`] for a Text column at the given row.
+    ///
+    /// Caller should check [`is_null`](Self::is_null) first.
+    ///
+    /// # Panics
+    /// Panics if column `col` is not Categorical/Text (Embedded).
+    #[inline]
+    pub fn text_embedding_idx(&self, col: usize, row: usize) -> TextEmbeddingIdx {
+        match &self.columns[col] {
+            ColumnSlice::Embedded { indices, .. } => TextEmbeddingIdx(indices[row]),
+            _ => panic!("column {col} is not Text (Embedded)"),
         }
     }
 }
@@ -1001,7 +1025,7 @@ pub enum ColumnWriter<'a> {
     },
     /// Boolean: validity bitmap + packed value bits.
     Boolean { validity: &'a [u8], bits: &'a [u8] },
-    /// Categorical or Text: validity bitmap + u32 indices into [`VocabEmbeddingTable`].
+    /// Categorical or Text: validity bitmap + u32 indices into the corresponding embedding table.
     Embedded {
         validity: &'a [u8],
         indices: &'a [u32],
@@ -1129,7 +1153,7 @@ pub fn write_table_bin(
 /// ## File layout
 ///
 /// ```text
-/// Header (4 bytes, 8-byte aligned):
+/// Header (8 bytes, 8-byte aligned):
 ///   num_seeds : u32     — number of (anchor_row, observation_time, target) triples
 ///   _reserved : u32     — reserved (must be 0)
 ///
@@ -1139,7 +1163,7 @@ pub fn write_table_bin(
 ///   target validity   : packed bits [ceil(num_seeds/8)]   — 1 = valid, 0 = null
 ///   target values     : type-dependent:
 ///     Numerical   → [f32; num_seeds]                      — z-scored values
-///     Categorical → [u32; num_seeds]                      — EmbeddingIdx
+///     Categorical → [u32; num_seeds]                      — CategoricalEmbeddingIdx
 ///     Boolean     → packed bits [ceil(num_seeds/8)]       — true/false
 ///     Timestamp   → [f32; num_seeds × TIMESTAMP_DIM]      — cyclic + z-epoch
 /// ```
@@ -1459,11 +1483,16 @@ pub fn write_task_bin(
 /// - **graph** — bidirectional CSR topology (flat binary, mmap'd zero-copy via [`GraphView`])
 /// - **tables** — preprocessed column data (flat binary, mmap'd zero-copy via [`TableView`])
 /// - **tasks** — materialized prediction tasks (flat binary, mmap'd zero-copy via [`TaskView`])
-/// - **vocab_embeddings** — interned text embeddings for categorical/text values (flat binary, mmap'd via [`VocabEmbeddingTable`])
+/// - **categorical_embeddings** — frozen embeddings for all categorical values (flat binary, mmap'd via [`EmbeddingTable`]; GPU-resident at training time)
+/// - **text_embeddings** — frozen embeddings for text values (flat binary, mmap'd via [`EmbeddingTable`]; subsets shipped per batch)
 ///
 /// Column-name embeddings are loaded from `column_embeddings.bin` and populated
 /// into [`ColumnMetadata::embedding`] at load time, so they can be uploaded to
 /// GPU shared memory once at training start.
+///
+/// Categorical embeddings are small enough (low cardinality) to keep GPU-resident
+/// permanently, just like column-name embeddings. Text embeddings are high-cardinality
+/// and shipped per-batch as needed.
 ///
 /// The preprocessed database directory layout:
 ///
@@ -1471,7 +1500,8 @@ pub fn write_task_bin(
 /// db_out/
 ///   metadata.json              — DatabaseMetadata (JSON, schema + stats + tasks)
 ///   column_embeddings.bin      — flat [C, EMBEDDING_DIM] f16 array (one per column)
-///   vocab_embeddings.bin       — flat [V, EMBEDDING_DIM] f16 array (categorical/text value embeddings)
+///   categorical_embeddings.bin — flat [Vc, EMBEDDING_DIM] f16 array (all categorical value embeddings)
+///   text_embeddings.bin        — flat [Vt, EMBEDDING_DIM] f16 array (all text value embeddings)
 ///   graph.bin                  — bidirectional CSR (flat binary, see GraphView)
 ///   tables/
 ///     badges.bin               — flat binary column store (see TableView)
@@ -1498,11 +1528,15 @@ pub struct Database {
     /// Each view is backed by a mmap'd `<task_name>.bin` file.
     pub tasks: Vec<TaskView>,
 
-    /// Interned vocabulary embeddings for categorical and text cell values.
-    /// Indexed by [`EmbeddingIdx`] stored in Embedded columns of `tables`.
-    /// Column-name embeddings are **not** in this table — they live in
-    /// [`ColumnMetadata::embedding`].
-    pub vocab_embeddings: VocabEmbeddingTable,
+    /// Frozen embeddings for all categorical values across all columns.
+    /// Indexed by [`CategoricalEmbeddingIdx`] stored in Embedded columns.
+    /// Small enough (low cardinality) to keep GPU-resident permanently.
+    pub categorical_embeddings: EmbeddingTable,
+
+    /// Frozen embeddings for text cell values.
+    /// Indexed by [`TextEmbeddingIdx`] stored in Embedded columns.
+    /// High-cardinality; subsets are shipped per batch.
+    pub text_embeddings: EmbeddingTable,
 
     /// Sorted table row-range starts for O(log T) row-to-table lookup.
     /// One entry per table: `row_starts[i] = table_metadata[i].row_range.0`.
@@ -1599,18 +1633,25 @@ impl Database {
             tasks.push(TaskView::from_mmap(mmap, target_stype));
         }
 
-        // -- Vocab embeddings (flat binary, mmap'd) ---------------------------
-        let vocab_path = dir.join("vocab_embeddings.bin");
-        let vocab_file = File::open(&vocab_path)?;
-        let vocab_mmap = Arc::new(unsafe { Mmap::map(&vocab_file)? });
-        let vocab_embeddings = VocabEmbeddingTable::from_mmap(vocab_mmap);
+        // -- Categorical embeddings (flat binary, mmap'd, GPU-resident) --------
+        let cat_emb_path = dir.join("categorical_embeddings.bin");
+        let cat_emb_file = File::open(&cat_emb_path)?;
+        let cat_emb_mmap = Arc::new(unsafe { Mmap::map(&cat_emb_file)? });
+        let categorical_embeddings = EmbeddingTable::from_mmap(cat_emb_mmap, "categorical");
+
+        // -- Text embeddings (flat binary, mmap'd, per-batch subsets) ---------
+        let text_emb_path = dir.join("text_embeddings.bin");
+        let text_emb_file = File::open(&text_emb_path)?;
+        let text_emb_mmap = Arc::new(unsafe { Mmap::map(&text_emb_file)? });
+        let text_embeddings = EmbeddingTable::from_mmap(text_emb_mmap, "text");
 
         Ok(Self {
             metadata,
             graph,
             tables,
             tasks,
-            vocab_embeddings,
+            categorical_embeddings,
+            text_embeddings,
             row_starts,
             col_starts,
         })
@@ -1647,11 +1688,18 @@ impl Database {
         &self.tables[idx.0 as usize]
     }
 
-    /// Look up a vocabulary embedding (categorical / text value) by index.
+    /// Look up a categorical value embedding by index.
     ///
     /// Returns a slice of [`EMBEDDING_DIM`] `f16` values.
-    pub fn vocab_embedding(&self, idx: EmbeddingIdx) -> &[f16] {
-        self.vocab_embeddings.get(idx)
+    pub fn categorical_embedding(&self, idx: CategoricalEmbeddingIdx) -> &[f16] {
+        self.categorical_embeddings.get(idx.0)
+    }
+
+    /// Look up a text value embedding by index.
+    ///
+    /// Returns a slice of [`EMBEDDING_DIM`] `f16` values.
+    pub fn text_embedding(&self, idx: TextEmbeddingIdx) -> &[f16] {
+        self.text_embeddings.get(idx.0)
     }
 
     /// Look up the column-name embedding for a given column.

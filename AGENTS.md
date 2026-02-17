@@ -2,7 +2,7 @@
 
 This repository contains code designed to build a "relational transformer" machine learning model.
 
-There are two main pieces. One is written in rust, and the other is written in python.
+There are two planned pieces. One is written in rust, and the other will be written in python.
 
 You can see lots of documentation in the `documentation` directory - read pieces of it as needed.
 
@@ -15,21 +15,21 @@ Headwater is a rust library with two responsibilities:
 1) preprocessing databases into graphs + materializing tasks
 
 The preprocessor converts collections of parquet files plus a metadata JSON file describing database semantics into a
-custom processed binary format for our samplers to load.
+custom processed binary format for our samplers to load. **This is implemented.**
 
-2) sampling from processed databases into batches
+2) sampling from processed databases into batches (NOT YET IMPLEMENTED)
 
-The sampler runs in a single rust process. It is responsible for producing sequences of training cells from our 
-pre-processed graphs. The sampler both *constructs the sequences* as well as *packs the batches* for downstream use.
-The sampler is callable from python code via PyO3.
+The sampler will run in a single rust process. It will be responsible for producing sequences of training cells from our 
+pre-processed graphs. The sampler will both *construct the sequences* as well as *pack the batches* for downstream use.
+The sampler will be callable from python code via PyO3.
 
 
-### Python (`confluence`)
+### Python (`confluence`) — NOT YET IMPLEMENTED
 
-Confluence (the model) is a JAX python project.
-We define a custom relational transformer model, and use the sampler from `headwater` to feed batches in.
+Confluence (the model) will be a JAX python project.
+We will define a custom relational transformer model, and use the sampler from `headwater` to feed batches in.
 
-Confluence is intended to be run in a DistributedDataParallel way - mutiple GPU nodes per host.
+Confluence is intended to be run in a DistributedDataParallel way - multiple GPU nodes per host.
 
 ## Development
 
@@ -57,7 +57,11 @@ Avoid anti-patterns like `unwrap`.
 
 Use tokio-rs `tracing` for logging instead or print statements.
 
-### Python (`confluence`)
+### Python (`confluence`) — NOT YET IMPLEMENTED
 
-This project uses `uv` for package management. All dependencies should be listed in `pyproject.toml`.
-If you want to do ANY one-off python tasks, you can use `uv run <script>`.
+When this project is started, it will use `uv` for package management with dependencies listed in `pyproject.toml`.
+
+### Python (`scripts`)
+
+Helper scripts live in the `scripts/` directory with their own `pyproject.toml`.
+If you want to do ANY one-off python tasks, you can use `uv run --project scripts <script>`.

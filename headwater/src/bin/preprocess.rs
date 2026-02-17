@@ -10,12 +10,13 @@
 //! ## Output
 //!
 //! Written to `processed/<dataset>/` under the data directory:
-//! - `metadata.json`             — serialized `DatabaseMetadata` (JSON, schema + stats + tasks)
-//! - `column_embeddings.bin`     — flat `[C, EMBEDDING_DIM]` f16 array (one per global column)
-//! - `vocab_embeddings.bin`      — flat `[V, EMBEDDING_DIM]` f16 array (categorical/text value embeddings)
-//! - `graph.bin`                 — bidirectional CSR graph (FK edges)
-//! - `tables/<table_name>.bin`   — packed column store per table
-//! - `tasks/<task_name>.bin`     — materialized prediction task per task
+//! - `metadata.json`              — serialized `DatabaseMetadata` (JSON, schema + stats + tasks)
+//! - `column_embeddings.bin`      — flat `[C, EMBEDDING_DIM]` f16 array (one per global column)
+//! - `categorical_embeddings.bin` — flat `[Vc, EMBEDDING_DIM]` f16 array (all categorical value embeddings)
+//! - `text_embeddings.bin`        — flat `[Vt, EMBEDDING_DIM]` f16 array (all text value embeddings)
+//! - `graph.bin`                  — bidirectional CSR graph (FK edges)
+//! - `tables/<table_name>.bin`    — packed column store per table
+//! - `tasks/<task_name>.bin`      — materialized prediction task per task
 //!
 //! ## Usage
 //!
@@ -654,14 +655,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let mut categories: Vec<String> = cats.into_iter().collect();
                         categories.sort();
+                        // cat_emb_start is populated later during vocab collection (step 4b).
                         ColumnStats::Categorical {
                             num_nulls,
                             categories,
+                            cat_emb_start: 0,
                         }
                     } else {
                         ColumnStats::Categorical {
                             num_nulls: 0,
                             categories: Vec::new(),
+                            cat_emb_start: 0,
                         }
                     }
                 }
@@ -732,34 +736,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reduces padding waste in GPU batches.
     let max_chars: usize = 512 * 4; // ≈ 512 tokens
 
-    // Vocabulary: ordered list of unique strings to embed.
+    // Vocabulary: ordered lists of unique strings to embed.
     // col_name_strings: one per global column — these become ColumnMetadata.embedding
     let mut col_name_strings: Vec<String> = Vec::with_capacity(total_cols);
 
-    // Shared embedding vocab: maps string -> EmbeddingIdx.
-    // Vocab indices are 0-based (column-name embeddings are stored separately
-    // in ColumnMetadata, not in the vocab embedding table).
-    let mut vocab_map: HashMap<String, EmbeddingIdx> = HashMap::new();
-    let mut vocab_list: Vec<String> = Vec::new();
+    // Categorical embedding vocab: maps formatted string -> CategoricalEmbeddingIdx.
+    // Indices are 0-based into categorical_embeddings.bin.
+    // Each column's categories form a contiguous block; cat_emb_start is recorded per column.
+    let mut cat_map: HashMap<String, CategoricalEmbeddingIdx> = HashMap::new();
+    let mut cat_list: Vec<String> = Vec::new();
 
-    let insert_vocab = |s: String,
-                        map: &mut HashMap<String, EmbeddingIdx>,
-                        list: &mut Vec<String>,
-                        limit: usize|
-     -> EmbeddingIdx {
-        let s = if s.len() > limit {
+    // Text embedding vocab: maps raw string -> TextEmbeddingIdx.
+    // Indices are 0-based into text_embeddings.bin.
+    let mut text_map: HashMap<String, TextEmbeddingIdx> = HashMap::new();
+    let mut text_list: Vec<String> = Vec::new();
+
+    let truncate_string = |s: String, limit: usize| -> String {
+        if s.len() > limit {
             let end = s.floor_char_boundary(limit);
             s[..end].to_string()
         } else {
             s
-        };
-        if let Some(&idx) = map.get(&s) {
-            idx
-        } else {
-            let idx = EmbeddingIdx(list.len() as u32);
-            map.insert(s.clone(), idx);
-            list.push(s);
-            idx
         }
     };
 
@@ -775,15 +772,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 4b) Categorical value embeddings
+    // 4b) Categorical value embeddings — each column's categories get a contiguous block
     {
         let mut ci = 0usize;
         for lt in loaded_tables.iter() {
             for (col_name, _) in &lt.raw_table.columns {
-                if let ColumnStats::Categorical { categories, .. } = &all_col_stats[ci] {
-                    for cat_val in categories {
-                        let s = format!("{col_name} is {cat_val}");
-                        insert_vocab(s, &mut vocab_map, &mut vocab_list, max_chars);
+                if let ColumnStats::Categorical { categories, cat_emb_start, .. } = &mut all_col_stats[ci] {
+                    // Record the start offset for this column's block in the categorical table.
+                    *cat_emb_start = cat_list.len() as u32;
+                    for cat_val in categories.iter() {
+                        let s = truncate_string(format!("{col_name} is {cat_val}"), max_chars);
+                        if !cat_map.contains_key(&s) {
+                            let idx = CategoricalEmbeddingIdx(cat_list.len() as u32);
+                            cat_map.insert(s.clone(), idx);
+                            cat_list.push(s);
+                        }
                     }
                 }
                 ci += 1;
@@ -806,7 +809,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let strings = array_to_strings(arr.as_ref());
                         for s in strings {
                             if let Some(v) = s {
-                                insert_vocab(v, &mut vocab_map, &mut vocab_list, max_chars);
+                                let v = truncate_string(v, max_chars);
+                                if !text_map.contains_key(&v) {
+                                    let idx = TextEmbeddingIdx(text_list.len() as u32);
+                                    text_map.insert(v.clone(), idx);
+                                    text_list.push(v);
+                                }
                             }
                         }
                     }
@@ -817,9 +825,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!(
-        "  Column name strings: {}, Shared vocab size: {}",
+        "  Column name strings: {}, Categorical vocab: {}, Text vocab: {}",
         col_name_strings.len(),
-        vocab_list.len()
+        cat_list.len(),
+        text_list.len()
     );
 
     // ── Embedding via API ─────────────────────────────────────────────────
@@ -829,12 +838,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
 
-    // Combine column name strings + vocab list for a single embedding pass.
-    // Column name embeddings are at indices [0, col_name_strings.len())
-    // Vocab embeddings are at indices [col_name_strings.len(), col_name_strings.len() + vocab_list.len())
+    // Combine all strings for a single embedding API pass.
+    // Layout: [column names | categorical values | text values]
     let all_strings_to_embed: Vec<String> = col_name_strings
         .iter()
-        .chain(vocab_list.iter())
+        .chain(cat_list.iter())
+        .chain(text_list.iter())
         .cloned()
         .collect();
 
@@ -937,15 +946,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result
     };
 
-    // Split results: column-name embeddings go into column_embeddings.bin,
-    // vocab embeddings go into vocab_embeddings.bin.
-    let column_embeddings: &[Vec<f16>] = &all_embeddings[..col_name_strings.len()];
-    let vocab_embeddings: &[Vec<f16>] = &all_embeddings[col_name_strings.len()..];
+    // Split results: column-name | categorical | text.
+    let col_count = col_name_strings.len();
+    let cat_count = cat_list.len();
+    let column_embeddings: &[Vec<f16>] = &all_embeddings[..col_count];
+    let categorical_embeddings: &[Vec<f16>] = &all_embeddings[col_count..col_count + cat_count];
+    let text_embeddings: &[Vec<f16>] = &all_embeddings[col_count + cat_count..];
 
     info!(
-        "  Got {} column embeddings (→ column_embeddings.bin), {} vocab embeddings (→ vocab_embeddings.bin)",
+        "  Got {} column embeddings, {} categorical embeddings, {} text embeddings",
         column_embeddings.len(),
-        vocab_embeddings.len()
+        categorical_embeddings.len(),
+        text_embeddings.len()
     );
 
     // ── Step 5: Encode tables and write table_XXXX.bin ───────────────────
@@ -979,7 +991,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 arrow_col.map(|a| a.as_ref()),
                 num_rows,
                 col_name,
-                &vocab_map,
+                &cat_map,
+                &text_map,
                 global_ts_mean_us,
                 global_ts_std_us,
             );
@@ -1273,7 +1286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target_arr.as_ref(),
                 &valid_indices,
                 &raw_task.target_column,
-                &vocab_map,
+                &cat_map,
                 global_ts_mean_us,
                 global_ts_std_us,
             );
@@ -1385,19 +1398,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         col_emb_data.len()
     );
 
-    // Write vocab_embeddings.bin — vocab embeddings only (categorical/text values).
-    let mut vocab_emb_data: Vec<u8> =
-        Vec::with_capacity(vocab_embeddings.len() * EMBEDDING_DIM * 2);
-    for emb in vocab_embeddings.iter() {
+    // Write categorical_embeddings.bin — categorical value embeddings (GPU-resident).
+    let mut cat_emb_data: Vec<u8> =
+        Vec::with_capacity(categorical_embeddings.len() * EMBEDDING_DIM * 2);
+    for emb in categorical_embeddings.iter() {
         for &v in emb {
-            vocab_emb_data.extend_from_slice(&f16::to_ne_bytes(v));
+            cat_emb_data.extend_from_slice(&f16::to_ne_bytes(v));
         }
     }
-    fs::write(output_dir.join("vocab_embeddings.bin"), &vocab_emb_data)?;
+    fs::write(output_dir.join("categorical_embeddings.bin"), &cat_emb_data)?;
     info!(
-        "  Wrote vocab_embeddings.bin ({} vocab embeddings, {} bytes)",
-        vocab_embeddings.len(),
-        vocab_emb_data.len()
+        "  Wrote categorical_embeddings.bin ({} categorical embeddings, {} bytes)",
+        categorical_embeddings.len(),
+        cat_emb_data.len()
+    );
+
+    // Write text_embeddings.bin — text value embeddings (per-batch subsets shipped to GPU).
+    let mut text_emb_data: Vec<u8> =
+        Vec::with_capacity(text_embeddings.len() * EMBEDDING_DIM * 2);
+    for emb in text_embeddings.iter() {
+        for &v in emb {
+            text_emb_data.extend_from_slice(&f16::to_ne_bytes(v));
+        }
+    }
+    fs::write(output_dir.join("text_embeddings.bin"), &text_emb_data)?;
+    info!(
+        "  Wrote text_embeddings.bin ({} text embeddings, {} bytes)",
+        text_embeddings.len(),
+        text_emb_data.len()
     );
 
     let elapsed = pipeline_start.elapsed();
@@ -1407,7 +1435,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Tasks: {}", db_metadata.task_metadata.len());
     info!("  Total rows: {}", HumanCount(total_rows as u64));
     info!("  Total columns: {}", total_cols);
-    info!("  Vocab size: {}", HumanCount(vocab_list.len() as u64));
+    info!(
+        "  Categorical vocab: {}, Text vocab: {}",
+        HumanCount(cat_list.len() as u64),
+        HumanCount(text_list.len() as u64)
+    );
 
     Ok(())
 }
@@ -1467,7 +1499,8 @@ fn encode_column(
     arrow_col: Option<&dyn Array>,
     num_rows: usize,
     col_name: &str,
-    vocab_map: &HashMap<String, EmbeddingIdx>,
+    cat_map: &HashMap<String, CategoricalEmbeddingIdx>,
+    text_map: &HashMap<String, TextEmbeddingIdx>,
     global_ts_mean_us: f64,
     global_ts_std_us: f64,
 ) -> ColumnWriterData {
@@ -1574,7 +1607,7 @@ fn encode_column(
                 for i in 0..num_rows {
                     if let Some(ref v) = strings[i] {
                         let key = format!("{col_name} is {v}");
-                        if let Some(&emb_idx) = vocab_map.get(&key) {
+                        if let Some(&emb_idx) = cat_map.get(&key) {
                             indices[i] = emb_idx.0;
                         }
                     }
@@ -1595,7 +1628,7 @@ fn encode_column(
                 let mut indices = vec![0u32; num_rows];
                 for i in 0..num_rows {
                     if let Some(ref v) = strings[i] {
-                        if let Some(&emb_idx) = vocab_map.get(v) {
+                        if let Some(&emb_idx) = text_map.get(v) {
                             indices[i] = emb_idx.0;
                         }
                     }
@@ -1618,7 +1651,7 @@ fn encode_task_target(
     target_arr: &dyn Array,
     valid_indices: &[usize],
     target_col_name: &str,
-    vocab_map: &HashMap<String, EmbeddingIdx>,
+    cat_map: &HashMap<String, CategoricalEmbeddingIdx>,
     global_ts_mean_us: f64,
     global_ts_std_us: f64,
 ) -> (ColumnWriterData, ColumnStats) {
@@ -1829,12 +1862,22 @@ fn encode_task_target(
             let mut categories: Vec<String> = cats_set.into_iter().collect();
             categories.sort();
 
+            // Determine cat_emb_start: look up the first category's index in cat_map.
+            // All categories for this task target should already be in cat_map from the
+            // source column (task targets are subsets of existing column values).
+            let cat_emb_start = if let Some(first_cat) = categories.first() {
+                let key = format!("{target_col_name} is {first_cat}");
+                cat_map.get(&key).map(|idx| idx.0).unwrap_or(0)
+            } else {
+                0
+            };
+
             let validity = build_bitmap_from_fn(n, |idx| strings[valid_indices[idx]].is_some());
             let mut indices = vec![0u32; n];
             for (out_idx, &i) in valid_indices.iter().enumerate() {
                 if let Some(ref v) = strings[i] {
                     let key = format!("{target_col_name} is {v}");
-                    if let Some(&emb_idx) = vocab_map.get(&key) {
+                    if let Some(&emb_idx) = cat_map.get(&key) {
                         indices[out_idx] = emb_idx.0;
                     }
                 }
@@ -1843,6 +1886,7 @@ fn encode_task_target(
             let stats = ColumnStats::Categorical {
                 num_nulls,
                 categories,
+                cat_emb_start,
             };
             (ColumnWriterData::Embedded { validity, indices }, stats)
         }

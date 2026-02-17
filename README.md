@@ -93,13 +93,15 @@ z-score normalized to an f32 based on all timestamp values across all tables in 
 
 Boolean values are encoded as 0 / 1 values, with a validity bitmap (null / present).
 
-Categorical values are encoded as an _index_ into a vocabulary embedding table, for the string
+Categorical values are encoded as an _index_ into a categorical embedding table, for the string
 "column name is X". For example, if the column name is "color", and the value is "red",
-we use a frozen text embedder to embed "color is red", put that embedding into a shared
-vocabulary table (`vocab_embeddings.bin`), and store the index into that table.
+we use a frozen text embedder to embed "color is red", put that embedding into a dedicated
+categorical embedding table (`categorical_embeddings.bin`), and store the index into that table.
+The categorical table is small (low cardinality) and kept GPU-resident at training time.
 
 Text values are similarly encoded — we use the same frozen text embedder for non-identifier
-(semantically meaningful) text values, sharing the same vocabulary table.
+(semantically meaningful) text values, stored in a separate text embedding table
+(`text_embeddings.bin`). Text embeddings are high-cardinality and shipped per-batch.
 
 ## Training
 
@@ -142,10 +144,11 @@ data/
 
 ```
 data/processed/<dataset>/
-  metadata.json             — schema, column stats, task definitions (JSON)
-  column_embeddings.bin     — flat [C, 256] f16 array (one per global column)
-  vocab_embeddings.bin      — flat [V, 256] f16 array (one per distinct categorical/text value)
-  graph.bin                 — bidirectional CSR graph (FK edges)
+  metadata.json              — schema, column stats, task definitions (JSON)
+  column_embeddings.bin      — flat [C, 256] f16 array (one per global column)
+  categorical_embeddings.bin — flat [Vc, 256] f16 array (all categorical value embeddings, GPU-resident)
+  text_embeddings.bin        — flat [Vt, 256] f16 array (all text value embeddings, per-batch subsets)
+  graph.bin                  — bidirectional CSR graph (FK edges)
   tables/
     <table_name>.bin        — packed column store per table
   tasks/

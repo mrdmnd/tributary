@@ -60,9 +60,9 @@ Arrow `timestamp` and `date` types are always assigned this semantic type.
    - Minute of hour (period 60)
    - Hour of day (period 24)
    - Day of week (period 7)
-   - Day of month (period ~30.44)
+   - Day of month (period 31)
    - Month of year (period 12)
-   - Day of year (period ~365.25)
+   - Day of year (period 366)
 2. **1 z-scored epoch value** (float) — the raw epoch microsecond value normalized using *global* timestamp
    statistics (`global_ts_mean_us`, `global_ts_std_us` from `DatabaseMetadata`), so all timestamps across all
    tables in the database are on the same scale.
@@ -94,11 +94,13 @@ with a small number of distinct values are often categorical, not identifiers.
 
 **Encoding:** Each distinct category value is converted to a text string (e.g., `"category is ELECTRONICS"`)
 and embedded with a frozen text embedding model (1024-dim output, MRL-truncated to 256-dim, stored as FP16).
-The embedding is interned into a shared vocabulary; the cell stores a `u32` `EmbeddingIdx` into the
-`VocabEmbeddingTable`.
+The embedding is stored in a dedicated categorical embedding table (`categorical_embeddings.bin`), separate from
+text embeddings. Each column's categories occupy a contiguous block in this table. The cell stores a `u32`
+`CategoricalEmbeddingIdx` into the categorical embedding table.
 
-Statistics (`ColumnStats::Categorical`) store `num_nulls` and the full list of `categories` (distinct string
-values). Cardinality is `categories.len()`.
+Statistics (`ColumnStats::Categorical`) store `num_nulls`, the full list of `categories` (distinct string
+values), and `cat_emb_start` (the starting index of this column's block in the categorical embedding table).
+Cardinality is `categories.len()`.
 
 **Null handling:** A validity bitmap tracks which rows have non-null values. At training time, when the model receives
 a categorical cell, it also receives the validity map so that it can learn signals from the presence/absence of data.
@@ -109,12 +111,13 @@ Multi-token strings where the semantic content is important. Examples: product d
 bodies, bios.
 
 **Encoding:** Each cell value is embedded with the same frozen text embedding model used for categoricals,
-producing a 256-dimensional FP16 vector (MRL-truncated from 1024-dim). Long strings are truncated to
-`MAX_SEQ_LEN * 4` characters (~2048) before tokenization. Like categoricals, text values are interned into the
-shared vocabulary and stored as `u32` `EmbeddingIdx` values.
+producing a 256-dimensional FP16 vector (MRL-truncated from 1024-dim). Long strings are truncated to 2048
+characters before tokenization. Text values are stored in a dedicated text embedding table
+(`text_embeddings.bin`), separate from categorical embeddings. The cell stores a `u32` `TextEmbeddingIdx`
+into the text embedding table.
 
 The difference from categoricals: text values are typically unique per row (high cardinality), while categoricals
-repeat. Both use the same storage format (`ColumnSlice::Embedded`).
+repeat. Both use the same on-disk storage format (`ColumnSlice::Embedded`) but index different embedding tables.
 
 Statistics (`ColumnStats::Text`) track only `num_nulls`.
 
@@ -146,7 +149,7 @@ marking an `int64` column as an `Identifier` or a low-cardinality `string` colum
 
 ## Embedding Layout
 
-The preprocessor produces two separate stores of embeddings:
+The preprocessor produces three separate stores of embeddings:
 
 ### Column-Name Embeddings (in `column_embeddings.bin`)
 
@@ -158,12 +161,25 @@ At load time, these are read into `ColumnMetadata.embedding` (a `Vec<f16>`). At 
 collected into a `[num_columns, EMBEDDING_DIM]` tensor and uploaded to GPU shared memory once at the start
 of the run.
 
-### Vocabulary Embeddings (in `vocab_embeddings.bin`)
+### Categorical Embeddings (in `categorical_embeddings.bin`)
 
-A flat `[V, EMBEDDING_DIM]` array of FP16 vectors, shared across all categorical and text columns.
-Each unique string value gets one embedding, deduplicated globally. Indices are 0-based.
+A flat `[Vc, EMBEDDING_DIM]` array of FP16 vectors containing all categorical value embeddings. Each
+column's categories occupy a contiguous block, starting at the offset stored in
+`ColumnStats::Categorical::cat_emb_start`. Indices are 0-based.
 
-At training time, `EmbeddingIdx` values in `Categorical` and `Text` columns index directly into this table.
+Because categorical columns are low-cardinality, the total table is small (typically a few thousand entries,
+well under 20 MB). At training time, the entire table is uploaded to GPU shared memory once — like column-name
+embeddings — and kept resident for the duration of the run. `CategoricalEmbeddingIdx` values in Categorical
+columns index directly into this table with no per-batch remapping.
+
+### Text Embeddings (in `text_embeddings.bin`)
+
+A flat `[Vt, EMBEDDING_DIM]` array of FP16 vectors containing all text value embeddings. Each unique text
+string value gets one embedding, deduplicated globally. Indices are 0-based.
+
+Text embeddings are high-cardinality (often unique per row) and too large to keep GPU-resident. At training
+time, the sampler ships a per-batch subset to the GPU. `TextEmbeddingIdx` values in Text columns are remapped
+to batch-local indices during batch construction.
 
 ## Usage in Tasks
 

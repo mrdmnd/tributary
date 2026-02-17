@@ -11,8 +11,20 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use half::f16;
 use headwater::common::*;
 use headwater::embedder::EMBEDDING_DIM;
+
+/// Compute the L2 norm of an embedding slice.
+fn embedding_l2_norm(emb: &[f16]) -> f32 {
+    emb.iter()
+        .map(|v| {
+            let f = v.to_f32();
+            f * f
+        })
+        .sum::<f32>()
+        .sqrt()
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Inspect a preprocessed database")]
@@ -67,10 +79,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         db.graph.num_nodes(),
         db.graph.num_edges()
     );
-    let num_vocab = db.vocab_embeddings.num_embeddings();
+    let num_cat_emb = db.categorical_embeddings.num_embeddings();
+    let num_text_emb = db.text_embeddings.num_embeddings();
     println!(
-        "║  Embeddings: {:>10} column (in metadata), {:>10} vocab (in vocab_embeddings.bin), {:>3} dim (f16)",
-        num_cols, num_vocab, EMBEDDING_DIM
+        "║  Embeddings: {:>10} column, {:>10} categorical, {:>10} text, {:>3} dim (f16)",
+        num_cols, num_cat_emb, num_text_emb, EMBEDDING_DIM
     );
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
@@ -376,20 +389,30 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("└──────────────────────────────────────────────────────────────");
     println!();
 
-    // ── Vocab Embedding Table ─────────────────────────────────────────
-    println!("┌─ Vocab Embedding Table (vocab_embeddings.bin, f16)");
-    println!("│  Count: {}  Dim: {}", num_vocab, EMBEDDING_DIM);
-    if num_vocab > 0 {
-        let show = num_vocab.min(5);
+    // ── Categorical Embedding Table ─────────────────────────────────────
+    println!("┌─ Categorical Embedding Table (categorical_embeddings.bin, f16)");
+    println!("│  Count: {}  Dim: {}", num_cat_emb, EMBEDDING_DIM);
+    if num_cat_emb > 0 {
+        let show = num_cat_emb.min(5);
         println!("│  Sample L2 norms:");
         for i in 0..show {
-            let emb = db.vocab_embeddings.get(EmbeddingIdx(i as u32));
-            let norm: f32 = emb
-                .iter()
-                .map(|v| v.to_f32())
-                .map(|v| v * v)
-                .sum::<f32>()
-                .sqrt();
+            let emb = db.categorical_embeddings.get(i as u32);
+            let norm = embedding_l2_norm(emb);
+            println!("│    [{i}] L2 norm = {norm:.4}");
+        }
+    }
+    println!("└──────────────────────────────────────────────────────────────");
+    println!();
+
+    // ── Text Embedding Table ─────────────────────────────────────────
+    println!("┌─ Text Embedding Table (text_embeddings.bin, f16)");
+    println!("│  Count: {}  Dim: {}", num_text_emb, EMBEDDING_DIM);
+    if num_text_emb > 0 {
+        let show = num_text_emb.min(5);
+        println!("│  Sample L2 norms:");
+        for i in 0..show {
+            let emb = db.text_embeddings.get(i as u32);
+            let norm = embedding_l2_norm(emb);
             println!("│    [{i}] L2 norm = {norm:.4}");
         }
     }
@@ -452,6 +475,7 @@ fn print_stats(stats: &ColumnStats, prefix: &str) {
         ColumnStats::Categorical {
             num_nulls,
             categories,
+            cat_emb_start,
         } => {
             let n = categories.len();
             let preview: Vec<&str> = categories.iter().take(10).map(|s| s.as_str()).collect();
@@ -461,7 +485,7 @@ fn print_stats(stats: &ColumnStats, prefix: &str) {
                 String::new()
             };
             println!(
-                "{prefix}nulls: {num_nulls}  cardinality: {n}  values: [{}]{suffix}",
+                "{prefix}nulls: {num_nulls}  cardinality: {n}  cat_emb_start: {cat_emb_start}  values: [{}]{suffix}",
                 preview.join(", ")
             );
         }
@@ -502,9 +526,13 @@ fn format_cell(tv: &TableView, stype: SemanticType, col: usize, row: usize) -> S
                 "false".to_string()
             }
         }
-        SemanticType::Categorical | SemanticType::Text => {
-            let idx = tv.embedding_idx(col, row);
-            format!("emb[{}]", idx.0)
+        SemanticType::Categorical => {
+            let idx = tv.categorical_embedding_idx(col, row);
+            format!("cat_emb[{}]", idx.0)
+        }
+        SemanticType::Text => {
+            let idx = tv.text_embedding_idx(col, row);
+            format!("text_emb[{}]", idx.0)
         }
         SemanticType::Ignored => "(ignored)".to_string(),
     }
@@ -524,7 +552,7 @@ fn format_target_cell(target: &ColumnSlice, stype: SemanticType, seed: usize) ->
             }
         }
         (SemanticType::Categorical, ColumnSlice::Embedded { indices, .. }) => {
-            format!("emb[{}]", indices[seed])
+            format!("cat_emb[{}]", indices[seed])
         }
         (SemanticType::Timestamp, ColumnSlice::Timestamp { values, .. }) => {
             let ts = &values[seed * TIMESTAMP_DIM..(seed + 1) * TIMESTAMP_DIM];

@@ -22,7 +22,7 @@ Every task is a SQL query that materializes ground-truth labels as tuples:
   Semantically interpreted as an instance of `target_stype` (numerical, categorical, boolean, or timestamp).
   Loss computation is determined by this value and semantic type.
 
-Tasks live in the `tasks` array of `metadata.json`. The training loop samples a
+Tasks live in the `tasks` map of `metadata.json`. The training loop samples a
 task, draws seeds from that task's anchor rows, builds subgraphs, masks the target
 on the seed row, and computes a single-type loss. The model and sampler are
 task-agnostic — they just see anchor rows, subgraphs, and targets.
@@ -35,8 +35,7 @@ Tasks range from trivial cell masking to complex derived predictions.
 All tasks are defined with the same structure:
 
 ```json
-{
-    "name": "(task name)",
+"(task name)": {
     "query": "(defining sql query)",
     "anchor_table": "(base table)",
     "anchor_key": "(primary key for base table rows)",
