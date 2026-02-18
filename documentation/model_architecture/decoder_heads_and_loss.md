@@ -71,10 +71,19 @@ null_loss = BCE(sigmoid(null_logits[b, t]), is_null[b, t])
 
 | Target type     | Loss        | Prediction                 | Ground truth                                                            |
 |-----------------|-------------|----------------------------|-------------------------------------------------------------------------|
-| **Numerical**   | MSE         | `num_preds[b, t]`          | `numeric_values[b, t]`                                                  |
+| **Numerical**   | Huber       | `num_preds[b, t]`          | `numeric_values[b, t]`                                                  |
 | **Boolean**     | BCE         | `sigmoid(bool_logits[b, t])` | `bool_values[b, t]`                                                  |
-| **Timestamp**   | MSE (15-dim)| `ts_preds[b, t]`           | `timestamp_values[b, t]`                                                |
+| **Timestamp**   | Huber (15-dim, weighted) | `ts_preds[b, t]` | `timestamp_values[b, t]`                                                |
 | **Categorical** | Cross-entropy | `cat_preds[b, t]`       | `categorical_encoder(cat_emb_table[cat_emb_start : cat_emb_start + K])` |
+
+**Huber loss** (smooth L1) is used for numerical and timestamp heads instead of MSE. It is quadratic for small errors
+(|e| ≤ δ, default δ=1.0) and linear for large errors, providing robustness to outliers in z-scored values while
+preserving smooth gradients near zero.
+
+**Timestamp weighting.** The 15-dim timestamp vector contains 14 cyclic (sin/cos) components and 1 z-scored scalar.
+The cyclic components are averaged into a single loss term while the scalar is weighted separately
+(`ts_scalar_weight`, default 2.0) to prevent it from being drowned out by the 14 cyclic dimensions. With default
+settings the scalar receives ~22% of the total timestamp gradient budget.
 
 **Categorical loss** in detail — cross-entropy over the full category set for the target column:
 

@@ -2,7 +2,7 @@
 
 Implements:
 - Null loss (BCE on null head)
-- Type-specific losses (MSE for numerical/timestamp, BCE for boolean, CE for categorical)
+- Type-specific losses (Huber for numerical/timestamp, BCE for boolean, CE for categorical)
 - Graph-break-free type selection via one-hot masking
 - Z-loss regularization for categorical predictions
 """
@@ -13,10 +13,21 @@ import jax.numpy as jnp
 from confluence.model import ModelOutput, STYPE_NUMERICAL, STYPE_BOOLEAN, STYPE_TIMESTAMP, STYPE_CATEGORICAL
 
 
-def binary_cross_entropy(logits, labels):
+def binary_cross_entropy(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
     """Numerically stable BCE from raw logits."""
     # sigmoid_cross_entropy_with_logits
     return jnp.maximum(logits, 0) - logits * labels + jnp.log1p(jnp.exp(-jnp.abs(logits)))
+
+
+def huber_loss(error: jnp.ndarray, delta: float = 1.0) -> jnp.ndarray:
+    """Huber loss (smooth L1): quadratic for |e| <= delta, linear beyond.
+
+    Branchless formulation suitable for JAX JIT.
+    """
+    abs_error = jnp.abs(error)
+    quadratic = jnp.minimum(abs_error, delta)
+    linear = abs_error - quadratic
+    return 0.5 * quadratic ** 2 + delta * linear
 
 
 def compute_loss(
@@ -25,6 +36,8 @@ def compute_loss(
     cat_emb_table: jnp.ndarray,
     categorical_encoder_fn,
     z_loss_weight: float = 1e-4,
+    ts_scalar_weight: float = 2.0,
+    huber_delta: float = 1.0,
     max_k: int = 256,
 ):
     """Compute training loss for a batch.
@@ -41,6 +54,10 @@ def compute_loss(
         categorical_encoder_fn: function that applies the categorical encoder
             Linear(D_t -> D) to a tensor. Used for cross-entropy over categories.
         z_loss_weight: coefficient for z-loss regularization.
+        ts_scalar_weight: weight for the z-scored scalar component of
+            timestamp loss relative to the averaged cyclic components.
+        huber_delta: threshold for Huber loss on numerical/timestamp heads.
+            Errors below delta are penalized quadratically; above, linearly.
         max_k: maximum category set size (for static shapes).
 
     Returns:
@@ -66,14 +83,22 @@ def compute_loss(
     # ---- Null loss: BCE at all target positions ----
     null_loss = binary_cross_entropy(null_logits, is_null)  # [B, S]
 
-    # ---- Numerical loss: MSE ----
-    num_loss = (num_preds - gt_numeric) ** 2  # [B, S]
+    # ---- Numerical loss: Huber ----
+    num_loss = huber_loss(num_preds - gt_numeric, delta=huber_delta)  # [B, S]
 
     # ---- Boolean loss: BCE ----
     bool_loss = binary_cross_entropy(bool_logits, gt_bool)  # [B, S]
 
-    # ---- Timestamp loss: MSE (sum over 15 dims) ----
-    ts_loss = jnp.sum((ts_preds - gt_timestamp) ** 2, axis=-1)  # [B, S]
+    # ---- Timestamp loss: Huber with upweighted scalar ----
+    # 14 cyclic dims (7 sin/cos pairs) averaged + scalar with higher weight
+    ts_cyclic_loss = jnp.mean(
+        huber_loss(ts_preds[..., :14] - gt_timestamp[..., :14], delta=huber_delta),
+        axis=-1,
+    )  # [B, S]
+    ts_scalar_loss = huber_loss(
+        ts_preds[..., 14] - gt_timestamp[..., 14], delta=huber_delta
+    )  # [B, S]
+    ts_loss = ts_cyclic_loss + ts_scalar_weight * ts_scalar_loss  # [B, S]
 
     # ---- Categorical loss: cross-entropy over category set ----
     # Get category set for the target column
