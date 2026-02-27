@@ -7,4 +7,5 @@ dependencies = [
     "duckdb>=1.4.4",
     "pyarrow>=23.0.0",
     "pydantic-ai-slim[openrouter]>=1.59.0",
+    "rich>=14.3.3",
 ]

@@ -111,6 +111,8 @@ impl PySampler {
         default_sequence_length = 1024,
         bfs_child_width = 16,
         max_rows_per_seq = 200,
+        perm_tile_size = 32,
+        perm_stats_every = 100,
     ))]
     fn new(
         py: Python<'_>,
@@ -125,6 +127,8 @@ impl PySampler {
         default_sequence_length: u32,
         bfs_child_width: u32,
         max_rows_per_seq: u32,
+        perm_tile_size: u32,
+        perm_stats_every: u32,
     ) -> PyResult<Self> {
         let config = SamplerConfig {
             db_path,
@@ -138,6 +142,8 @@ impl PySampler {
             sequence_length: default_sequence_length,
             bfs_child_width,
             max_rows_per_seq,
+            perm_tile_size,
+            perm_stats_every,
         };
 
         let sampler = py

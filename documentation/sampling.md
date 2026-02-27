@@ -1,9 +1,8 @@
 # How the Context Window Sampling Works
 
-> **Note:** This document describes the *intended design* for the sampler. The implementation
-> in `headwater/src/sampler.rs` is not yet written.
-
 The goal is to build a "context window" of cells from a relational database that are relevant to predicting a single masked (unknown) cell. Think of it like: given a specific row you care about (the seed row), go explore the database graph to find the most useful nearby information, up to a budget of L cells.
+
+The implementation lives in `headwater/src/sampler.rs`.
 
 ## The Core Idea
 
@@ -39,8 +38,7 @@ We get diminishing returns from including every single child row.
 
 ## Implementation Details (processes, threading, parallelism)
 
-Sampling will be implemented as a rust library.
-The intention is that the library will be callable from python code via PyO3.
+Sampling is implemented as a Rust library, callable from Python via PyO3 (see `headwater/src/python.rs`).
 
-Each JAX process will have its own corresponding rust sampler process.
-The sampler processes will SHARE MEMORY on the underlying graph database, via memory-mapped files.
+Each JAX process has its own corresponding Rust sampler instance.
+The sampler processes share memory on the underlying graph database via memory-mapped files.

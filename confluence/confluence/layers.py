@@ -82,9 +82,12 @@ class QKNormedMultiHeadAttention(nn.Module):
         # Attention logits: [B, H, S, S]
         attn_logits = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / jnp.sqrt(cfg.d_head)
 
-        # Apply mask
+        # Apply mask. Force self-attention on the diagonal in-model so
+        # structural masks can stay block-sparse without explicit identity.
         if mask.ndim == 3:
             mask = mask[:, None, :, :]  # [B, 1, S, S]
+        diag = jnp.eye(s, dtype=jnp.bool_)[None, None, :, :]  # [1, 1, S, S]
+        mask = mask | diag
         attn_logits = jnp.where(mask, attn_logits, -1e9)
 
         attn_weights = jax.nn.softmax(attn_logits, axis=-1)

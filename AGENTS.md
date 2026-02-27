@@ -2,7 +2,7 @@
 
 This repository contains code designed to build a "relational transformer" machine learning model.
 
-There are two planned pieces. One is written in rust, and the other will be written in python.
+There are two pieces. One is written in Rust, and the other in Python.
 
 You can see lots of documentation in the `documentation` directory - read pieces of it as needed.
 
@@ -10,24 +10,27 @@ You can see lots of documentation in the `documentation` directory - read pieces
 
 ### Rust (`headwater`)
 
-Headwater is a rust library with two responsibilities: 
+Headwater is a Rust library with two responsibilities:
 
 1) preprocessing databases into graphs + materializing tasks
 
 The preprocessor converts collections of parquet files plus a metadata JSON file describing database semantics into a
 custom processed binary format for our samplers to load. **This is implemented.**
 
-2) sampling from processed databases into batches (NOT YET IMPLEMENTED)
+2) sampling from processed databases into batches
 
-The sampler will run in a single rust process. It will be responsible for producing sequences of training cells from our 
-pre-processed graphs. The sampler will both *construct the sequences* as well as *pack the batches* for downstream use.
-The sampler will be callable from python code via PyO3.
+The sampler runs in a single Rust process. It produces sequences of training cells from our pre-processed graphs. The
+sampler both *constructs the sequences* and *packs the batches* for downstream use. It is callable from Python code via
+PyO3. **This is implemented.** See `src/sampler.rs` for the BFS-based sampling, batch packing, prefetch pipeline, and
+DDP sharding. See `src/python.rs` for the PyO3 bindings.
 
 
-### Python (`confluence`) — NOT YET IMPLEMENTED
+### Python (`confluence`)
 
-Confluence (the model) will be a JAX python project.
-We will define a custom relational transformer model, and use the sampler from `headwater` to feed batches in.
+Confluence is a JAX python project. It defines a custom relational transformer model and uses the sampler from
+`headwater` to feed batches in. **This is implemented.** The model, training loop, loss, and optimizer are all in
+`confluence/confluence/`. A standalone smoke test (`confluence/smoke_test.py`) validates the pipeline end-to-end without
+the Rust sampler.
 
 Confluence is intended to be run in a DistributedDataParallel way - multiple GPU nodes per host.
 
@@ -36,6 +39,7 @@ Confluence is intended to be run in a DistributedDataParallel way - multiple GPU
 ### General Style
 
 - In particular, functions should generally be no longer than about 60 lines (one screen of text).
+- Use a hard cutover approach and never implement backward compatibility.
 
 ### Environmental Assumptions
 
@@ -57,9 +61,10 @@ Avoid anti-patterns like `unwrap`.
 
 Use tokio-rs `tracing` for logging instead or print statements.
 
-### Python (`confluence`) — NOT YET IMPLEMENTED
+### Python (`confluence`)
 
-When this project is started, it will use `uv` for package management with dependencies listed in `pyproject.toml`.
+This project uses `uv` for package management with dependencies listed in `pyproject.toml`. The `headwater` Rust crate
+is a local editable dependency (built via maturin). Use `ruff` for linting/formatting.
 
 ### Python (`scripts`)
 

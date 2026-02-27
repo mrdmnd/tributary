@@ -8,16 +8,15 @@ Implements:
 
 from typing import NamedTuple
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 
 from confluence.config import ModelConfig
 from confluence.layers import (
-    ZeroCenteredRMSNorm,
     TransformerLayer,
+    ZeroCenteredRMSNorm,
 )
-
 
 # Semantic type constants (must match Rust SemanticType enum)
 STYPE_IDENTIFIER = 0
@@ -31,12 +30,13 @@ STYPE_IGNORED = 6
 
 class ModelOutput(NamedTuple):
     """Output of the relational transformer forward pass."""
-    h: jnp.ndarray            # [B, S, D] final hidden states
+
+    h: jnp.ndarray  # [B, S, D] final hidden states
     null_logits: jnp.ndarray  # [B, S] null head (raw logits)
-    num_preds: jnp.ndarray    # [B, S] numerical predictions (z-score scale)
+    num_preds: jnp.ndarray  # [B, S] numerical predictions (z-score scale)
     bool_logits: jnp.ndarray  # [B, S] boolean head (raw logits)
-    ts_preds: jnp.ndarray     # [B, S, 15] timestamp predictions
-    cat_preds: jnp.ndarray    # [B, S, D] categorical projections
+    ts_preds: jnp.ndarray  # [B, S, 15] timestamp predictions
+    cat_preds: jnp.ndarray  # [B, S, D] categorical projections
 
 
 class ValueEncoder(nn.Module):
@@ -47,6 +47,7 @@ class ValueEncoder(nn.Module):
     Where col_enc = Linear(D_t -> D)(column_embedding_table[column_ids])
     and val_final is the type-specific value, gated by null and target masks.
     """
+
     config: ModelConfig
 
     @nn.compact
@@ -65,8 +66,8 @@ class ValueEncoder(nn.Module):
         d = cfg.d_model
         d_t = cfg.d_text
 
-        semantic_types = batch["semantic_types"]        # [B, S] int8
-        column_ids = batch["column_ids"]                # [B, S] int32
+        semantic_types = batch["semantic_types"]  # [B, S] int8
+        column_ids = batch["column_ids"]  # [B, S] int32
         is_null = batch["is_null"].astype(jnp.float32)  # [B, S]
         is_target = batch["is_target"].astype(jnp.float32)  # [B, S]
         is_padding = batch["is_padding"].astype(jnp.float32)  # [B, S]
@@ -120,42 +121,34 @@ class ValueEncoder(nn.Module):
         type_one_hot = jax.nn.one_hot(stypes, cfg.num_semantic_types)  # [B,S,7]
 
         # Stack all encoders: [B, S, 7, D]
-        all_vals = jnp.stack([
-            id_val,    # 0: Identifier
-            num_val,   # 1: Numerical
-            ts_val,    # 2: Timestamp
-            bool_val,  # 3: Boolean
-            cat_val,   # 4: Categorical
-            text_val,  # 5: Text
-            jnp.zeros_like(id_val),  # 6: Ignored (should never appear)
-        ], axis=2)  # [B, S, 7, D]
+        all_vals = jnp.stack(
+            [
+                id_val,  # 0: Identifier
+                num_val,  # 1: Numerical
+                ts_val,  # 2: Timestamp
+                bool_val,  # 3: Boolean
+                cat_val,  # 4: Categorical
+                text_val,  # 5: Text
+                jnp.zeros_like(id_val),  # 6: Ignored (should never appear)
+            ],
+            axis=2,
+        )  # [B, S, 7, D]
 
         # Select: [B, S, D]
         raw_val = jnp.einsum("bst,bstd->bsd", type_one_hot, all_vals)
 
         # Null gating: replace value with null_emb if is_null
-        null_emb = self.param(
-            "null_emb", nn.initializers.normal(stddev=0.02), (d,)
-        )
+        null_emb = self.param("null_emb", nn.initializers.normal(stddev=0.02), (d,))
         is_null_expanded = is_null[..., None]  # [B, S, 1]
-        val_or_null = (
-            is_null_expanded * null_emb + (1.0 - is_null_expanded) * raw_val
-        )
+        val_or_null = is_null_expanded * null_emb + (1.0 - is_null_expanded) * raw_val
 
         # Target masking: replace with mask_emb if is_target (priority over null)
-        mask_emb = self.param(
-            "mask_emb", nn.initializers.normal(stddev=0.02), (d,)
-        )
+        mask_emb = self.param("mask_emb", nn.initializers.normal(stddev=0.02), (d,))
         is_target_expanded = is_target[..., None]  # [B, S, 1]
-        val_final = (
-            is_target_expanded * mask_emb
-            + (1.0 - is_target_expanded) * val_or_null
-        )
+        val_final = is_target_expanded * mask_emb + (1.0 - is_target_expanded) * val_or_null
 
         # Combine column encoding + value encoding
-        h0 = ZeroCenteredRMSNorm(eps=cfg.rms_norm_eps, name="h0_norm")(
-            col_enc + val_final
-        )
+        h0 = ZeroCenteredRMSNorm(eps=cfg.rms_norm_eps, name="h0_norm")(col_enc + val_final)
 
         # Note: we intentionally do NOT zero out padding positions here.
         # Attention masks already exclude padding from affecting non-padding
@@ -167,6 +160,7 @@ class ValueEncoder(nn.Module):
 
 class DecoderHeads(nn.Module):
     """All five decoder heads, run unconditionally on every position."""
+
     config: ModelConfig
 
     @nn.compact
@@ -183,9 +177,7 @@ class DecoderHeads(nn.Module):
         null_logits = nn.Dense(1, use_bias=True, name="null_head")(h).squeeze(-1)
         num_preds = nn.Dense(1, use_bias=True, name="numerical_decoder")(h).squeeze(-1)
         bool_logits = nn.Dense(1, use_bias=True, name="boolean_decoder")(h).squeeze(-1)
-        ts_preds = nn.Dense(
-            self.config.d_time, use_bias=True, name="timestamp_decoder"
-        )(h)
+        ts_preds = nn.Dense(self.config.d_time, use_bias=True, name="timestamp_decoder")(h)
         cat_preds = nn.Dense(d, use_bias=True, name="categorical_decoder")(h)
 
         return ModelOutput(
@@ -209,9 +201,9 @@ def build_attention_masks(batch, max_rows):
         outbound_mask, inbound_mask, column_mask: each [B, S, S] bool.
     """
     seq_row_ids = batch["seq_row_ids"].astype(jnp.int32)  # [B, S]
-    fk_adj = batch["fk_adj"].astype(jnp.bool_)             # [B, R, R]
-    is_padding = batch["is_padding"].astype(jnp.bool_)     # [B, S]
-    column_ids = batch["column_ids"]                        # [B, S]
+    fk_adj = batch["fk_adj"].astype(jnp.bool_)  # [B, R, R]
+    is_padding = batch["is_padding"].astype(jnp.bool_)  # [B, S]
+    column_ids = batch["column_ids"]  # [B, S]
     b, s = seq_row_ids.shape
 
     # Row indices for mask expansion
@@ -230,7 +222,7 @@ def build_attention_masks(batch, max_rows):
     fk_ij = fk_adj[batch_idx, ri_broadcast, rj_broadcast]  # [B, S, S]
 
     # Same row mask
-    same_row = (ri == rj)  # [B, S, S]
+    same_row = ri == rj  # [B, S, S]
 
     # Outbound mask: same_row OR fk_adj[ri, rj]
     outbound_mask = same_row | fk_ij
@@ -242,7 +234,7 @@ def build_attention_masks(batch, max_rows):
     # Column mask: same column
     col_i = column_ids[:, :, None]  # [B, S, 1]
     col_j = column_ids[:, None, :]  # [B, 1, S]
-    column_mask = (col_i == col_j)
+    column_mask = col_i == col_j
 
     # Exclude padding from all masks
     not_padding_i = ~is_padding[:, :, None]  # [B, S, 1]
@@ -252,14 +244,6 @@ def build_attention_masks(batch, max_rows):
     outbound_mask = outbound_mask & valid_mask
     inbound_mask = inbound_mask & valid_mask
     column_mask = column_mask & valid_mask
-
-    # Ensure every position can attend to itself so softmax never gets an
-    # all-masked row (which produces NaN gradients).  For padding positions
-    # this is harmless because their hidden states are already zeroed out.
-    diag = jnp.eye(s, dtype=jnp.bool_)[None, :, :]  # [1, S, S]
-    outbound_mask = outbound_mask | diag
-    inbound_mask = inbound_mask | diag
-    column_mask = column_mask | diag
 
     return outbound_mask, inbound_mask, column_mask
 
@@ -273,6 +257,7 @@ class RelationalTransformer(nn.Module):
     3. Final RMSNorm
     4. Decoder heads
     """
+
     config: ModelConfig
 
     @nn.compact
@@ -286,30 +271,29 @@ class RelationalTransformer(nn.Module):
         # For now, cast uint16 -> float32 -> bfloat16 via jax.lax.bitcast_convert_type
         # Actually, the bits are IEEE float16, not bfloat16.
         # We need to convert f16 bits -> f32 first.
-        text_batch_emb = jnp.array(text_emb_u16, dtype=jnp.float16).astype(
-            jnp.bfloat16
-        )
+        text_batch_emb = jnp.array(text_emb_u16, dtype=jnp.float16).astype(jnp.bfloat16)
 
         # Value encoding
-        h = ValueEncoder(config=cfg, name="value_encoder")(
-            batch, col_emb_table, cat_emb_table, text_batch_emb
-        )
+        h = ValueEncoder(config=cfg, name="value_encoder")(batch, col_emb_table, cat_emb_table, text_batch_emb)
 
         # Build attention masks
-        outbound_mask, inbound_mask, column_mask = build_attention_masks(
-            batch, cfg.max_rows
-        )
+        outbound_mask, inbound_mask, column_mask = build_attention_masks(batch, cfg.max_rows)
 
         # Get permutations from batch
         out_perm = batch["out_perm"]  # [B, S]
-        in_perm = batch["in_perm"]    # [B, S]
+        in_perm = batch["in_perm"]  # [B, S]
         col_perm = batch["col_perm"]  # [B, S]
 
         # Transformer layers
         for i in range(cfg.n_layers):
             h = TransformerLayer(config=cfg, layer_idx=i, name=f"layer_{i}")(
-                h, outbound_mask, inbound_mask, column_mask,
-                out_perm, in_perm, col_perm,
+                h,
+                outbound_mask,
+                inbound_mask,
+                column_mask,
+                out_perm,
+                in_perm,
+                col_perm,
             )
 
         # Final RMSNorm

@@ -50,6 +50,10 @@ pub struct SamplerConfig {
     pub bfs_child_width: u32,
     /// Max distinct rows per sequence (R dimension for fk_adj).
     pub max_rows_per_seq: u32,
+    /// Tile size used by permutation optimizer and sparsity reporting.
+    pub perm_tile_size: u32,
+    /// Log tile sparsity stats every N batches (0 disables).
+    pub perm_stats_every: u32,
 }
 
 impl Default for SamplerConfig {
@@ -66,6 +70,8 @@ impl Default for SamplerConfig {
             sequence_length: 1024,
             bfs_child_width: 16,
             max_rows_per_seq: 200,
+            perm_tile_size: 32,
+            perm_stats_every: 100,
         }
     }
 }
@@ -525,7 +531,7 @@ fn build_sequence(
         }
     }
 
-    // Compute permutations
+    // Compute permutations (RCM for row-graph views).
     let col_perm = compute_col_perm(&column_ids, &is_padding, s);
     let out_perm = compute_rcm_perm(&fk_adj, &seq_row_ids, &is_padding, s, r, true);
     let in_perm = compute_rcm_perm(&fk_adj, &seq_row_ids, &is_padding, s, r, false);
@@ -1102,6 +1108,56 @@ pub enum SamplerError {
     Shutdown,
 }
 
+fn count_seq0_active_tiles(batch: &RawBatch, tile: usize) -> (usize, usize, usize, usize, usize, usize) {
+    let s = batch.sequence_length.min(256);
+    let r = batch.max_rows;
+    let fk_adj = &batch.fk_adj[..r * r];
+    let out_perm = &batch.out_perm[..batch.sequence_length];
+    let in_perm = &batch.in_perm[..batch.sequence_length];
+    let col_perm = &batch.col_perm[..batch.sequence_length];
+
+    let mut out_raw = std::collections::HashSet::new();
+    let mut out_p = std::collections::HashSet::new();
+    let mut in_raw = std::collections::HashSet::new();
+    let mut in_p = std::collections::HashSet::new();
+    let mut col_raw = std::collections::HashSet::new();
+    let mut col_p = std::collections::HashSet::new();
+
+    for i in 0..s {
+        for j in 0..s {
+            if batch.is_padding[i] == 1 || batch.is_padding[j] == 1 {
+                continue;
+            }
+            let ri = batch.seq_row_ids[i] as usize;
+            let rj = batch.seq_row_ids[j] as usize;
+            let same_row = ri == rj;
+            let fk_ij = ri < r && rj < r && fk_adj[ri * r + rj] == 1;
+            let fk_ji = ri < r && rj < r && fk_adj[rj * r + ri] == 1;
+            let same_col = batch.column_ids[i] == batch.column_ids[j];
+            if same_row || fk_ij {
+                out_raw.insert((i / tile, j / tile));
+                out_p.insert((out_perm[i] as usize / tile, out_perm[j] as usize / tile));
+            }
+            if fk_ji {
+                in_raw.insert((i / tile, j / tile));
+                in_p.insert((in_perm[i] as usize / tile, in_perm[j] as usize / tile));
+            }
+            if same_col {
+                col_raw.insert((i / tile, j / tile));
+                col_p.insert((col_perm[i] as usize / tile, col_perm[j] as usize / tile));
+            }
+        }
+    }
+    (
+        out_raw.len(),
+        out_p.len(),
+        in_raw.len(),
+        in_p.len(),
+        col_raw.len(),
+        col_p.len(),
+    )
+}
+
 /// Background producer loop: continuously builds batches and pushes to channel.
 fn producer_loop(
     db: Arc<Database>,
@@ -1126,6 +1182,7 @@ fn producer_loop(
 
     debug!("Producer {:?} started", split);
 
+    let mut produced_batches: u64 = 0;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -1133,6 +1190,19 @@ fn producer_loop(
 
         match build_batch(&db, &seed_manager, &config, split, &mut rng) {
             Some(batch) => {
+                produced_batches += 1;
+                if config.perm_stats_every > 0
+                    && produced_batches.is_multiple_of(config.perm_stats_every as u64)
+                {
+                    let side = batch.sequence_length.min(256);
+                    let tile = (config.perm_tile_size as usize).max(1).min(side.max(1));
+                    let (out_raw, out_perm, in_raw, in_perm, col_raw, col_perm) =
+                        count_seq0_active_tiles(&batch, tile);
+                    info!(
+                        "Sampler {:?} tile stats seq0 (side={}, tile={}): out {}->{} in {}->{} col {}->{}",
+                        split, side, tile, out_raw, out_perm, in_raw, in_perm, col_raw, col_perm
+                    );
+                }
                 if tx.send(batch).is_err() {
                     break; // receiver dropped
                 }
