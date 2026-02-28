@@ -172,8 +172,8 @@ impl PySampler {
         batch_to_dict(py, batch)
     }
 
-    /// Pull the next validation batch. Returns a dict of numpy arrays.
-    /// Blocks until a batch is available (GIL released during wait).
+    /// Build and return the next validation batch. Returns a dict of numpy arrays.
+    /// GIL is released during batch construction.
     fn next_val_batch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let sampler = self
             .inner

@@ -8,4 +8,4 @@ pub mod embedder;
 pub mod sampler;
 
 #[cfg(feature = "python")]
-mod python;
+mod python_bindings;

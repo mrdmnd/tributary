@@ -26,20 +26,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def numpy_batch_to_jax(np_batch, device):
-    """Convert a numpy batch dict to JAX arrays on the given device."""
-    jax_batch = {}
-    for k, v in np_batch.items():
-        jax_batch[k] = jax.device_put(jnp.array(v), device)
-    return jax_batch
+def numpy_batch_to_jax(
+    np_batch: dict[str, np.ndarray], device: jax.Device
+) -> dict[str, jax.Array]:
+    """Convert a numpy batch dict to JAX arrays on the given device.
+
+    Passes the full pytree in a single ``device_put`` so JAX can batch
+    the host-to-device transfers instead of issuing one per array.
+    """
+    return jax.device_put(np_batch, device)
 
 
-def numpy_batch_to_pmap(np_batch):
-    """Convert a numpy batch dict to pmap-ready arrays (leading local-device axis)."""
-    jax_batch = {}
-    for k, v in np_batch.items():
-        jax_batch[k] = jnp.expand_dims(jnp.array(v), axis=0)
-    return jax_batch
+def numpy_batch_to_pmap(
+    np_batch: dict[str, np.ndarray],
+) -> dict[str, jax.Array]:
+    """Convert a numpy batch dict to pmap-ready arrays (leading local-device axis).
+
+    Uses numpy for the expand then a single ``device_put`` on the pytree.
+    """
+    expanded = {k: np.expand_dims(v, axis=0) for k, v in np_batch.items()}
+    return jax.device_put(expanded)
 
 
 def create_dummy_batch(config: ModelConfig, training_config: TrainingConfig):

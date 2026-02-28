@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -1507,17 +1507,22 @@ fn build_batch(
 // Sampler (prefetch pipeline)
 // ============================================================================
 
-/// Main sampler: holds DB, seed sharding, and prefetch channels; used from Python and benchmark binaries.
+/// Mutable state for on-demand validation batch construction.
+struct ValBatchState {
+    rng: SmallRng,
+    workspace: BatchBuildWorkspace,
+}
+
+/// Main sampler: holds DB, seed sharding, train prefetch channel, and on-demand val state.
 #[allow(dead_code)]
 pub struct Sampler {
     db: Arc<Database>,
     config: SamplerConfig,
     seed_manager: Arc<SeedManager>,
     train_rx: Receiver<RawBatch>,
-    val_rx: Receiver<RawBatch>,
     shutdown: Arc<AtomicBool>,
     train_handle: Option<std::thread::JoinHandle<()>>,
-    val_handle: Option<std::thread::JoinHandle<()>>,
+    val_state: Mutex<ValBatchState>,
     profile_reported: bool,
 }
 
@@ -1542,11 +1547,8 @@ impl Sampler {
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Create bounded channels
+        // Create bounded train channel and spawn producer thread.
         let (train_tx, train_rx) = channel::bounded(config.num_prefetch);
-        let (val_tx, val_rx) = channel::bounded(config.num_prefetch.max(1));
-
-        // Spawn train producer thread
         let train_handle = {
             let db = Arc::clone(&db);
             let sm = Arc::clone(&seed_manager);
@@ -1559,28 +1561,26 @@ impl Sampler {
                 })?
         };
 
-        // Spawn val producer thread
-        let val_handle = {
-            let db = Arc::clone(&db);
-            let sm = Arc::clone(&seed_manager);
-            let cfg = config.clone();
-            let stop = Arc::clone(&shutdown);
-            std::thread::Builder::new()
-                .name("sampler-val".into())
-                .spawn(move || {
-                    producer_loop(db, sm, cfg, Split::Val, val_tx, stop);
-                })?
-        };
+        // Validation batches are built on-demand (no background thread).
+        let val_rng = SmallRng::seed_from_u64(
+            config
+                .seed
+                .wrapping_add(config.rank as u64 * 1000)
+                .wrapping_add(1),
+        );
+        let val_state = Mutex::new(ValBatchState {
+            rng: val_rng,
+            workspace: BatchBuildWorkspace::new(config.batch_size as usize),
+        });
 
         Ok(Self {
             db,
             config,
             seed_manager,
             train_rx,
-            val_rx,
             shutdown,
             train_handle: Some(train_handle),
-            val_handle: Some(val_handle),
+            val_state,
             profile_reported: false,
         })
     }
@@ -1610,26 +1610,21 @@ impl Sampler {
         Ok(batch)
     }
 
-    /// Pull the next validation batch. Blocks until one is available.
+    /// Build and return the next validation batch on demand.
     pub fn next_val_batch(&self) -> Result<RawBatch, SamplerError> {
-        let batch = match self.val_rx.try_recv() {
-            Ok(batch) => batch,
-            Err(TryRecvError::Empty) => {
-                let t_wait = if profile_enabled() {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                let recv = self.val_rx.recv().map_err(|_| SamplerError::Shutdown)?;
-                if t_wait.is_some() {
-                    PROFILE_CONSUMER_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
-                }
-                add_elapsed_ns(&PROFILE_CONSUMER_BLOCKED_NS, t_wait);
-                recv
-            }
-            Err(TryRecvError::Disconnected) => return Err(SamplerError::Shutdown),
-        };
+        let mut state = self.val_state.lock().map_err(|_| SamplerError::Shutdown)?;
+        let ValBatchState { rng, workspace } = &mut *state;
+        let batch = build_batch(
+            &self.db,
+            &self.seed_manager,
+            &self.config,
+            Split::Val,
+            rng,
+            workspace,
+        )
+        .ok_or(SamplerError::NoSeeds)?;
         if profile_enabled() {
+            PROFILE_PRODUCED_VAL_COUNT.fetch_add(1, Ordering::Relaxed);
             PROFILE_CONSUMED_VAL_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         Ok(batch)
@@ -1670,14 +1665,10 @@ impl Sampler {
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
 
-        // Drain channels so producers can unblock
+        // Drain train channel so the producer can unblock.
         while self.train_rx.try_recv().is_ok() {}
-        while self.val_rx.try_recv().is_ok() {}
 
         if let Some(h) = self.train_handle.take() {
-            let _ = h.join();
-        }
-        if let Some(h) = self.val_handle.take() {
             let _ = h.join();
         }
 
@@ -1700,6 +1691,8 @@ impl Drop for Sampler {
 pub enum SamplerError {
     #[error("sampler has been shut down")]
     Shutdown,
+    #[error("no seeds available for the requested split")]
+    NoSeeds,
 }
 
 /// Background producer: loop build_batch → send; runs in a dedicated thread per split.

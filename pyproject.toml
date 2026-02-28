@@ -17,8 +17,14 @@ dependencies = [
 [project.scripts]
 train = "confluence.train:main"
 
+[tool.uv.workspace]
+members = ["headwater"]
+
 [tool.uv.sources]
-headwater = { path = "../headwater", editable = true }
+headwater = { workspace = true }
+
+[tool.uv]
+default-groups = ["dev"]
 
 [dependency-groups]
 dev = [
@@ -31,15 +37,19 @@ dev = [
     "ty>=0.0.18",
     "types-tqdm>=4.67.3.20260205",
 ]
+scripts = [
+    "duckdb>=1.4.4",
+    "pyarrow>=23.0.0",
+    "pydantic-ai-slim[openrouter]>=1.59.0",
+    "rich>=14.3.3",
+]
 
-# Lint Rules
 [tool.ruff]
 line-length = 150
 target-version = "py313"
 
 [tool.ruff.lint]
 preview = true
-# we could consider adding "D" for doc, and "DOC" for more doc
 select = [
     "I",
     "E",
@@ -68,7 +78,6 @@ select = [
     "RUF",
 ]
 ignore = ["TD003", "F722", "PLR0914", "TRY003", "SIM108", "PLR0913", "PLR0917", "C901"]
-# "bugbear" checks are not fixable by default
 unfixable = ["B"]
 
 [tool.pytest.ini_options]

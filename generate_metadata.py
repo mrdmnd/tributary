@@ -5,7 +5,7 @@ sampling data, and checking cardinalities to produce a high-quality initial
 metadata annotation. The human annotator then reviews and corrects the output.
 
 Usage:
-    uv run generate_metadata.py <data_dir> [--model MODEL] [--force]
+    uv run --project confluence --group scripts python generate_metadata.py <data_dir> [--model MODEL] [--force]
 
 Requires the OPENROUTER_API_KEY environment variable to be set.
 """

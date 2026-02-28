@@ -10,5 +10,8 @@ target
 
 /target
 
+# Python
+.venv/
+
 data/processed/
 data/raw/
