@@ -5,8 +5,9 @@ A foundation model for learning internal representations of relational databases
 ## Overview
 
 Tributary is HEAVILY based on top of Rishabh Ranjan's work in [Relational Transformer](https://arxiv.org/abs/2510.06377).
+The core ideas in this project come predominantly from their work
 
-This is mostly a small re-implementation plus some slight modifications to their paper to support my own use cases.
+This is mostly a small re-implementation plus some slight engineer-y modifications.
 
 Tributary is a system designed to train a foundation model to understand relational databases, via prediction.
 The underlying model derives signal from human-annotated "tasks", which correspond to regression or classification
@@ -15,10 +16,11 @@ problems. As the model learns, it should get better at these tasks across databa
 ## Setup
 
 To preprocess your own databases, you need to have a frozen text embedder endpoint available.
-The default in this project is to use an OpenAI compatible endpoint; how you get this hosted is up to you.
+The default in this project is to use an OpenAI compatible endpoint; however you want to host this is up to you.
 I've found that Baseten is a really good high speed host for throughput-sensitive applications like this preprocessing.
 
-If you want to use the Baseten hosted endpoint, you need to set the following environment variables:
+If you want to use a Baseten hosted endpoint, you need to set the following environment variables:
+
 - `BASETEN_EMBEDDER_URL` - the base URL of the Baseten endpoint
 - `BASETEN_API_KEY` - the API key for the Baseten endpoint
 
@@ -26,9 +28,8 @@ In additional to generating frozen embeddings, we also will need to provide gene
 I've put together a small agentic helper script that will generate an appropriate metadata file as a starting point.
 
 If you want to use the OpenRouter endpoint for the "metadata generation agent", you need to set the following variable:
+
 - `OPENROUTER_API_KEY` - the base URL of the OpenRouter endpoint
-
-
 
 ## Representations
 
@@ -42,12 +43,14 @@ graph, with directed edges between tables.
 
 Each table is also a collection of rows, each of which has some columns. A particular
 "cell" is identified by a (table, row, column) tuple. Cells can be "null" or "not null".
+(The "null" vs "not null" distinction is not directly supported in the Ranjan work, but
+we add it as learning signal here as a useful inductive bias.)
 
 Tables generally will have a primary key column (though this is not required).
 
 Tables may have foreign key columns (relationships to other tables) as well as temporal columns (columns that contain
-information points in time). For tables with one or more temporal columns, we need to define a canonical column that
-represents when the observations in the row "came into existence" for the purposes of temporal filtering.
+information points in time). Tables with temporal columns may additionally have a canonical column defined in metadata
+that indicates when the observations in the row "came into existence" for the purposes of temporal filtering.
 
 Columns in a table can have different "data types" - these are the primitive types that the column is stored as.
 For example, in MySQL, this could be "INT", "FLOAT", "VARCHAR", "BOOLEAN", etc.
@@ -59,6 +62,14 @@ might be a "Timestamp" column, and a column that holds a string might be a "Text
 (when the contents are semantically meaningful) or a "Categorical" column (when the
 contents do not have meaningful semantics, but serve as an enumeration of some kind.)
 
+The original Ranjan paper did not support the "categorical" semantic type, but we've added
+it here as a useful learning target. Open question: would it be better to support booleans
+as "categoricals" as well?
+
+Additionally, the Ranjan paper did not support the "Identifier" semantic type - we add
+it because the null/not-null-ness of an identifier cell may still be a useful learning
+signal to the model.
+
 Our model supports the following semantic types:
 
 - `Identifier`
@@ -69,7 +80,8 @@ Our model supports the following semantic types:
 - `Text`
 
 Every column that is not one of the above semantic types is marked as "Ignored"
-and is skipped entirely during preprocessing and training.
+and is skipped entirely during preprocessing and training. Users can also manually mark
+columns as "Ignored" when they want to skip them entirely from signal inclusion.
 
 ## Preprocessing
 
@@ -102,7 +114,7 @@ mapping may help the model internalize those patterns better.
 - month of year
 - day of year
 
-These features are turned into pairs (sin(2 * pi * x / period), cos(2 * pi * x / period)) to normalize the values.
+These features are turned into pairs (sin(2 _pi_ x / period), cos(2 _pi_ x / period)) to normalize the values.
 
 The timestamp itself (i64 microseconds since epoch) is also part of the feature, but it's
 z-score normalized to an f32 value based on all timestamp values across all tables in the database.
