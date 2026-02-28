@@ -114,7 +114,7 @@ class QKNormedMultiHeadAttention(nn.Module):
 
 
 class GatedAttentionSublayer(nn.Module):
-    """One attention sublayer: RMSNorm -> permute -> MHA -> unpermute -> gate -> residual.
+    """One attention sublayer: RMSNorm -> MHA -> gate -> residual.
 
     The gate is sigmoid(x_norm @ W_gate) applied elementwise to the attention
     output before the residual connection.
@@ -123,58 +123,30 @@ class GatedAttentionSublayer(nn.Module):
     output_scale: float = 1.0
 
     @nn.compact
-    def __call__(self, x, mask, perm):
+    def __call__(self, x, mask):
         """
         Args:
             x: [B, S, D] input hidden states.
             mask: [B, S, S] attention mask (True = attend).
-            perm: [B, S] permutation indices for block sparsity.
-
         Returns:
             [B, S, D] output after residual connection.
         """
         cfg = self.config
-        b, s, d = x.shape
 
         # Pre-norm
         x_norm = ZeroCenteredRMSNorm(eps=cfg.rms_norm_eps, name="norm")(x)
 
-        # Gather into permuted order
-        perm_expanded = perm[:, :, None].astype(jnp.int32)
-        perm_expanded = jnp.broadcast_to(perm_expanded, (b, s, d))
-        x_perm = jnp.take_along_axis(x_norm, perm_expanded, axis=1)
-
-        # Permute mask: mask_perm[b, i, j] = mask[b, perm[b, i], perm[b, j]]
-        perm_i = perm[:, :, None].astype(jnp.int32)  # [B, S, 1]
-        perm_j = perm[:, None, :].astype(jnp.int32)  # [B, 1, S]
-        # Gather rows then columns
-        mask_perm = jnp.take_along_axis(
-            jnp.take_along_axis(mask, jnp.broadcast_to(perm_i, (b, s, s)), axis=1),
-            jnp.broadcast_to(perm_j, (b, s, s)),
-            axis=2,
-        )
-
-        # Attention in permuted space
+        # Attention in sequence order
         attn_out = QKNormedMultiHeadAttention(
             config=cfg, output_scale=self.output_scale, name="mha"
-        )(x_perm, mask_perm)
-
-        # Scatter back from permuted order using inverse permutation
-        perm_i32 = perm.astype(jnp.int32)
-        inv_perm = jnp.zeros((b, s), dtype=jnp.int32)
-        batch_idx = jnp.arange(b)[:, None]
-        seq_idx = jnp.broadcast_to(jnp.arange(s, dtype=jnp.int32)[None, :], (b, s))
-        inv_perm = inv_perm.at[batch_idx, perm_i32].set(seq_idx)
-        inv_expanded = inv_perm[:, :, None].astype(jnp.int32)
-        inv_expanded = jnp.broadcast_to(inv_expanded, (b, s, d))
-        attn_unperm = jnp.take_along_axis(attn_out, inv_expanded, axis=1)
+        )(x_norm, mask)
 
         # Sigmoid gate: gate = sigmoid(x_norm @ W_gate)
         gate = nn.Dense(d, use_bias=False, name="w_gate")(x_norm)
         gate = jax.nn.sigmoid(gate)
 
         # Gated output + residual
-        return x + attn_unperm * gate
+        return x + attn_out * gate
 
 
 class SwiGLUFFN(nn.Module):
@@ -212,8 +184,7 @@ class TransformerLayer(nn.Module):
     layer_idx: int = 0
 
     @nn.compact
-    def __call__(self, x, outbound_mask, inbound_mask, column_mask,
-                 out_perm, in_perm, col_perm):
+    def __call__(self, x, outbound_mask, inbound_mask, column_mask):
         cfg = self.config
         n_layers = cfg.n_layers
         # W_O and W_2 scaling factor for residual variance control
@@ -222,17 +193,17 @@ class TransformerLayer(nn.Module):
         # Outbound attention (self + FK parents)
         x = GatedAttentionSublayer(
             config=cfg, output_scale=output_scale, name="outbound"
-        )(x, outbound_mask, out_perm)
+        )(x, outbound_mask)
 
         # Inbound attention (FK children)
         x = GatedAttentionSublayer(
             config=cfg, output_scale=output_scale, name="inbound"
-        )(x, inbound_mask, in_perm)
+        )(x, inbound_mask)
 
         # Column attention (same-column peers)
         x = GatedAttentionSublayer(
             config=cfg, output_scale=output_scale, name="column"
-        )(x, column_mask, col_perm)
+        )(x, column_mask)
 
         # FFN with pre-norm
         x_norm = ZeroCenteredRMSNorm(eps=cfg.rms_norm_eps, name="ffn_norm")(x)

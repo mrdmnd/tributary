@@ -20,8 +20,8 @@ A final RMSNorm is applied after the last layer, before the decoder heads:
 h_final = RMSNorm(x)                        # [B, S, D]
 ```
 
-Each attention sublayer internally performs: permute → QK-normed multi-head attention → unpermute.
-See [attention.md](attention.md) for mask derivation and permutation details.
+Each attention sublayer internally performs: QK-normed multi-head attention over the provided dense `[B, S, S]` mask.
+See [attention.md](attention.md) for sparse tile transport and mask decode details.
 
 ## SDPA Output Gating
 
@@ -30,7 +30,7 @@ the SDPA output before the residual connection:
 
 ```
 def GatedAttention(sdpa_fn, x_norm, W_gate):
-    attn_out = sdpa_fn(x_norm)               # permute → block-sparse MHA → unpermute → W_O
+    attn_out = sdpa_fn(x_norm)               # masked MHA → W_O
     gate = sigmoid(x_norm @ W_gate)          # [B, S, D]
     return attn_out * gate                   # elementwise modulation before residual add
 ```
@@ -39,8 +39,8 @@ The gate operates **outside** the block-sparse attention kernel:
 
 ```
 ┌──────────────────────────────────────┐
-│  Block-sparse SDPA kernel            │
-│  permute → Q,K,V → attn → W_O       │
+│  Masked SDPA kernel                  │
+│  Q,K,V → attn(masked) → W_O          │
 └──────────────────┬───────────────────┘
                    │ attn_out [B, S, D]
                    ▼

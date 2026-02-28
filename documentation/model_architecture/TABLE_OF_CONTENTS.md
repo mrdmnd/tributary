@@ -8,7 +8,7 @@ These documents specify the model architecture, training configuration, and batc
 | Document | Contents |
 |----------|----------|
 | [batch_structure.md](batch_structure.md) | `TrainingBatch` layout: dimensions, index spaces, all tensor definitions, GPU-resident tables, text embedding remapping |
-| [attention.md](attention.md) | Three attention patterns (outbound, inbound, column), FK adjacency matrix, mask derivation, block-sparse permutations |
+| [attention.md](attention.md) | Three attention patterns (outbound, inbound, column), CSR mask transport, and dense decode path |
 | [value_encoding.md](value_encoding.md) | Column-name encoder, per-type value encoders, null gating, target masking, combination into h₀ |
 | [decoder_heads_and_loss.md](decoder_heads_and_loss.md) | Decoder head inventory, loss computation (null + type-specific), inference output |
 | [transformer_blocks.md](transformer_blocks.md) | Pre-norm block structure, SDPA output gating, SwiGLU FFN |

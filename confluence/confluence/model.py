@@ -190,62 +190,54 @@ class DecoderHeads(nn.Module):
         )
 
 
-def build_attention_masks(batch, max_rows):
-    """Build the three attention masks from batch tensors.
+def _csr_to_dense_mask(
+    row_ptr: jnp.ndarray,
+    seq_offsets: jnp.ndarray,
+    col_idx: jnp.ndarray,
+    s: int,
+) -> jnp.ndarray:
+    """Decode packed CSR payload into dense [B,S,S] bool."""
+    positions = jnp.arange(col_idx.shape[0], dtype=jnp.int32)
+    col_idx_i32 = col_idx.astype(jnp.int32)
 
-    Args:
-        batch: dict with seq_row_ids [B,S], fk_adj [B,R,R], is_padding [B,S].
-        max_rows: R dimension.
+    def decode_one(rp: jnp.ndarray, seq_start: jnp.ndarray, seq_end: jnp.ndarray) -> jnp.ndarray:
+        seq_start_i32 = seq_start.astype(jnp.int32)
+        seq_nnz = (seq_end - seq_start).astype(jnp.int32)
+        local_pos = positions - seq_start_i32
+        valid = (local_pos >= 0) & (local_pos < seq_nnz)
+        local_pos = jnp.where(valid, local_pos, 0)
+        row_ids = jnp.searchsorted(rp.astype(jnp.int32), local_pos, side="right") - 1
+        rows = jnp.where(valid, row_ids, 0)
+        cols = jnp.where(valid, col_idx_i32, 0)
+        dense = jnp.zeros((s, s), dtype=jnp.bool_)
+        return dense.at[rows, cols].set(valid)
 
-    Returns:
-        outbound_mask, inbound_mask, column_mask: each [B, S, S] bool.
-    """
-    seq_row_ids = batch["seq_row_ids"].astype(jnp.int32)  # [B, S]
-    fk_adj = batch["fk_adj"].astype(jnp.bool_)  # [B, R, R]
-    is_padding = batch["is_padding"].astype(jnp.bool_)  # [B, S]
-    column_ids = batch["column_ids"]  # [B, S]
-    b, s = seq_row_ids.shape
+    return jax.vmap(decode_one)(row_ptr, seq_offsets[:-1], seq_offsets[1:])
 
-    # Row indices for mask expansion
-    ri = seq_row_ids[:, :, None]  # [B, S, 1]
-    rj = seq_row_ids[:, None, :]  # [B, 1, S]
 
-    # Gather fk_adj[b, ri, rj] for all (i, j) pairs
-    # fk_adj_ij[b, i, j] = fk_adj[b, ri, rj]
-    ri_flat = ri.reshape(b, s, 1).astype(jnp.int32)
-    rj_flat = rj.reshape(b, 1, s).astype(jnp.int32)
-
-    # Index into fk_adj: use advanced indexing
-    batch_idx = jnp.arange(b)[:, None, None]
-    ri_broadcast = jnp.broadcast_to(ri_flat, (b, s, s))
-    rj_broadcast = jnp.broadcast_to(rj_flat, (b, s, s))
-    fk_ij = fk_adj[batch_idx, ri_broadcast, rj_broadcast]  # [B, S, S]
-
-    # Same row mask
-    same_row = ri == rj  # [B, S, S]
-
-    # Outbound mask: same_row OR fk_adj[ri, rj]
-    outbound_mask = same_row | fk_ij
-
-    # Inbound mask: fk_adj[rj, ri] (transposed)
-    fk_ji = fk_adj[batch_idx, rj_broadcast, ri_broadcast]  # [B, S, S]
-    inbound_mask = fk_ji
-
-    # Column mask: same column
-    col_i = column_ids[:, :, None]  # [B, S, 1]
-    col_j = column_ids[:, None, :]  # [B, 1, S]
-    column_mask = col_i == col_j
-
-    # Exclude padding from all masks
-    not_padding_i = ~is_padding[:, :, None]  # [B, S, 1]
-    not_padding_j = ~is_padding[:, None, :]  # [B, 1, S]
-    valid_mask = not_padding_i & not_padding_j
-
-    outbound_mask = outbound_mask & valid_mask
-    inbound_mask = inbound_mask & valid_mask
-    column_mask = column_mask & valid_mask
-
-    return outbound_mask, inbound_mask, column_mask
+def build_attention_masks(batch):
+    """Build dense masks from CSR transport."""
+    s = int(batch["seq_row_ids"].shape[1])
+    return (
+        _csr_to_dense_mask(
+            batch["outbound_csr_row_ptr"],
+            batch["outbound_csr_seq_offsets"],
+            batch["outbound_csr_col_idx"],
+            s,
+        ),
+        _csr_to_dense_mask(
+            batch["inbound_csr_row_ptr"],
+            batch["inbound_csr_seq_offsets"],
+            batch["inbound_csr_col_idx"],
+            s,
+        ),
+        _csr_to_dense_mask(
+            batch["column_csr_row_ptr"],
+            batch["column_csr_seq_offsets"],
+            batch["column_csr_col_idx"],
+            s,
+        ),
+    )
 
 
 class RelationalTransformer(nn.Module):
@@ -277,12 +269,7 @@ class RelationalTransformer(nn.Module):
         h = ValueEncoder(config=cfg, name="value_encoder")(batch, col_emb_table, cat_emb_table, text_batch_emb)
 
         # Build attention masks
-        outbound_mask, inbound_mask, column_mask = build_attention_masks(batch, cfg.max_rows)
-
-        # Get permutations from batch
-        out_perm = batch["out_perm"]  # [B, S]
-        in_perm = batch["in_perm"]  # [B, S]
-        col_perm = batch["col_perm"]  # [B, S]
+        outbound_mask, inbound_mask, column_mask = build_attention_masks(batch)
 
         # Transformer layers
         for i in range(cfg.n_layers):
@@ -291,9 +278,6 @@ class RelationalTransformer(nn.Module):
                 outbound_mask,
                 inbound_mask,
                 column_mask,
-                out_perm,
-                in_perm,
-                col_perm,
             )
 
         # Final RMSNorm

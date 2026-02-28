@@ -187,7 +187,7 @@ Each of the B seeds is processed independently on a rayon worker thread:
 3. BFS from the seed row over FK edges, respecting the temporal cutoff and sequence length budget
    L (see `sampling.md`).
 4. Linearize visited cells into a flat sequence. Build the per-sequence `HashMap<RowIdx, u16>`
-   for row remapping, the `fk_adj` adjacency slice, and the attention permutations.
+   for row remapping and dense attention masks.
 5. Write cell values into pre-allocated per-sequence buffers. Text cells temporarily store
    global `TextEmbeddingIdx` values.
 
@@ -291,15 +291,12 @@ sampler.shutdown()  # drain channels, join threads, drop mmaps
 | `is_null` | `[B, S]` | `u8` | `uint8` | 0/1 |
 | `is_target` | `[B, S]` | `u8` | `uint8` | 0/1 |
 | `is_padding` | `[B, S]` | `u8` | `uint8` | 0/1 |
-| `fk_adj` | `[B, R, R]` | `u8` | `uint8` | Boolean adjacency |
-| `col_perm` | `[B, S]` | `u16` | `uint16` | Attention permutation |
-| `out_perm` | `[B, S]` | `u16` | `uint16` | Attention permutation |
-| `in_perm` | `[B, S]` | `u16` | `uint16` | Attention permutation |
+| `outbound_mask` | `[B, S, S]` | `u8` | `uint8` | Dense outbound attention mask (0/1) |
+| `inbound_mask` | `[B, S, S]` | `u8` | `uint8` | Dense inbound attention mask (0/1) |
+| `column_mask` | `[B, S, S]` | `u8` | `uint8` | Dense column attention mask (0/1) |
 | `text_batch_embeddings` | `[U, D_t]` | `f16` | `float16` | Per-batch text subset |
 | `target_stype` | `[1]` | `u8` | `uint8` | Batch is homogeneous |
 | `task_idx` | `[1]` | `u32` | `uint32` | For stats / logging |
-| `cat_emb_start` | `[1]` | `u32` | `uint32` | Offset into categorical table |
-| `cat_emb_count` | `[1]` | `u32` | `uint32` | K for the target column |
 
 **Dtype rationale**: Rust produces `f32` for numeric/timestamp values and `u8` for booleans /
 masks. The bf16 cast happens on-device during the JAX forward pass — this avoids bf16 rounding
@@ -458,6 +455,7 @@ def run_validation(sampler, model, params, col_emb_table, cat_emb_table,
     total_loss = 0.0
     for _ in range(num_val_steps):
         np_batch = sampler.next_val_batch()
+        decode_attention_masks_inplace(np_batch)
         device_batch = jax.device_put(np_batch, device)
         loss = eval_step(params, device_batch, col_emb_table, cat_emb_table)
         total_loss += float(loss)

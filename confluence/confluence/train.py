@@ -5,19 +5,18 @@ Uses the headwater Rust sampler for efficient batch generation.
 """
 
 import argparse
-import time
 import logging
+import time
+from functools import partial
 
+import headwater
 import jax
 import jax.numpy as jnp
 import numpy as np
-import flax.linen as nn
-
-import headwater
 
 from confluence.config import ModelConfig, TrainingConfig
-from confluence.model import RelationalTransformer
 from confluence.loss import compute_loss
+from confluence.model import RelationalTransformer
 from confluence.optimizer import create_optimizer
 
 logging.basicConfig(
@@ -35,12 +34,22 @@ def numpy_batch_to_jax(np_batch, device):
     return jax_batch
 
 
+def numpy_batch_to_pmap(np_batch):
+    """Convert a numpy batch dict to pmap-ready arrays (leading local-device axis)."""
+    jax_batch = {}
+    for k, v in np_batch.items():
+        jax_batch[k] = jnp.expand_dims(jnp.array(v), axis=0)
+    return jax_batch
+
+
 def create_dummy_batch(config: ModelConfig, training_config: TrainingConfig):
     """Create a dummy batch for model initialization."""
     b = training_config.batch_size
     s = training_config.sequence_length
-    r = config.max_rows
     d_t = config.d_text
+    row_ptr = np.zeros((b, s + 1), dtype=np.uint32)
+    seq_offsets = np.zeros((b + 1,), dtype=np.uint32)
+    col_idx = np.zeros((0,), dtype=np.uint16)
 
     return {
         "semantic_types": np.zeros((b, s), dtype=np.int8),
@@ -54,10 +63,16 @@ def create_dummy_batch(config: ModelConfig, training_config: TrainingConfig):
         "is_null": np.zeros((b, s), dtype=np.uint8),
         "is_target": np.zeros((b, s), dtype=np.uint8),
         "is_padding": np.ones((b, s), dtype=np.uint8),
-        "fk_adj": np.zeros((b, r, r), dtype=np.uint8),
-        "col_perm": np.arange(s, dtype=np.uint16)[None, :].repeat(b, axis=0),
-        "out_perm": np.arange(s, dtype=np.uint16)[None, :].repeat(b, axis=0),
-        "in_perm": np.arange(s, dtype=np.uint16)[None, :].repeat(b, axis=0),
+        "mask_format": np.array([1], dtype=np.uint8),
+        "outbound_csr_row_ptr": row_ptr.copy(),
+        "outbound_csr_seq_offsets": seq_offsets.copy(),
+        "outbound_csr_col_idx": col_idx.copy(),
+        "inbound_csr_row_ptr": row_ptr.copy(),
+        "inbound_csr_seq_offsets": seq_offsets.copy(),
+        "inbound_csr_col_idx": col_idx.copy(),
+        "column_csr_row_ptr": row_ptr.copy(),
+        "column_csr_seq_offsets": seq_offsets.copy(),
+        "column_csr_col_idx": col_idx.copy(),
         "text_batch_embeddings": np.zeros((1, d_t), dtype=np.uint16),
         "target_stype": np.array([1], dtype=np.uint8),
         "task_idx": np.array([0], dtype=np.uint32),
@@ -125,9 +140,16 @@ def main():
 
     rank = jax.process_index()
     world_size = jax.process_count()
-    device = jax.local_devices()[0]
+    local_devices = jax.local_devices()
+    local_device_count = len(local_devices)
+    device = local_devices[0]
 
     logger.info(f"Process {rank}/{world_size} using device: {device}")
+    if world_size > 1 and local_device_count != 1:
+        raise RuntimeError(
+            "This training loop currently expects one process per GPU "
+            "(local_device_count must be 1 when world_size > 1)."
+        )
 
     # --- Configuration ---
     model_config = ModelConfig(
@@ -194,29 +216,49 @@ def main():
     opt_state = optimizer.init(params)
     logger.info("Optimizer initialized.")
 
-    # --- JIT-compiled Training Step ---
+    # --- JIT-compiled single-process Training Step ---
     @jax.jit
-    def train_step(params, opt_state, batch, col_emb, cat_emb):
+    def train_step_single(params, opt_state, batch, col_emb, cat_emb):
         def loss_fn(params):
             output = model.apply(params, batch, col_emb, cat_emb)
             cat_enc_fn = make_categorical_encoder_fn(params, model)
-            loss = compute_loss(
+            return compute_loss(
                 output, batch, cat_emb, cat_enc_fn,
                 z_loss_weight=training_config.z_loss_weight,
             )
-            return loss
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
-
-        # Allreduce gradients and loss across DDP ranks
-        if world_size > 1:
-            grads = jax.lax.pmean(grads, axis_name="devices")
-            loss = jax.lax.pmean(loss, axis_name="devices")
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax_apply_updates(params, updates)
 
         return new_params, new_opt_state, loss
+
+    # --- PMAP training step for one-process-per-GPU distributed runs ---
+    @partial(jax.pmap, axis_name="devices")
+    def train_step_pmapped(params, opt_state, batch, col_emb, cat_emb):
+        def loss_fn(params):
+            output = model.apply(params, batch, col_emb, cat_emb)
+            cat_enc_fn = make_categorical_encoder_fn(params, model)
+            return compute_loss(
+                output, batch, cat_emb, cat_enc_fn,
+                z_loss_weight=training_config.z_loss_weight,
+            )
+
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        grads = jax.lax.pmean(grads, axis_name="devices")
+        loss = jax.lax.pmean(loss, axis_name="devices")
+
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax_apply_updates(params, updates)
+
+        return new_params, new_opt_state, loss
+
+    if world_size > 1:
+        params = jax.device_put_replicated(params, local_devices)
+        opt_state = jax.device_put_replicated(opt_state, local_devices)
+        col_emb_table = jax.device_put_replicated(col_emb_table, local_devices)
+        cat_emb_table = jax.device_put_replicated(cat_emb_table, local_devices)
 
     # --- Training Loop ---
     logger.info(f"Starting training for {args.num_steps} steps...")
@@ -227,15 +269,19 @@ def main():
 
         # Pull batch from Rust sampler (GIL released during wait)
         np_batch = sampler.next_train_batch()
-        batch = numpy_batch_to_jax(np_batch, device)
-
-        # Dispatch training step (async on GPU)
-        params, opt_state, loss = train_step(
-            params, opt_state, batch, col_emb_table, cat_emb_table
-        )
-
-        # Block on loss for logging (forces sync)
-        loss_val = float(loss)
+        if world_size > 1:
+            batch = numpy_batch_to_pmap(np_batch)
+            params, opt_state, loss = train_step_pmapped(
+                params, opt_state, batch, col_emb_table, cat_emb_table
+            )
+            loss_val = float(jax.device_get(loss)[0])
+        else:
+            batch = numpy_batch_to_jax(np_batch, device)
+            params, opt_state, loss = train_step_single(
+                params, opt_state, batch, col_emb_table, cat_emb_table
+            )
+            # Block on loss for logging (forces sync)
+            loss_val = float(loss)
         dt = time.perf_counter() - t0
         step_times.append(dt)
 
@@ -248,16 +294,30 @@ def main():
 
         # Periodic validation
         if step > 0 and step % args.eval_interval == 0:
+            eval_params = params
+            eval_col_emb = col_emb_table
+            eval_cat_emb = cat_emb_table
+            if world_size > 1:
+                eval_params = jax.tree.map(lambda x: x[0], params)
+                eval_col_emb = col_emb_table[0]
+                eval_cat_emb = cat_emb_table[0]
             val_loss = run_validation(
-                sampler, model, params, col_emb_table, cat_emb_table,
+                sampler, model, eval_params, eval_col_emb, eval_cat_emb,
                 device, args.num_val_steps,
             )
             logger.info(f"  val_loss: {val_loss:.4f}")
 
     # --- Final Validation ---
     logger.info("Running final validation...")
+    eval_params = params
+    eval_col_emb = col_emb_table
+    eval_cat_emb = cat_emb_table
+    if world_size > 1:
+        eval_params = jax.tree.map(lambda x: x[0], params)
+        eval_col_emb = col_emb_table[0]
+        eval_cat_emb = cat_emb_table[0]
     val_loss = run_validation(
-        sampler, model, params, col_emb_table, cat_emb_table,
+        sampler, model, eval_params, eval_col_emb, eval_cat_emb,
         device, training_config.num_val_steps,
     )
     logger.info(f"Final val_loss: {val_loss:.4f}")

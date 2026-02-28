@@ -1,25 +1,221 @@
 //! BFS-based relational database sampler for training batch construction.
 //!
 //! The sampler walks FK edges outward from task seed rows, collects cells into
-//! sequences, and packs them into dense batches for the relational transformer.
+//! sequences, and packs them into batches for the relational transformer.
+//! Attention masks are built per sequence and shipped as packed CSR (row_ptr,
+//! seq_offsets, col_idx); the model decodes them to dense bool masks.
 //!
 //! See `documentation/sampling.md` and `documentation/system_architecture.md`
 //! for the full design.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
-use crossbeam::channel::{self, Receiver, Sender};
+use crossbeam::channel::{self, Receiver, Sender, TryRecvError, TrySendError};
 use half::f16;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use tracing::{debug, info, warn};
 
-use crate::common::{Database, RowIdx, SemanticType, TIMESTAMP_DIM, TaskIdx};
+use crate::common::{ColumnSlice, Database, RowIdx, SemanticType, TIMESTAMP_DIM, TaskIdx};
 use crate::embedder::EMBEDDING_DIM;
+
+static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+static PROFILE_BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SEQUENCE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_BATCH_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_BATCH_PHASE1_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_BATCH_TEXT_DEDUP_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_BATCH_TEXT_GATHER_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_BATCH_COLLATE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SEQUENCE_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_ENCODE_MASK_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_FRONTIER_POP_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_VISITED_CHECK_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_ROW_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_OUT_NEIGHBOR_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_IN_NEIGHBOR_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_TEMPORAL_FILTER_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_CHILD_SUBSAMPLE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_ROWS_VISITED: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_ROWS_SKIPPED_VISITED: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_OUT_NEIGHBOR_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_IN_NEIGHBOR_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_TEMPORAL_CHECK_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_TEMPORAL_REJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_PARENT_PUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PHASE1_CHILD_PUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PRODUCED_TRAIN_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PRODUCED_VAL_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_CONSUMED_TRAIN_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_CONSUMED_VAL_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PRODUCER_BLOCKED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PRODUCER_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_CONSUMER_BLOCKED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_CONSUMER_BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Word size in bits for position bitsets (used in CSR mask encoding).
+const BITSET_WORD_BITS: usize = u64::BITS as usize;
+
+/// True when `HEADWATER_PROFILE=1`; enables per-phase timing and profile logs.
+fn profile_enabled() -> bool {
+    *PROFILE_ENABLED.get_or_init(|| {
+        std::env::var("HEADWATER_PROFILE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn add_elapsed_ns(counter: &AtomicU64, start: Option<Instant>) {
+    if let Some(t0) = start {
+        counter.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// True if the bit for the given row is set in the packed validity bitmap.
+#[inline]
+fn validity_bit_is_set(validity: &[u8], row_byte: usize, row_bit_mask: u8) -> bool {
+    (validity[row_byte] & row_bit_mask) != 0
+}
+
+/// Set one bit in a position bitset (used for CSR mask construction).
+#[inline]
+fn bitset_set(bits: &mut [u64], idx: usize) {
+    let word = idx / BITSET_WORD_BITS;
+    let bit = idx % BITSET_WORD_BITS;
+    bits[word] |= 1u64 << bit;
+}
+
+/// OR `src` into `dst` in place; both must have the same length.
+#[inline]
+fn bitset_or_inplace(dst: &mut [u64], src: &[u64]) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d |= *s;
+    }
+}
+
+/// Append sequence positions (0..S) corresponding to set bits, in ascending order.
+#[inline]
+fn bitset_extend_sorted_indices(bits: &[u64], out: &mut Vec<u16>) {
+    for (word_idx, &word) in bits.iter().enumerate() {
+        let mut w = word;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            let idx = word_idx * BITSET_WORD_BITS + tz;
+            out.push(idx as u16);
+            w &= w - 1;
+        }
+    }
+}
+
+/// Copy one row's timestamp encoding (length `TIMESTAMP_DIM`) into the batch slot at position `pos`.
+#[inline]
+fn copy_timestamp_values(dst: &mut [f32], pos: usize, ts: &[f32]) {
+    let start = pos * TIMESTAMP_DIM;
+    dst[start..start + TIMESTAMP_DIM].copy_from_slice(ts);
+}
+
+fn log_profile_report() {
+    let batches = PROFILE_BATCH_COUNT.load(Ordering::Relaxed);
+    let seqs = PROFILE_SEQUENCE_COUNT.load(Ordering::Relaxed);
+    if batches == 0 && seqs == 0 {
+        return;
+    }
+
+    let batch_total_ns = PROFILE_BATCH_TOTAL_NS.load(Ordering::Relaxed);
+    let phase1_ns = PROFILE_BATCH_PHASE1_NS.load(Ordering::Relaxed);
+    let text_dedup_ns = PROFILE_BATCH_TEXT_DEDUP_NS.load(Ordering::Relaxed);
+    let text_gather_ns = PROFILE_BATCH_TEXT_GATHER_NS.load(Ordering::Relaxed);
+    let collate_ns = PROFILE_BATCH_COLLATE_NS.load(Ordering::Relaxed);
+    let seq_total_ns = PROFILE_SEQUENCE_TOTAL_NS.load(Ordering::Relaxed);
+    let encode_mask_ns = PROFILE_ENCODE_MASK_NS.load(Ordering::Relaxed);
+    let phase1_frontier_pop_ns = PROFILE_PHASE1_FRONTIER_POP_NS.load(Ordering::Relaxed);
+    let phase1_visited_check_ns = PROFILE_PHASE1_VISITED_CHECK_NS.load(Ordering::Relaxed);
+    let phase1_row_materialize_ns = PROFILE_PHASE1_ROW_MATERIALIZE_NS.load(Ordering::Relaxed);
+    let phase1_out_neighbor_ns = PROFILE_PHASE1_OUT_NEIGHBOR_NS.load(Ordering::Relaxed);
+    let phase1_in_neighbor_ns = PROFILE_PHASE1_IN_NEIGHBOR_NS.load(Ordering::Relaxed);
+    let phase1_temporal_filter_ns = PROFILE_PHASE1_TEMPORAL_FILTER_NS.load(Ordering::Relaxed);
+    let phase1_child_subsample_ns = PROFILE_PHASE1_CHILD_SUBSAMPLE_NS.load(Ordering::Relaxed);
+    let phase1_rows_visited = PROFILE_PHASE1_ROWS_VISITED.load(Ordering::Relaxed);
+    let phase1_rows_skipped_visited = PROFILE_PHASE1_ROWS_SKIPPED_VISITED.load(Ordering::Relaxed);
+    let phase1_out_neighbor_count = PROFILE_PHASE1_OUT_NEIGHBOR_COUNT.load(Ordering::Relaxed);
+    let phase1_in_neighbor_count = PROFILE_PHASE1_IN_NEIGHBOR_COUNT.load(Ordering::Relaxed);
+    let phase1_temporal_check_count = PROFILE_PHASE1_TEMPORAL_CHECK_COUNT.load(Ordering::Relaxed);
+    let phase1_temporal_reject_count = PROFILE_PHASE1_TEMPORAL_REJECT_COUNT.load(Ordering::Relaxed);
+    let phase1_parent_push_count = PROFILE_PHASE1_PARENT_PUSH_COUNT.load(Ordering::Relaxed);
+    let phase1_child_push_count = PROFILE_PHASE1_CHILD_PUSH_COUNT.load(Ordering::Relaxed);
+    let produced_train = PROFILE_PRODUCED_TRAIN_COUNT.load(Ordering::Relaxed);
+    let produced_val = PROFILE_PRODUCED_VAL_COUNT.load(Ordering::Relaxed);
+    let consumed_train = PROFILE_CONSUMED_TRAIN_COUNT.load(Ordering::Relaxed);
+    let consumed_val = PROFILE_CONSUMED_VAL_COUNT.load(Ordering::Relaxed);
+    let producer_blocked_count = PROFILE_PRODUCER_BLOCKED_COUNT.load(Ordering::Relaxed);
+    let producer_blocked_ns = PROFILE_PRODUCER_BLOCKED_NS.load(Ordering::Relaxed);
+    let consumer_blocked_count = PROFILE_CONSUMER_BLOCKED_COUNT.load(Ordering::Relaxed);
+    let consumer_blocked_ns = PROFILE_CONSUMER_BLOCKED_NS.load(Ordering::Relaxed);
+
+    let batch_denom = (batches as f64).max(1.0);
+    let seq_denom = (seqs as f64).max(1.0);
+    info!(
+        "Sampler profile: batches={}, sequences={}, batch_avg_ms={:.3}, phase1_ms={:.3}, text_dedup_ms={:.3}, text_gather_ms={:.3}, collate_ms={:.3}, sequence_avg_ms={:.3}, encode_mask_ms={:.3}",
+        batches,
+        seqs,
+        batch_total_ns as f64 / batch_denom / 1e6,
+        phase1_ns as f64 / batch_denom / 1e6,
+        text_dedup_ns as f64 / batch_denom / 1e6,
+        text_gather_ns as f64 / batch_denom / 1e6,
+        collate_ns as f64 / batch_denom / 1e6,
+        seq_total_ns as f64 / seq_denom / 1e6,
+        encode_mask_ns as f64 / seq_denom / 1e6,
+    );
+    info!(
+        "Sampler phase1 detail: frontier_pop_ms={:.3}, visited_check_ms={:.3}, row_materialize_ms={:.3}, out_neighbor_ms={:.3}, in_neighbor_ms={:.3}, temporal_filter_ms={:.3}, child_subsample_ms={:.3}, rows_visited_avg={:.2}, rows_skipped_avg={:.2}, out_neighbors_avg={:.2}, in_neighbors_avg={:.2}, temporal_checks_avg={:.2}, temporal_reject_rate={:.3}, parent_push_avg={:.2}, child_push_avg={:.2}",
+        phase1_frontier_pop_ns as f64 / seq_denom / 1e6,
+        phase1_visited_check_ns as f64 / seq_denom / 1e6,
+        phase1_row_materialize_ns as f64 / seq_denom / 1e6,
+        phase1_out_neighbor_ns as f64 / seq_denom / 1e6,
+        phase1_in_neighbor_ns as f64 / seq_denom / 1e6,
+        phase1_temporal_filter_ns as f64 / seq_denom / 1e6,
+        phase1_child_subsample_ns as f64 / seq_denom / 1e6,
+        phase1_rows_visited as f64 / seq_denom,
+        phase1_rows_skipped_visited as f64 / seq_denom,
+        phase1_out_neighbor_count as f64 / seq_denom,
+        phase1_in_neighbor_count as f64 / seq_denom,
+        phase1_temporal_check_count as f64 / seq_denom,
+        if phase1_temporal_check_count > 0 {
+            phase1_temporal_reject_count as f64 / phase1_temporal_check_count as f64
+        } else {
+            0.0
+        },
+        phase1_parent_push_count as f64 / seq_denom,
+        phase1_child_push_count as f64 / seq_denom,
+    );
+    info!(
+        "Sampler queue profile: produced_train={}, consumed_train={}, produced_val={}, consumed_val={}, producer_blocked_events={}, producer_blocked_avg_ms={:.3}, consumer_blocked_events={}, consumer_blocked_avg_ms={:.3}",
+        produced_train,
+        consumed_train,
+        produced_val,
+        consumed_val,
+        producer_blocked_count,
+        if producer_blocked_count > 0 {
+            producer_blocked_ns as f64 / producer_blocked_count as f64 / 1e6
+        } else {
+            0.0
+        },
+        consumer_blocked_count,
+        if consumer_blocked_count > 0 {
+            consumer_blocked_ns as f64 / consumer_blocked_count as f64 / 1e6
+        } else {
+            0.0
+        },
+    );
+}
 
 // ============================================================================
 // Configuration
@@ -48,12 +244,6 @@ pub struct SamplerConfig {
     pub sequence_length: u32,
     /// Max children sampled per P->F edge during BFS.
     pub bfs_child_width: u32,
-    /// Max distinct rows per sequence (R dimension for fk_adj).
-    pub max_rows_per_seq: u32,
-    /// Tile size used by permutation optimizer and sparsity reporting.
-    pub perm_tile_size: u32,
-    /// Log tile sparsity stats every N batches (0 disables).
-    pub perm_stats_every: u32,
 }
 
 impl Default for SamplerConfig {
@@ -69,9 +259,6 @@ impl Default for SamplerConfig {
             batch_size: 32,
             sequence_length: 1024,
             bfs_child_width: 16,
-            max_rows_per_seq: 200,
-            perm_tile_size: 32,
-            perm_stats_every: 100,
         }
     }
 }
@@ -87,7 +274,7 @@ pub enum Split {
     Test,
 }
 
-/// Deterministic hash-based split assignment.
+/// Deterministic hash-based train/val/test assignment per (task, anchor_row, split_seed).
 fn assign_split(
     task_idx: u32,
     anchor_row: u32,
@@ -125,6 +312,9 @@ struct SeedManager {
     /// For each task, the seed indices assigned to this rank for test split.
     #[allow(dead_code)]
     test_seeds: Vec<Vec<usize>>,
+    train_tasks_with_seeds: Vec<usize>,
+    val_tasks_with_seeds: Vec<usize>,
+    test_tasks_with_seeds: Vec<usize>,
 }
 
 impl SeedManager {
@@ -200,10 +390,32 @@ impl SeedManager {
                 .join(", "),
         );
 
+        let train_tasks_with_seeds = train_seeds
+            .iter()
+            .enumerate()
+            .filter(|(_, seeds)| !seeds.is_empty())
+            .map(|(ti, _)| ti)
+            .collect();
+        let val_tasks_with_seeds = val_seeds
+            .iter()
+            .enumerate()
+            .filter(|(_, seeds)| !seeds.is_empty())
+            .map(|(ti, _)| ti)
+            .collect();
+        let test_tasks_with_seeds = test_seeds
+            .iter()
+            .enumerate()
+            .filter(|(_, seeds)| !seeds.is_empty())
+            .map(|(ti, _)| ti)
+            .collect();
+
         Self {
             train_seeds,
             val_seeds,
             test_seeds,
+            train_tasks_with_seeds,
+            val_tasks_with_seeds,
+            test_tasks_with_seeds,
         }
     }
 
@@ -212,6 +424,14 @@ impl SeedManager {
             Split::Train => &self.train_seeds,
             Split::Val => &self.val_seeds,
             Split::Test => &self.test_seeds,
+        }
+    }
+
+    fn tasks_with_seeds(&self, split: Split) -> &[usize] {
+        match split {
+            Split::Train => &self.train_tasks_with_seeds,
+            Split::Val => &self.val_tasks_with_seeds,
+            Split::Test => &self.test_tasks_with_seeds,
         }
     }
 
@@ -227,166 +447,408 @@ impl SeedManager {
 
 /// A complete batch of B sequences, ready for transfer to Python/GPU.
 ///
-/// All tensors are flat `Vec<T>` with shapes documented per field.
-/// The Python binding converts these to NumPy arrays via zero-copy.
+/// All tensors are flat `Vec<T>`; shapes are `[B, S]`, `[B, S, TIMESTAMP_DIM]`, or
+/// packed CSR. The Python binding converts these to NumPy arrays via zero-copy.
 pub struct RawBatch {
     pub batch_size: usize,
     pub sequence_length: usize,
+    /// Max distinct rows in any one sequence in this batch (R dimension).
     pub max_rows: usize,
 
-    // Cell identity: [B, S]
+    // --- Cell identity [B, S] ---
     pub semantic_types: Vec<i8>,
     pub column_ids: Vec<i32>,
     pub seq_row_ids: Vec<u16>,
 
-    // Per-type values: [B, S] or [B, S, 15]
+    // --- Per-type values [B, S] or [B, S, TIMESTAMP_DIM] ---
     pub numeric_values: Vec<f32>,
-    pub timestamp_values: Vec<f32>, // [B, S, 15]
+    pub timestamp_values: Vec<f32>,
     pub bool_values: Vec<u8>,
     pub categorical_embed_ids: Vec<u32>,
     pub text_embed_ids: Vec<u32>,
 
-    // Masks: [B, S]
+    // --- Validity and masking [B, S] ---
     pub is_null: Vec<u8>,
     pub is_target: Vec<u8>,
     pub is_padding: Vec<u8>,
 
-    // Adjacency: [B, R, R]
-    pub fk_adj: Vec<u8>,
+    // --- Attention masks (CSR transport) ---
+    /// Always 1 (CSR). Row ptrs [B, S+1]; seq_offsets [B+1]; col_idx packed.
+    pub mask_format: u8,
+    pub outbound_csr_row_ptr: Vec<u32>,
+    pub outbound_csr_seq_offsets: Vec<u32>,
+    pub outbound_csr_col_idx: Vec<u16>,
+    pub inbound_csr_row_ptr: Vec<u32>,
+    pub inbound_csr_seq_offsets: Vec<u32>,
+    pub inbound_csr_col_idx: Vec<u16>,
+    pub column_csr_row_ptr: Vec<u32>,
+    pub column_csr_seq_offsets: Vec<u32>,
+    pub column_csr_col_idx: Vec<u16>,
 
-    // Permutations: [B, S]
-    pub col_perm: Vec<u16>,
-    pub out_perm: Vec<u16>,
-    pub in_perm: Vec<u16>,
-
-    // Text embeddings: [U, EMBEDDING_DIM]
+    // --- Text embeddings (per-batch subset) ---
+    /// [U, EMBEDDING_DIM] f16; U = num unique text ids in this batch.
     pub text_batch_embeddings: Vec<f16>,
     pub num_unique_texts: usize,
 
-    // Batch-level metadata
+    // --- Batch-level metadata ---
     pub target_stype: u8,
     pub task_idx: u32,
 }
 
-// ============================================================================
-// BFS Frontier
-// ============================================================================
-
-/// Priority tag for BFS frontier entries.
-/// F->P (parent) rows have higher priority than P->F (child) rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrontierPriority {
-    /// Reached via F->P edge (parent). Always explored first.
-    Parent,
-    /// Reached via P->F edge (child). Explored after all parents.
-    Child,
+/// Per-batch buffers filled during Phase 1; converted into `RawBatch` by `into_raw_batch`.
+struct BatchBuffers {
+    semantic_types: Vec<i8>,
+    column_ids: Vec<i32>,
+    seq_row_ids: Vec<u16>,
+    numeric_values: Vec<f32>,
+    timestamp_values: Vec<f32>,
+    bool_values: Vec<u8>,
+    categorical_embed_ids: Vec<u32>,
+    text_embed_ids: Vec<u32>,
+    is_null: Vec<u8>,
+    is_target: Vec<u8>,
+    is_padding: Vec<u8>,
 }
 
-struct FrontierEntry {
-    row: RowIdx,
-    priority: FrontierPriority,
-    #[allow(dead_code)]
-    hops: u32,
+/// Per-sequence CSR attention masks (outbound, inbound, column) before packing into batch-wide arrays.
+#[derive(Default)]
+struct SequenceCsrMasks {
+    outbound_row_ptr: Vec<u32>,
+    outbound_col_idx: Vec<u16>,
+    inbound_row_ptr: Vec<u32>,
+    inbound_col_idx: Vec<u16>,
+    column_row_ptr: Vec<u32>,
+    column_col_idx: Vec<u16>,
+}
+
+impl SequenceCsrMasks {
+    fn clear(&mut self) {
+        self.outbound_row_ptr.clear();
+        self.outbound_col_idx.clear();
+        self.inbound_row_ptr.clear();
+        self.inbound_col_idx.clear();
+        self.column_row_ptr.clear();
+        self.column_col_idx.clear();
+    }
+}
+
+/// Mutable slices for one sequence's slot within `BatchBuffers` (one of B sequences).
+struct SequenceSlotMut<'a> {
+    semantic_types: &'a mut [i8],
+    column_ids: &'a mut [i32],
+    seq_row_ids: &'a mut [u16],
+    numeric_values: &'a mut [f32],
+    timestamp_values: &'a mut [f32],
+    bool_values: &'a mut [u8],
+    categorical_embed_ids: &'a mut [u32],
+    text_embed_ids: &'a mut [u32],
+    is_null: &'a mut [u8],
+    is_target: &'a mut [u8],
+    is_padding: &'a mut [u8],
+}
+
+impl BatchBuffers {
+    fn new(b: usize, s: usize) -> Self {
+        let total_cells = b * s;
+        let total_ts = b * s * TIMESTAMP_DIM;
+        Self {
+            semantic_types: vec![0i8; total_cells],
+            column_ids: vec![0i32; total_cells],
+            seq_row_ids: vec![0u16; total_cells],
+            numeric_values: vec![0.0f32; total_cells],
+            timestamp_values: vec![0.0f32; total_ts],
+            bool_values: vec![0u8; total_cells],
+            categorical_embed_ids: vec![0u32; total_cells],
+            text_embed_ids: vec![0u32; total_cells],
+            is_null: vec![0u8; total_cells],
+            is_target: vec![0u8; total_cells],
+            is_padding: vec![1u8; total_cells],
+        }
+    }
+
+    fn into_raw_batch(
+        self,
+        seq_csr_masks: &mut [SequenceCsrMasks],
+        b: usize,
+        s: usize,
+        max_rows: usize,
+        text_batch_embeddings: Vec<f16>,
+        num_unique_texts: usize,
+        target_stype: u8,
+        task_idx: u32,
+    ) -> RawBatch {
+        let mut outbound_csr_row_ptr = vec![0u32; b * (s + 1)];
+        let mut inbound_csr_row_ptr = vec![0u32; b * (s + 1)];
+        let mut column_csr_row_ptr = vec![0u32; b * (s + 1)];
+        let mut outbound_csr_seq_offsets = vec![0u32; b + 1];
+        let mut inbound_csr_seq_offsets = vec![0u32; b + 1];
+        let mut column_csr_seq_offsets = vec![0u32; b + 1];
+
+        for bi in 0..b {
+            outbound_csr_seq_offsets[bi + 1] =
+                outbound_csr_seq_offsets[bi] + seq_csr_masks[bi].outbound_col_idx.len() as u32;
+            inbound_csr_seq_offsets[bi + 1] =
+                inbound_csr_seq_offsets[bi] + seq_csr_masks[bi].inbound_col_idx.len() as u32;
+            column_csr_seq_offsets[bi + 1] =
+                column_csr_seq_offsets[bi] + seq_csr_masks[bi].column_col_idx.len() as u32;
+        }
+
+        let mut outbound_csr_col_idx = vec![0u16; outbound_csr_seq_offsets[b] as usize];
+        let mut inbound_csr_col_idx = vec![0u16; inbound_csr_seq_offsets[b] as usize];
+        let mut column_csr_col_idx = vec![0u16; column_csr_seq_offsets[b] as usize];
+
+        for (bi, seq) in seq_csr_masks.iter().enumerate() {
+            let row_off = bi * (s + 1);
+            let out_col_off = outbound_csr_seq_offsets[bi] as usize;
+            let in_col_off = inbound_csr_seq_offsets[bi] as usize;
+            let col_col_off = column_csr_seq_offsets[bi] as usize;
+            let out_nnz = seq.outbound_col_idx.len();
+            let in_nnz = seq.inbound_col_idx.len();
+            let col_nnz = seq.column_col_idx.len();
+            debug_assert_eq!(seq.outbound_row_ptr.len(), s + 1);
+            debug_assert_eq!(seq.inbound_row_ptr.len(), s + 1);
+            debug_assert_eq!(seq.column_row_ptr.len(), s + 1);
+            outbound_csr_row_ptr[row_off..row_off + (s + 1)].copy_from_slice(&seq.outbound_row_ptr);
+            inbound_csr_row_ptr[row_off..row_off + (s + 1)].copy_from_slice(&seq.inbound_row_ptr);
+            column_csr_row_ptr[row_off..row_off + (s + 1)].copy_from_slice(&seq.column_row_ptr);
+            outbound_csr_col_idx[out_col_off..out_col_off + out_nnz]
+                .copy_from_slice(&seq.outbound_col_idx);
+            inbound_csr_col_idx[in_col_off..in_col_off + in_nnz]
+                .copy_from_slice(&seq.inbound_col_idx);
+            column_csr_col_idx[col_col_off..col_col_off + col_nnz]
+                .copy_from_slice(&seq.column_col_idx);
+        }
+        for seq in seq_csr_masks.iter_mut() {
+            seq.clear();
+        }
+
+        RawBatch {
+            batch_size: b,
+            sequence_length: s,
+            max_rows,
+            semantic_types: self.semantic_types,
+            column_ids: self.column_ids,
+            seq_row_ids: self.seq_row_ids,
+            numeric_values: self.numeric_values,
+            timestamp_values: self.timestamp_values,
+            bool_values: self.bool_values,
+            categorical_embed_ids: self.categorical_embed_ids,
+            text_embed_ids: self.text_embed_ids,
+            is_null: self.is_null,
+            is_target: self.is_target,
+            is_padding: self.is_padding,
+            mask_format: 1,
+            outbound_csr_row_ptr,
+            outbound_csr_seq_offsets,
+            outbound_csr_col_idx,
+            inbound_csr_row_ptr,
+            inbound_csr_seq_offsets,
+            inbound_csr_col_idx,
+            column_csr_row_ptr,
+            column_csr_seq_offsets,
+            column_csr_col_idx,
+            text_batch_embeddings,
+            num_unique_texts,
+            target_stype,
+            task_idx,
+        }
+    }
+}
+
+/// Reused across batch builds: per-sequence CSR mask buffers, seed indices, and text dedup state.
+struct BatchBuildWorkspace {
+    seq_csr_masks: Vec<SequenceCsrMasks>,
+    seq_num_rows: Vec<usize>,
+    seed_indices: Vec<usize>,
+    thread_seeds: Vec<u64>,
+    text_global_to_local: FxHashMap<u32, u32>,
+    unique_text_indices: Vec<u32>,
+}
+
+impl BatchBuildWorkspace {
+    fn new(batch_size: usize) -> Self {
+        let mut seq_csr_masks = Vec::with_capacity(batch_size);
+        seq_csr_masks.resize_with(batch_size, SequenceCsrMasks::default);
+        Self {
+            seq_csr_masks,
+            seq_num_rows: vec![0usize; batch_size],
+            seed_indices: Vec::with_capacity(batch_size),
+            thread_seeds: Vec::with_capacity(batch_size),
+            text_global_to_local: FxHashMap::default(),
+            unique_text_indices: Vec::new(),
+        }
+    }
+
+    fn reset_for_batch(&mut self, batch_size: usize) {
+        if self.seq_csr_masks.len() != batch_size {
+            self.seq_csr_masks
+                .resize_with(batch_size, SequenceCsrMasks::default);
+        }
+        for seq in &mut self.seq_csr_masks {
+            seq.clear();
+        }
+        self.seq_num_rows.resize(batch_size, 0);
+        self.seq_num_rows.fill(0);
+        self.seed_indices.clear();
+        self.thread_seeds.clear();
+        self.text_global_to_local.clear();
+        self.unique_text_indices.clear();
+    }
+}
+
+/// Per-thread scratch for building one sequence: BFS state, row adjacency, and bitsets for CSR mask encoding.
+#[derive(Default)]
+struct SequenceScratch {
+    row_map: FxHashMap<RowIdx, u16>,
+    parent_frontier: VecDeque<RowIdx>,
+    child_frontier: VecDeque<RowIdx>,
+    eligible_children: Vec<RowIdx>,
+    active_positions: Vec<usize>,
+    /// For each row index ri, bitset of sequence positions (0..S) in that row; used for CSR mask OR.
+    row_position_bits: Vec<Vec<u64>>,
+    out_neighbors: Vec<Vec<usize>>,
+    in_neighbors: Vec<Vec<usize>>,
+    col_pairs: Vec<(i32, usize)>,
+    tmp_bits: Vec<u64>,
+    col_group_start: Vec<usize>,
+    col_group_end: Vec<usize>,
 }
 
 // ============================================================================
 // Per-Sequence Builder
 // ============================================================================
 
-/// Intermediate result of BFS + linearization for a single sequence.
-#[allow(dead_code)]
-struct SequenceData {
-    num_cells: usize,
+/// Per-sequence summary stats written during slot construction.
+struct SequenceStats {
     num_rows: usize,
-
-    // [S] arrays
-    semantic_types: Vec<i8>,
-    column_ids: Vec<i32>,
-    seq_row_ids: Vec<u16>,
-    numeric_values: Vec<f32>,
-    timestamp_values: Vec<f32>, // [S * 15]
-    bool_values: Vec<u8>,
-    categorical_embed_ids: Vec<u32>,
-    text_embed_ids: Vec<u32>, // global TextEmbeddingIdx temporarily
-    is_null: Vec<u8>,
-    is_target: Vec<u8>,
-    is_padding: Vec<u8>,
-
-    // [R, R] adjacency (R = num_rows)
-    fk_adj: Vec<u8>,
-
-    // [S] permutations
-    col_perm: Vec<u16>,
-    out_perm: Vec<u16>,
-    in_perm: Vec<u16>,
 }
 
-/// Build a single sequence from a seed via BFS.
-fn build_sequence(
+/// Build one sequence: BFS from seed, materialize cells into slot, build adjacency, encode CSR masks.
+#[allow(clippy::too_many_arguments)]
+fn build_sequence_into(
     db: &Database,
     task_idx: TaskIdx,
     seed_idx: usize,
+    target_pos_in_seed: usize,
     config: &SamplerConfig,
     rng: &mut SmallRng,
-) -> SequenceData {
+    scratch: &mut SequenceScratch,
+    slot: &mut SequenceSlotMut<'_>,
+    seq_csr_masks: &mut SequenceCsrMasks,
+) -> SequenceStats {
+    let prof = profile_enabled();
+    let t_sequence_total = if prof { Some(Instant::now()) } else { None };
+    // Profiling accumulators (only used when HEADWATER_PROFILE=1)
+    let mut p_frontier_pop_ns = 0u64;
+    let mut p_visited_check_ns = 0u64;
+    let mut p_row_materialize_ns = 0u64;
+    let mut p_out_neighbor_ns = 0u64;
+    let mut p_in_neighbor_ns = 0u64;
+    let mut p_temporal_filter_ns = 0u64;
+    let mut p_child_subsample_ns = 0u64;
+    let mut p_rows_visited = 0u64;
+    let mut p_rows_skipped_visited = 0u64;
+    let mut p_out_neighbor_count = 0u64;
+    let mut p_in_neighbor_count = 0u64;
+    let mut p_temporal_check_count = 0u64;
+    let mut p_temporal_reject_count = 0u64;
+    let mut p_parent_push_count = 0u64;
+    let mut p_child_push_count = 0u64;
     let s = config.sequence_length as usize;
-    let max_r = config.max_rows_per_seq as usize;
     let _task_meta = db.task_metadata(task_idx);
     let task_view = db.task(task_idx);
 
     let seed_row = task_view.anchor_row(seed_idx);
     let obs_time = task_view.observation_time(seed_idx);
+    let use_temporal_filter = obs_time != i64::MAX;
+    let obs_time_z_cutoff = if use_temporal_filter && db.metadata.global_ts_std_us > 0.0 {
+        Some(((obs_time as f64) - db.metadata.global_ts_mean_us) / db.metadata.global_ts_std_us)
+    } else {
+        None
+    };
 
-    // Allocate per-sequence buffers (initialized to zeros / padding)
-    let mut semantic_types = vec![0i8; s];
-    let mut column_ids = vec![0i32; s];
-    let mut seq_row_ids = vec![0u16; s];
-    let mut numeric_values = vec![0.0f32; s];
-    let mut timestamp_values = vec![0.0f32; s * TIMESTAMP_DIM];
-    let mut bool_values = vec![0u8; s];
-    let mut categorical_embed_ids = vec![0u32; s];
-    let mut text_embed_ids = vec![0u32; s];
-    let mut is_null = vec![0u8; s];
-    let mut is_target = vec![0u8; s];
-    let mut is_padding = vec![1u8; s]; // start all padding, clear as we fill
+    debug_assert_eq!(slot.semantic_types.len(), s);
+    debug_assert_eq!(slot.column_ids.len(), s);
+    debug_assert_eq!(slot.seq_row_ids.len(), s);
+    debug_assert_eq!(slot.numeric_values.len(), s);
+    debug_assert_eq!(slot.timestamp_values.len(), s * TIMESTAMP_DIM);
+    debug_assert_eq!(slot.bool_values.len(), s);
+    debug_assert_eq!(slot.categorical_embed_ids.len(), s);
+    debug_assert_eq!(slot.text_embed_ids.len(), s);
+    debug_assert_eq!(slot.is_null.len(), s);
+    debug_assert_eq!(slot.is_target.len(), s);
+    debug_assert_eq!(slot.is_padding.len(), s);
 
-    // Row tracking
-    let mut row_map: HashMap<RowIdx, u16> = HashMap::new();
-    let mut row_order: Vec<RowIdx> = Vec::new(); // insertion order for adjacency
+    let semantic_types = &mut slot.semantic_types;
+    let column_ids = &mut slot.column_ids;
+    let seq_row_ids = &mut slot.seq_row_ids;
+    let numeric_values = &mut slot.numeric_values;
+    let timestamp_values = &mut slot.timestamp_values;
+    let bool_values = &mut slot.bool_values;
+    let categorical_embed_ids = &mut slot.categorical_embed_ids;
+    let text_embed_ids = &mut slot.text_embed_ids;
+    let is_null = &mut slot.is_null;
+    let is_target = &mut slot.is_target;
+    let is_padding = &mut slot.is_padding;
+
+    // Reuse per-thread scratch buffers to reduce allocator churn.
+    scratch.row_map.clear();
+    scratch.parent_frontier.clear();
+    scratch.child_frontier.clear();
+    scratch.eligible_children.clear();
+
+    let row_map = &mut scratch.row_map;
     let mut cell_count: usize = 0;
-
-    // BFS frontier
-    let mut frontier: VecDeque<FrontierEntry> = VecDeque::new();
-    let mut visited: std::collections::HashSet<RowIdx> = std::collections::HashSet::new();
+    let parent_frontier = &mut scratch.parent_frontier;
+    let child_frontier = &mut scratch.child_frontier;
 
     // Seed the frontier
-    frontier.push_back(FrontierEntry {
-        row: seed_row,
-        priority: FrontierPriority::Parent,
-        hops: 0,
-    });
+    parent_frontier.push_back(seed_row);
 
-    while let Some(entry) = pop_next(&mut frontier) {
-        if cell_count >= s || row_map.len() >= max_r {
+    loop {
+        let t_frontier_pop = if prof { Some(Instant::now()) } else { None };
+        let row = match parent_frontier
+            .pop_front()
+            .or_else(|| child_frontier.pop_front())
+        {
+            Some(row) => row,
+            None => break,
+        };
+        if let Some(t0) = t_frontier_pop {
+            p_frontier_pop_ns += t0.elapsed().as_nanos() as u64;
+        }
+        if cell_count >= s {
             break;
         }
-        if visited.contains(&entry.row) {
+        let t_visited_check = if prof { Some(Instant::now()) } else { None };
+        let next_seq_row_id = row_map.len() as u16;
+        let is_new_row = if let std::collections::hash_map::Entry::Vacant(slot) = row_map.entry(row)
+        {
+            slot.insert(next_seq_row_id);
+            true
+        } else {
+            false
+        };
+        if let Some(t0) = t_visited_check {
+            p_visited_check_ns += t0.elapsed().as_nanos() as u64;
+        }
+        if !is_new_row {
+            p_rows_skipped_visited += 1;
             continue;
         }
-        visited.insert(entry.row);
-
-        let row = entry.row;
+        p_rows_visited += 1;
+        let t_row_materialize = if prof { Some(Instant::now()) } else { None };
         let table_idx = db.row_table(row);
         let table_meta = &db.metadata.table_metadata[table_idx.0 as usize];
         let table_view = db.table(table_idx);
         let local_row = (row.0 - table_meta.row_range.0.0) as usize;
 
-        // Assign sequence-local row id
-        let seq_row_id = row_map.len() as u16;
-        row_map.insert(row, seq_row_id);
-        row_order.push(row);
+        // Assigned above via row_map.entry()
+        let seq_row_id = row_map[&row];
 
-        // Visit all non-ignored columns of this row
+        // Precompute bitmap indices for this row (used for validity/boolean bits in column slices).
+        let row_byte = local_row / 8;
+        let row_bit_mask = 1u8 << (local_row % 8);
         let col_start = table_meta.col_range.0.0;
         let col_end = table_meta.col_range.1.0;
         for global_col in col_start..col_end {
@@ -407,96 +869,141 @@ fn build_sequence(
             column_ids[pos] = global_col as i32;
             seq_row_ids[pos] = seq_row_id;
 
-            let cell_is_null = match col_meta.stype {
-                SemanticType::Identifier => false,
-                _ => table_view.is_null(local_col, local_row),
-            };
-            is_null[pos] = cell_is_null as u8;
-
-            // Write value based on semantic type
-            if !cell_is_null {
-                match col_meta.stype {
-                    SemanticType::Identifier => {
-                        // No value to write - presence is the signal
-                    }
-                    SemanticType::Numerical => {
-                        numeric_values[pos] = table_view.numerical(local_col, local_row);
-                    }
-                    SemanticType::Timestamp => {
-                        let ts = table_view.timestamp(local_col, local_row);
-                        let start = pos * TIMESTAMP_DIM;
-                        timestamp_values[start..start + TIMESTAMP_DIM].copy_from_slice(ts);
-                    }
-                    SemanticType::Boolean => {
-                        bool_values[pos] = table_view.boolean(local_col, local_row) as u8;
-                    }
-                    SemanticType::Categorical => {
-                        categorical_embed_ids[pos] =
-                            table_view.categorical_embedding_idx(local_col, local_row).0;
-                    }
-                    SemanticType::Text => {
-                        text_embed_ids[pos] = table_view.text_embedding_idx(local_col, local_row).0;
-                    }
-                    SemanticType::Ignored => unreachable!(),
+            // Match once on the column backing slice to avoid repeated dispatch
+            // through TableView helpers in this hot row-materialization loop.
+            match table_view.column(local_col) {
+                ColumnSlice::Identifier { .. } => {
+                    is_null[pos] = 0;
                 }
+                ColumnSlice::Numerical { validity, values } => {
+                    let is_valid = validity_bit_is_set(validity, row_byte, row_bit_mask);
+                    is_null[pos] = (!is_valid) as u8;
+                    if is_valid {
+                        numeric_values[pos] = values[local_row];
+                    }
+                }
+                ColumnSlice::Timestamp { validity, values } => {
+                    let is_valid = validity_bit_is_set(validity, row_byte, row_bit_mask);
+                    is_null[pos] = (!is_valid) as u8;
+                    if is_valid {
+                        let ts_start = local_row * TIMESTAMP_DIM;
+                        copy_timestamp_values(
+                            timestamp_values,
+                            pos,
+                            &values[ts_start..ts_start + TIMESTAMP_DIM],
+                        );
+                    }
+                }
+                ColumnSlice::Boolean { validity, bits } => {
+                    let is_valid = validity_bit_is_set(validity, row_byte, row_bit_mask);
+                    is_null[pos] = (!is_valid) as u8;
+                    if is_valid {
+                        bool_values[pos] = validity_bit_is_set(bits, row_byte, row_bit_mask) as u8;
+                    }
+                }
+                ColumnSlice::Embedded { validity, indices } => {
+                    let is_valid = validity_bit_is_set(validity, row_byte, row_bit_mask);
+                    is_null[pos] = (!is_valid) as u8;
+                    if is_valid {
+                        match col_meta.stype {
+                            SemanticType::Categorical => {
+                                categorical_embed_ids[pos] = indices[local_row];
+                            }
+                            SemanticType::Text => {
+                                text_embed_ids[pos] = indices[local_row];
+                            }
+                            _ => {
+                                unreachable!("embedded storage is only valid for categorical/text")
+                            }
+                        }
+                    }
+                }
+                ColumnSlice::Ignored => unreachable!("ignored columns are filtered above"),
             }
+        }
+        if let Some(t0) = t_row_materialize {
+            p_row_materialize_ns += t0.elapsed().as_nanos() as u64;
+        }
+
+        if cell_count >= s {
+            break;
         }
 
         // Add FK neighbors to frontier
         // Outgoing edges (F->P): this row's FK columns point to parent rows
+        let t_out_neighbors = if prof { Some(Instant::now()) } else { None };
         for &neighbor_raw in db.graph.outgoing_neighbors(row) {
+            p_out_neighbor_count += 1;
             let neighbor = RowIdx(neighbor_raw);
-            if !visited.contains(&neighbor) {
-                frontier.push_back(FrontierEntry {
-                    row: neighbor,
-                    priority: FrontierPriority::Parent,
-                    hops: entry.hops + 1,
-                });
+            if !row_map.contains_key(&neighbor) {
+                parent_frontier.push_back(neighbor);
+                p_parent_push_count += 1;
+            }
+        }
+        if let Some(t0) = t_out_neighbors {
+            p_out_neighbor_ns += t0.elapsed().as_nanos() as u64;
+        }
+
+        // Incoming edges (P->F): rows with FKs into this row (children).
+        // Graph stores a temporal-aware partition:
+        //   - static incoming: rows without usable temporal value
+        //   - temporal incoming: rows sorted by timestamp z-score
+        let t_in_neighbors = if prof { Some(Instant::now()) } else { None };
+        scratch.eligible_children.clear();
+        let static_children = db.graph.incoming_static_neighbors(row);
+        let (temporal_children, temporal_z) = db.graph.incoming_temporal_neighbors(row);
+        p_in_neighbor_count += (static_children.len() + temporal_children.len()) as u64;
+
+        for &child_raw in static_children {
+            let child_row = RowIdx(child_raw);
+            if !row_map.contains_key(&child_row) {
+                scratch.eligible_children.push(child_row);
             }
         }
 
-        // Incoming edges (P->F): other rows' FK columns point to this row (children)
-        let children: Vec<u32> = db.graph.incoming_neighbors(row).to_vec();
-        let mut eligible: Vec<RowIdx> = Vec::new();
-        for &child_raw in &children {
+        let temporal_prefix_len = if use_temporal_filter {
+            let t_temporal_filter = if prof { Some(Instant::now()) } else { None };
+            p_temporal_check_count += temporal_children.len() as u64;
+            let prefix_len = if let Some(z_cutoff) = obs_time_z_cutoff {
+                temporal_z.partition_point(|&z| (z as f64) <= z_cutoff)
+            } else {
+                temporal_children.len()
+            };
+            p_temporal_reject_count += (temporal_children.len() - prefix_len) as u64;
+            if let Some(t0) = t_temporal_filter {
+                p_temporal_filter_ns += t0.elapsed().as_nanos() as u64;
+            }
+            prefix_len
+        } else {
+            temporal_children.len()
+        };
+
+        for &child_raw in &temporal_children[..temporal_prefix_len] {
             let child_row = RowIdx(child_raw);
-            if visited.contains(&child_row) {
-                continue;
+            if !row_map.contains_key(&child_row) {
+                scratch.eligible_children.push(child_row);
             }
-            // Temporal filtering: if the child's table has a temporal column,
-            // exclude rows with timestamp after obs_time
-            if obs_time != i64::MAX {
-                let child_table_idx = db.row_table(child_row);
-                let child_table_meta = &db.metadata.table_metadata[child_table_idx.0 as usize];
-                if let Some(tc) = child_table_meta.temporal_col {
-                    let child_local_row = (child_row.0 - child_table_meta.row_range.0.0) as usize;
-                    let child_table_view = db.table(child_table_idx);
-                    let tc_local = (tc.0 - child_table_meta.col_range.0.0) as usize;
-                    if !child_table_view.is_null(tc_local, child_local_row) {
-                        let z = child_table_view.timestamp_zscore_epoch(tc_local, child_local_row);
-                        let raw_us = (z as f64 * db.metadata.global_ts_std_us
-                            + db.metadata.global_ts_mean_us)
-                            as i64;
-                        if raw_us > obs_time {
-                            continue; // Future row, skip
-                        }
-                    }
-                }
-            }
-            eligible.push(child_row);
+        }
+        if let Some(t0) = t_in_neighbors {
+            p_in_neighbor_ns += t0.elapsed().as_nanos() as u64;
         }
 
         // Subsample children to bfs_child_width
-        if eligible.len() > config.bfs_child_width as usize {
-            eligible.shuffle(rng);
-            eligible.truncate(config.bfs_child_width as usize);
+        let t_child_subsample = if prof { Some(Instant::now()) } else { None };
+        if scratch.eligible_children.len() > config.bfs_child_width as usize {
+            scratch.eligible_children.shuffle(rng);
+            scratch
+                .eligible_children
+                .truncate(config.bfs_child_width as usize);
         }
-        for child_row in eligible {
-            frontier.push_back(FrontierEntry {
-                row: child_row,
-                priority: FrontierPriority::Child,
-                hops: entry.hops + 1,
-            });
+        for &child_row in &scratch.eligible_children {
+            if !row_map.contains_key(&child_row) {
+                child_frontier.push_back(child_row);
+                p_child_push_count += 1;
+            }
+        }
+        if let Some(t0) = t_child_subsample {
+            p_child_subsample_ns += t0.elapsed().as_nanos() as u64;
         }
     }
 
@@ -504,69 +1011,69 @@ fn build_sequence(
     // For the seed row, we need to mark the appropriate cell as target
     // and overwrite its value with the ground-truth from the task
     mark_target(
-        &mut is_target,
-        &mut is_null,
-        &mut numeric_values,
-        &mut timestamp_values,
-        &mut bool_values,
-        &mut categorical_embed_ids,
-        &semantic_types,
-        db,
-        task_idx,
-        seed_idx,
-        seed_row,
-        &row_map,
-        s,
-    );
-
-    // Build fk_adj[R, R] where R = max_rows_per_seq (padded)
-    let r = max_r;
-    let mut fk_adj = vec![0u8; r * r];
-    for (&row, &seq_id) in &row_map {
-        // Outgoing neighbors that are also in this sequence
-        for &neighbor_raw in db.graph.outgoing_neighbors(row) {
-            if let Some(&neighbor_seq_id) = row_map.get(&RowIdx(neighbor_raw)) {
-                fk_adj[seq_id as usize * r + neighbor_seq_id as usize] = 1;
-            }
-        }
-    }
-
-    // Compute permutations (RCM for row-graph views).
-    let col_perm = compute_col_perm(&column_ids, &is_padding, s);
-    let out_perm = compute_rcm_perm(&fk_adj, &seq_row_ids, &is_padding, s, r, true);
-    let in_perm = compute_rcm_perm(&fk_adj, &seq_row_ids, &is_padding, s, r, false);
-
-    SequenceData {
-        num_cells: cell_count,
-        num_rows: row_map.len(),
-        semantic_types,
-        column_ids,
-        seq_row_ids,
+        is_target,
+        is_null,
         numeric_values,
         timestamp_values,
         bool_values,
         categorical_embed_ids,
-        text_embed_ids,
-        is_null,
-        is_target,
-        is_padding,
-        fk_adj,
-        col_perm,
-        out_perm,
-        in_perm,
-    }
-}
+        db,
+        task_idx,
+        seed_idx,
+        target_pos_in_seed,
+        s,
+    );
 
-/// Pop the next entry from the frontier with parent priority.
-fn pop_next(frontier: &mut VecDeque<FrontierEntry>) -> Option<FrontierEntry> {
-    // Prefer Parent-priority entries; if none, take from front (closest-first BFS)
-    if let Some(pos) = frontier
-        .iter()
-        .position(|e| e.priority == FrontierPriority::Parent)
-    {
-        frontier.remove(pos)
-    } else {
-        frontier.pop_front()
+    // Build row-level directed adjacency for rows materialized in this sequence.
+    let r = row_map.len();
+    if scratch.out_neighbors.len() < r {
+        scratch.out_neighbors.resize_with(r, Vec::new);
+    }
+    if scratch.in_neighbors.len() < r {
+        scratch.in_neighbors.resize_with(r, Vec::new);
+    }
+    for ri in 0..r {
+        scratch.out_neighbors[ri].clear();
+        scratch.in_neighbors[ri].clear();
+    }
+    for (&row, &seq_id) in row_map.iter() {
+        for &neighbor_raw in db.graph.outgoing_neighbors(row) {
+            if let Some(&neighbor_seq_id) = row_map.get(&RowIdx(neighbor_raw)) {
+                let ri = seq_id as usize;
+                let rj = neighbor_seq_id as usize;
+                scratch.out_neighbors[ri].push(rj);
+                scratch.in_neighbors[rj].push(ri);
+            }
+        }
+    }
+
+    let row_count = row_map.len();
+    *seq_csr_masks =
+        encode_attention_masks_csr(seq_row_ids, column_ids, is_padding, s, r, scratch);
+
+    if t_sequence_total.is_some() {
+        PROFILE_SEQUENCE_COUNT.fetch_add(1, Ordering::Relaxed);
+        PROFILE_PHASE1_FRONTIER_POP_NS.fetch_add(p_frontier_pop_ns, Ordering::Relaxed);
+        PROFILE_PHASE1_VISITED_CHECK_NS.fetch_add(p_visited_check_ns, Ordering::Relaxed);
+        PROFILE_PHASE1_ROW_MATERIALIZE_NS.fetch_add(p_row_materialize_ns, Ordering::Relaxed);
+        PROFILE_PHASE1_OUT_NEIGHBOR_NS.fetch_add(p_out_neighbor_ns, Ordering::Relaxed);
+        PROFILE_PHASE1_IN_NEIGHBOR_NS.fetch_add(p_in_neighbor_ns, Ordering::Relaxed);
+        PROFILE_PHASE1_TEMPORAL_FILTER_NS.fetch_add(p_temporal_filter_ns, Ordering::Relaxed);
+        PROFILE_PHASE1_CHILD_SUBSAMPLE_NS.fetch_add(p_child_subsample_ns, Ordering::Relaxed);
+        PROFILE_PHASE1_ROWS_VISITED.fetch_add(p_rows_visited, Ordering::Relaxed);
+        PROFILE_PHASE1_ROWS_SKIPPED_VISITED.fetch_add(p_rows_skipped_visited, Ordering::Relaxed);
+        PROFILE_PHASE1_OUT_NEIGHBOR_COUNT.fetch_add(p_out_neighbor_count, Ordering::Relaxed);
+        PROFILE_PHASE1_IN_NEIGHBOR_COUNT.fetch_add(p_in_neighbor_count, Ordering::Relaxed);
+        PROFILE_PHASE1_TEMPORAL_CHECK_COUNT.fetch_add(p_temporal_check_count, Ordering::Relaxed);
+        PROFILE_PHASE1_TEMPORAL_REJECT_COUNT.fetch_add(p_temporal_reject_count, Ordering::Relaxed);
+        PROFILE_PHASE1_PARENT_PUSH_COUNT.fetch_add(p_parent_push_count, Ordering::Relaxed);
+        PROFILE_PHASE1_CHILD_PUSH_COUNT.fetch_add(p_child_push_count, Ordering::Relaxed);
+    }
+    add_elapsed_ns(&PROFILE_SEQUENCE_TOTAL_NS, t_sequence_total);
+
+    let _ = cell_count;
+    SequenceStats {
+        num_rows: row_count,
     }
 }
 
@@ -583,44 +1090,19 @@ fn mark_target(
     timestamp_values: &mut [f32],
     bool_values: &mut [u8],
     categorical_embed_ids: &mut [u32],
-    _semantic_types: &[i8],
     db: &Database,
     task_idx: TaskIdx,
     seed_idx: usize,
-    _seed_row: RowIdx,
-    _row_map: &HashMap<RowIdx, u16>,
+    target_pos_in_seed: usize,
     s: usize,
 ) {
     let task_meta = db.task_metadata(task_idx);
     let task_view = db.task(task_idx);
     let target_stype = task_meta.target_stype;
 
-    // The seed row's cells were placed first in the sequence. Walk the anchor
-    // table's columns in order to find the position of the first cell matching
-    // target_stype.
-    let anchor_table_meta = &db.metadata.table_metadata[task_meta.anchor_table.0 as usize];
-    let col_start = anchor_table_meta.col_range.0.0;
-    let col_end = anchor_table_meta.col_range.1.0;
-
-    let mut target_pos: Option<usize> = None;
-    let mut pos_in_seq = 0usize;
-    for global_col in col_start..col_end {
-        let col_meta = &db.metadata.column_metadata[global_col as usize];
-        if col_meta.stype == SemanticType::Ignored {
-            continue;
-        }
-        if pos_in_seq >= s {
-            break;
-        }
-        if col_meta.stype == target_stype && target_pos.is_none() {
-            target_pos = Some(pos_in_seq);
-        }
-        pos_in_seq += 1;
-    }
-
-    // Fallback: use position 0 (first cell of seed row) for derived tasks where
-    // target_stype may not exist as a column in the anchor table.
-    let pos = target_pos.unwrap_or(0);
+    // Fallback position for derived tasks where target_stype doesn't appear
+    // in the anchor table is precomputed to 0.
+    let pos = target_pos_in_seed;
     if pos >= s {
         return;
     }
@@ -638,8 +1120,7 @@ fn mark_target(
             }
             SemanticType::Timestamp => {
                 let ts = task_view.target_timestamp(seed_idx);
-                let start = pos * TIMESTAMP_DIM;
-                timestamp_values[start..start + TIMESTAMP_DIM].copy_from_slice(ts);
+                copy_timestamp_values(timestamp_values, pos, ts);
             }
             SemanticType::Boolean => {
                 bool_values[pos] = task_view.target_boolean(seed_idx) as u8;
@@ -652,166 +1133,198 @@ fn mark_target(
     }
 }
 
-// ============================================================================
-// Permutation Computation
-// ============================================================================
+fn target_pos_in_seed_row(db: &Database, task_idx: usize) -> usize {
+    let task_meta = &db.metadata.task_metadata[task_idx];
+    let target_stype = task_meta.target_stype;
+    let anchor_table_meta = &db.metadata.table_metadata[task_meta.anchor_table.0 as usize];
+    let col_start = anchor_table_meta.col_range.0.0;
+    let col_end = anchor_table_meta.col_range.1.0;
 
-/// Compute column-based permutation: argsort by column_ids.
-/// Padding positions go to the end.
-fn compute_col_perm(column_ids: &[i32], is_padding: &[u8], s: usize) -> Vec<u16> {
-    let mut indices: Vec<u16> = (0..s as u16).collect();
-    indices.sort_by(|&a, &b| {
-        let a_pad = is_padding[a as usize];
-        let b_pad = is_padding[b as usize];
-        a_pad
-            .cmp(&b_pad)
-            .then_with(|| column_ids[a as usize].cmp(&column_ids[b as usize]))
-            .then_with(|| a.cmp(&b))
-    });
-    indices
+    let mut pos_in_seq = 0usize;
+    for global_col in col_start..col_end {
+        let col_meta = &db.metadata.column_metadata[global_col as usize];
+        if col_meta.stype == SemanticType::Ignored {
+            continue;
+        }
+        if col_meta.stype == target_stype {
+            return pos_in_seq;
+        }
+        pos_in_seq += 1;
+    }
+    0
 }
 
-/// Compute reverse Cuthill-McKee permutation for block-sparse attention.
-/// `outbound=true` uses (I + fk_adj), `outbound=false` uses fk_adj^T.
-fn compute_rcm_perm(
-    fk_adj: &[u8],
+/// Build per-sequence CSR attention masks (outbound, inbound, column) using position bitsets and OR.
+/// Uses `row_position_bits` for row→positions, then outbound = self row ∪ out_neighbors' positions,
+/// inbound = union of in_neighbors' positions; column = same-column position pairs.
+fn encode_attention_masks_csr(
     seq_row_ids: &[u16],
+    column_ids: &[i32],
     is_padding: &[u8],
     s: usize,
     r: usize,
-    outbound: bool,
-) -> Vec<u16> {
-    // Build row-level adjacency for RCM
-    let mut adj = vec![vec![]; r];
-    for i in 0..r {
-        for j in 0..r {
-            let connected = if outbound {
-                (i == j) || fk_adj[i * r + j] == 1 // I + fk_adj
-            } else {
-                fk_adj[j * r + i] == 1 // fk_adj^T
-            };
-            if connected && i != j {
-                adj[i].push(j);
-            }
+    scratch: &mut SequenceScratch,
+) -> SequenceCsrMasks {
+    let t_encode = if profile_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    let active_positions = &mut scratch.active_positions;
+    active_positions.clear();
+    active_positions.reserve(s);
+
+    let col_pairs = &mut scratch.col_pairs;
+    col_pairs.clear();
+    col_pairs.reserve(s);
+    let mut out_row_ptr = Vec::with_capacity(s + 1);
+    let mut out_col_idx = Vec::new();
+    out_row_ptr.push(0);
+    let mut in_row_ptr = Vec::with_capacity(s + 1);
+    let mut in_col_idx = Vec::new();
+    in_row_ptr.push(0);
+
+    let words_per_row = s.div_ceil(BITSET_WORD_BITS);
+    if scratch.row_position_bits.len() < r {
+        scratch.row_position_bits.resize_with(r, Vec::new);
+    }
+    for ri in 0..r {
+        let bits = &mut scratch.row_position_bits[ri];
+        if bits.len() != words_per_row {
+            bits.resize(words_per_row, 0);
         }
+        bits.fill(0);
+    }
+    for i in 0..s {
+        if is_padding[i] == 1 {
+            continue;
+        }
+        active_positions.push(i);
+        let ri = seq_row_ids[i] as usize;
+        if ri < r {
+            bitset_set(&mut scratch.row_position_bits[ri], i);
+        }
+        col_pairs.push((column_ids[i], i));
     }
 
-    // RCM: start from the node with minimum degree
-    let mut row_order: Vec<usize> = Vec::with_capacity(r);
-    let mut row_visited = vec![false; r];
-
-    // Find all rows that are actually used
-    let mut used_rows: Vec<bool> = vec![false; r];
-    for pos in 0..s {
-        if is_padding[pos] == 0 {
-            let row_id = seq_row_ids[pos] as usize;
-            if row_id < r {
-                used_rows[row_id] = true;
-            }
+    let tmp_bits = &mut scratch.tmp_bits;
+    if tmp_bits.len() != words_per_row {
+        tmp_bits.resize(words_per_row, 0);
+    }
+    for i in 0..s {
+        if is_padding[i] == 1 {
+            out_row_ptr.push(out_col_idx.len() as u32);
+            continue;
         }
+        let ri = seq_row_ids[i] as usize;
+        if ri >= r {
+            out_row_ptr.push(out_col_idx.len() as u32);
+            continue;
+        }
+        tmp_bits.copy_from_slice(&scratch.row_position_bits[ri]);
+        for &rj in &scratch.out_neighbors[ri] {
+            bitset_or_inplace(tmp_bits, &scratch.row_position_bits[rj]);
+        }
+        bitset_extend_sorted_indices(tmp_bits, &mut out_col_idx);
+        out_row_ptr.push(out_col_idx.len() as u32);
     }
 
-    // Simple BFS-based RCM for used rows
-    while row_order.len() < r {
-        // Find unvisited used row with minimum degree
-        let start = (0..r)
-            .filter(|&i| !row_visited[i] && used_rows[i])
-            .min_by_key(|&i| adj[i].len())
-            .or_else(|| (0..r).find(|&i| !row_visited[i]));
-
-        let start = match start {
-            Some(s) => s,
-            None => break,
-        };
-
-        // BFS from start
-        let mut queue = VecDeque::new();
-        queue.push_back(start);
-        row_visited[start] = true;
-
-        while let Some(node) = queue.pop_front() {
-            row_order.push(node);
-            // Sort neighbors by degree (ascending) for Cuthill-McKee
-            let mut neighbors: Vec<usize> = adj[node]
-                .iter()
-                .filter(|&&n| !row_visited[n])
-                .copied()
-                .collect();
-            neighbors.sort_by_key(|&n| adj[n].len());
-            for n in neighbors {
-                if !row_visited[n] {
-                    row_visited[n] = true;
-                    queue.push_back(n);
-                }
-            }
+    for i in 0..s {
+        if is_padding[i] == 1 {
+            in_row_ptr.push(in_col_idx.len() as u32);
+            continue;
         }
+        let ri = seq_row_ids[i] as usize;
+        if ri >= r {
+            in_row_ptr.push(in_col_idx.len() as u32);
+            continue;
+        }
+        tmp_bits.fill(0);
+        for &rj in &scratch.in_neighbors[ri] {
+            bitset_or_inplace(tmp_bits, &scratch.row_position_bits[rj]);
+        }
+        bitset_extend_sorted_indices(tmp_bits, &mut in_col_idx);
+        in_row_ptr.push(in_col_idx.len() as u32);
+    }
+    if scratch.col_group_start.len() < s {
+        scratch.col_group_start.resize(s, usize::MAX);
+    }
+    if scratch.col_group_end.len() < s {
+        scratch.col_group_end.resize(s, usize::MAX);
+    }
+    for i in 0..s {
+        scratch.col_group_start[i] = usize::MAX;
+        scratch.col_group_end[i] = usize::MAX;
+    }
+    col_pairs.sort_unstable_by_key(|&(col, _)| col);
+    let mut start = 0usize;
+    while start < col_pairs.len() {
+        let col = col_pairs[start].0;
+        let mut end = start + 1;
+        while end < col_pairs.len() && col_pairs[end].0 == col {
+            end += 1;
+        }
+        for &(_, pos) in &col_pairs[start..end] {
+            scratch.col_group_start[pos] = start;
+            scratch.col_group_end[pos] = end;
+        }
+        start = end;
     }
 
-    // Reverse for RCM
-    row_order.reverse();
-
-    // Fill remaining unused rows
-    for (i, visited) in row_visited.iter().enumerate().take(r) {
-        if !visited {
-            row_order.push(i);
+    let mut col_row_ptr = Vec::with_capacity(s + 1);
+    let mut col_col_idx = Vec::new();
+    col_row_ptr.push(0);
+    for i in 0..s {
+        if is_padding[i] == 1 {
+            col_row_ptr.push(col_col_idx.len() as u32);
+            continue;
         }
+        let g_start = scratch.col_group_start[i];
+        let g_end = scratch.col_group_end[i];
+        if g_start == usize::MAX {
+            col_row_ptr.push(col_col_idx.len() as u32);
+            continue;
+        }
+        for k in g_start..g_end {
+            col_col_idx.push(col_pairs[k].1 as u16);
+        }
+        col_row_ptr.push(col_col_idx.len() as u32);
     }
 
-    // Build row_id -> rcm_rank mapping
-    let mut row_rank = vec![0usize; r];
-    for (rank, &row_id) in row_order.iter().enumerate() {
-        if row_id < r {
-            row_rank[row_id] = rank;
-        }
+    add_elapsed_ns(&PROFILE_ENCODE_MASK_NS, t_encode);
+    SequenceCsrMasks {
+        outbound_row_ptr: out_row_ptr,
+        outbound_col_idx: out_col_idx,
+        inbound_row_ptr: in_row_ptr,
+        inbound_col_idx: in_col_idx,
+        column_row_ptr: col_row_ptr,
+        column_col_idx: col_col_idx,
     }
-
-    // Sort cell positions by (is_padding, row_rank, column_id)
-    let mut indices: Vec<u16> = (0..s as u16).collect();
-    indices.sort_by(|&a, &b| {
-        let a_pad = is_padding[a as usize];
-        let b_pad = is_padding[b as usize];
-        a_pad.cmp(&b_pad).then_with(|| {
-            let a_row = seq_row_ids[a as usize] as usize;
-            let b_row = seq_row_ids[b as usize] as usize;
-            let a_rank = if a_row < r {
-                row_rank[a_row]
-            } else {
-                usize::MAX
-            };
-            let b_rank = if b_row < r {
-                row_rank[b_row]
-            } else {
-                usize::MAX
-            };
-            a_rank.cmp(&b_rank).then_with(|| a.cmp(&b))
-        })
-    });
-    indices
 }
 
 // ============================================================================
 // Batch Construction
 // ============================================================================
 
-/// Build a complete batch from B seeds.
+/// Build one batch: choose task, draw B seeds, Phase 1 parallel BFS + CSR masks, Phase 2 text dedup/gather/collate.
 fn build_batch(
     db: &Database,
     seed_manager: &SeedManager,
     config: &SamplerConfig,
     split: Split,
     rng: &mut SmallRng,
+    workspace: &mut BatchBuildWorkspace,
 ) -> Option<RawBatch> {
+    let t_batch_total = if profile_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let b = config.batch_size as usize;
     let s = config.sequence_length as usize;
-    let r = config.max_rows_per_seq as usize;
 
     let seeds_by_task = seed_manager.seeds_for_split(split);
-    let num_tasks = seeds_by_task.len();
-
-    // Find tasks that have seeds
-    let tasks_with_seeds: Vec<usize> = (0..num_tasks)
-        .filter(|&ti| !seeds_by_task[ti].is_empty())
-        .collect();
+    let tasks_with_seeds = seed_manager.tasks_with_seeds(split);
 
     if tasks_with_seeds.is_empty() {
         warn!("No tasks with seeds for {:?} split", split);
@@ -822,37 +1335,110 @@ fn build_batch(
     let chosen_task_idx = tasks_with_seeds[rng.random_range(0..tasks_with_seeds.len())];
     let task_seeds = &seeds_by_task[chosen_task_idx];
     let task_meta = &db.metadata.task_metadata[chosen_task_idx];
+    let target_pos_in_seed = target_pos_in_seed_row(db, chosen_task_idx);
 
     // Draw B seed indices (with replacement if needed)
-    let seed_indices: Vec<usize> = (0..b)
-        .map(|_| task_seeds[rng.random_range(0..task_seeds.len())])
-        .collect();
+    workspace.reset_for_batch(b);
+    workspace
+        .seed_indices
+        .extend((0..b).map(|_| task_seeds[rng.random_range(0..task_seeds.len())]));
 
-    // Phase 1: Parallel BFS over B seeds
-    // Each thread gets its own RNG derived from the batch RNG
-    let thread_seeds: Vec<u64> = (0..b).map(|_| rng.random()).collect();
+    // Pre-allocate final batch tensors and build each sequence directly in-place.
+    let mut buffers = BatchBuffers::new(b, s);
+    let seq_csr_masks = &mut workspace.seq_csr_masks;
+    let seq_num_rows = &mut workspace.seq_num_rows;
+
+    // Phase 1: Parallel BFS over B seeds with direct writes into final buffers.
+    workspace
+        .thread_seeds
+        .extend((0..b).map(|_| rng.random::<u64>()));
+    let seed_indices = &workspace.seed_indices;
+    let thread_seeds = &workspace.thread_seeds;
     let task_idx = TaskIdx(chosen_task_idx as u32);
-
-    let sequences: Vec<SequenceData> = thread_seeds
-        .par_iter()
+    let t_phase1 = if profile_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    seq_num_rows
+        .par_iter_mut()
         .zip(seed_indices.par_iter())
-        .map(|(&thread_seed, &seed_idx)| {
-            let mut thread_rng = SmallRng::seed_from_u64(thread_seed);
-            build_sequence(db, task_idx, seed_idx, config, &mut thread_rng)
-        })
-        .collect();
+        .zip(thread_seeds.par_iter())
+        .zip(buffers.semantic_types.par_chunks_mut(s))
+        .zip(buffers.column_ids.par_chunks_mut(s))
+        .zip(buffers.seq_row_ids.par_chunks_mut(s))
+        .zip(buffers.numeric_values.par_chunks_mut(s))
+        .zip(buffers.timestamp_values.par_chunks_mut(s * TIMESTAMP_DIM))
+        .zip(buffers.bool_values.par_chunks_mut(s))
+        .zip(buffers.categorical_embed_ids.par_chunks_mut(s))
+        .zip(buffers.text_embed_ids.par_chunks_mut(s))
+        .zip(buffers.is_null.par_chunks_mut(s))
+        .zip(buffers.is_target.par_chunks_mut(s))
+        .zip(buffers.is_padding.par_chunks_mut(s))
+        .zip(seq_csr_masks.par_iter_mut())
+        .for_each_init(SequenceScratch::default, |scratch, item| {
+            let (item, seq_csr_masks_out) = item;
+            let (item, is_padding) = item;
+            let (item, is_target) = item;
+            let (item, is_null) = item;
+            let (item, text_embed_ids) = item;
+            let (item, categorical_embed_ids) = item;
+            let (item, bool_values) = item;
+            let (item, timestamp_values) = item;
+            let (item, numeric_values) = item;
+            let (item, seq_row_ids) = item;
+            let (item, column_ids) = item;
+            let (item, semantic_types) = item;
+            let ((num_rows_out, seed_idx), thread_seed) = item;
 
-    // Phase 2: Text embedding dedup and collation
-    let mut text_global_to_local: HashMap<u32, u32> = HashMap::new();
-    let mut unique_text_indices: Vec<u32> = Vec::new();
+            let mut thread_rng = SmallRng::seed_from_u64(*thread_seed);
+            let mut slot = SequenceSlotMut {
+                semantic_types,
+                column_ids,
+                seq_row_ids,
+                numeric_values,
+                timestamp_values,
+                bool_values,
+                categorical_embed_ids,
+                text_embed_ids,
+                is_null,
+                is_target,
+                is_padding,
+            };
+            let stats = build_sequence_into(
+                db,
+                task_idx,
+                *seed_idx,
+                target_pos_in_seed,
+                config,
+                &mut thread_rng,
+                scratch,
+                &mut slot,
+                seq_csr_masks_out,
+            );
+            *num_rows_out = stats.num_rows;
+        });
+    add_elapsed_ns(&PROFILE_BATCH_PHASE1_NS, t_phase1);
 
-    for seq in &sequences {
+    // Phase 2: Text embedding dedup, gather, and remap to batch-local indices.
+    let text_global_to_local = &mut workspace.text_global_to_local;
+    let unique_text_indices = &mut workspace.unique_text_indices;
+
+    let t_text_dedup = if profile_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    for bi in 0..b {
+        let cell_offset = bi * s;
         for pos in 0..s {
-            if seq.is_padding[pos] == 1 {
+            let idx = cell_offset + pos;
+            if buffers.is_padding[idx] == 1 {
                 continue;
             }
-            if seq.semantic_types[pos] == SemanticType::Text as i8 && seq.is_null[pos] == 0 {
-                let global_idx = seq.text_embed_ids[pos];
+            if buffers.semantic_types[idx] == SemanticType::Text as i8 && buffers.is_null[idx] == 0
+            {
+                let global_idx = buffers.text_embed_ids[idx];
                 if let std::collections::hash_map::Entry::Vacant(e) =
                     text_global_to_local.entry(global_idx)
                 {
@@ -863,8 +1449,14 @@ fn build_batch(
             }
         }
     }
+    add_elapsed_ns(&PROFILE_BATCH_TEXT_DEDUP_NS, t_text_dedup);
 
-    // Gather text embeddings
+    // Gather unique text embedding vectors from DB into text_batch_embeddings.
+    let t_text_gather = if profile_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let u = unique_text_indices.len();
     let mut text_batch_embeddings = vec![f16::ZERO; u * EMBEDDING_DIM];
     for (local_idx, &global_idx) in unique_text_indices.iter().enumerate() {
@@ -872,94 +1464,50 @@ fn build_batch(
         let start = local_idx * EMBEDDING_DIM;
         text_batch_embeddings[start..start + EMBEDDING_DIM].copy_from_slice(emb);
     }
+    add_elapsed_ns(&PROFILE_BATCH_TEXT_GATHER_NS, t_text_gather);
 
-    // Assemble final batch tensors
-    let total_cells = b * s;
-    let total_ts = b * s * TIMESTAMP_DIM;
-    let total_adj = b * r * r;
-
-    let mut batch_semantic_types = vec![0i8; total_cells];
-    let mut batch_column_ids = vec![0i32; total_cells];
-    let mut batch_seq_row_ids = vec![0u16; total_cells];
-    let mut batch_numeric_values = vec![0.0f32; total_cells];
-    let mut batch_timestamp_values = vec![0.0f32; total_ts];
-    let mut batch_bool_values = vec![0u8; total_cells];
-    let mut batch_categorical_embed_ids = vec![0u32; total_cells];
-    let mut batch_text_embed_ids = vec![0u32; total_cells];
-    let mut batch_is_null = vec![0u8; total_cells];
-    let mut batch_is_target = vec![0u8; total_cells];
-    let mut batch_is_padding = vec![1u8; total_cells];
-    let mut batch_fk_adj = vec![0u8; total_adj];
-    let mut batch_col_perm = vec![0u16; total_cells];
-    let mut batch_out_perm = vec![0u16; total_cells];
-    let mut batch_in_perm = vec![0u16; total_cells];
-
-    for (bi, seq) in sequences.iter().enumerate() {
+    // Rewrite text_embed_ids from global to batch-local indices.
+    let t_collate = if profile_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    for bi in 0..b {
         let cell_offset = bi * s;
-        let ts_offset = bi * s * TIMESTAMP_DIM;
-        let adj_offset = bi * r * r;
-
-        batch_semantic_types[cell_offset..cell_offset + s].copy_from_slice(&seq.semantic_types);
-        batch_column_ids[cell_offset..cell_offset + s].copy_from_slice(&seq.column_ids);
-        batch_seq_row_ids[cell_offset..cell_offset + s].copy_from_slice(&seq.seq_row_ids);
-        batch_numeric_values[cell_offset..cell_offset + s].copy_from_slice(&seq.numeric_values);
-        batch_timestamp_values[ts_offset..ts_offset + s * TIMESTAMP_DIM]
-            .copy_from_slice(&seq.timestamp_values);
-        batch_bool_values[cell_offset..cell_offset + s].copy_from_slice(&seq.bool_values);
-        batch_categorical_embed_ids[cell_offset..cell_offset + s]
-            .copy_from_slice(&seq.categorical_embed_ids);
-        batch_is_null[cell_offset..cell_offset + s].copy_from_slice(&seq.is_null);
-        batch_is_target[cell_offset..cell_offset + s].copy_from_slice(&seq.is_target);
-        batch_is_padding[cell_offset..cell_offset + s].copy_from_slice(&seq.is_padding);
-        batch_fk_adj[adj_offset..adj_offset + r * r].copy_from_slice(&seq.fk_adj);
-        batch_col_perm[cell_offset..cell_offset + s].copy_from_slice(&seq.col_perm);
-        batch_out_perm[cell_offset..cell_offset + s].copy_from_slice(&seq.out_perm);
-        batch_in_perm[cell_offset..cell_offset + s].copy_from_slice(&seq.in_perm);
-
-        // Remap text_embed_ids to batch-local indices
         for pos in 0..s {
-            if seq.is_padding[pos] == 0
-                && seq.semantic_types[pos] == SemanticType::Text as i8
-                && seq.is_null[pos] == 0
+            let idx = cell_offset + pos;
+            if buffers.is_padding[idx] == 0
+                && buffers.semantic_types[idx] == SemanticType::Text as i8
+                && buffers.is_null[idx] == 0
             {
-                let global = seq.text_embed_ids[pos];
-                batch_text_embed_ids[cell_offset + pos] =
-                    *text_global_to_local.get(&global).unwrap_or(&0);
+                let global = buffers.text_embed_ids[idx];
+                buffers.text_embed_ids[idx] = *text_global_to_local.get(&global).unwrap_or(&0);
             }
         }
     }
+    add_elapsed_ns(&PROFILE_BATCH_COLLATE_NS, t_collate);
+    if t_batch_total.is_some() {
+        PROFILE_BATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    add_elapsed_ns(&PROFILE_BATCH_TOTAL_NS, t_batch_total);
 
-    Some(RawBatch {
-        batch_size: b,
-        sequence_length: s,
-        max_rows: r,
-        semantic_types: batch_semantic_types,
-        column_ids: batch_column_ids,
-        seq_row_ids: batch_seq_row_ids,
-        numeric_values: batch_numeric_values,
-        timestamp_values: batch_timestamp_values,
-        bool_values: batch_bool_values,
-        categorical_embed_ids: batch_categorical_embed_ids,
-        text_embed_ids: batch_text_embed_ids,
-        is_null: batch_is_null,
-        is_target: batch_is_target,
-        is_padding: batch_is_padding,
-        fk_adj: batch_fk_adj,
-        col_perm: batch_col_perm,
-        out_perm: batch_out_perm,
-        in_perm: batch_in_perm,
+    Some(buffers.into_raw_batch(
+        seq_csr_masks,
+        b,
+        s,
+        seq_num_rows.iter().copied().max().unwrap_or(0),
         text_batch_embeddings,
-        num_unique_texts: u,
-        target_stype: task_meta.target_stype as u8,
-        task_idx: chosen_task_idx as u32,
-    })
+        u,
+        task_meta.target_stype as u8,
+        chosen_task_idx as u32,
+    ))
 }
 
 // ============================================================================
-// Sampler (with prefetch pipeline)
+// Sampler (prefetch pipeline)
 // ============================================================================
 
-/// The main sampler struct, managing prefetch channels and background threads.
+/// Main sampler: holds DB, seed sharding, and prefetch channels; used from Python and benchmark binaries.
 #[allow(dead_code)]
 pub struct Sampler {
     db: Arc<Database>,
@@ -970,6 +1518,7 @@ pub struct Sampler {
     shutdown: Arc<AtomicBool>,
     train_handle: Option<std::thread::JoinHandle<()>>,
     val_handle: Option<std::thread::JoinHandle<()>>,
+    profile_reported: bool,
 }
 
 impl Sampler {
@@ -1032,17 +1581,58 @@ impl Sampler {
             shutdown,
             train_handle: Some(train_handle),
             val_handle: Some(val_handle),
+            profile_reported: false,
         })
     }
 
     /// Pull the next training batch. Blocks until one is available.
     pub fn next_train_batch(&self) -> Result<RawBatch, SamplerError> {
-        self.train_rx.recv().map_err(|_| SamplerError::Shutdown)
+        let batch = match self.train_rx.try_recv() {
+            Ok(batch) => batch,
+            Err(TryRecvError::Empty) => {
+                let t_wait = if profile_enabled() {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let recv = self.train_rx.recv().map_err(|_| SamplerError::Shutdown)?;
+                if t_wait.is_some() {
+                    PROFILE_CONSUMER_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                add_elapsed_ns(&PROFILE_CONSUMER_BLOCKED_NS, t_wait);
+                recv
+            }
+            Err(TryRecvError::Disconnected) => return Err(SamplerError::Shutdown),
+        };
+        if profile_enabled() {
+            PROFILE_CONSUMED_TRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(batch)
     }
 
     /// Pull the next validation batch. Blocks until one is available.
     pub fn next_val_batch(&self) -> Result<RawBatch, SamplerError> {
-        self.val_rx.recv().map_err(|_| SamplerError::Shutdown)
+        let batch = match self.val_rx.try_recv() {
+            Ok(batch) => batch,
+            Err(TryRecvError::Empty) => {
+                let t_wait = if profile_enabled() {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let recv = self.val_rx.recv().map_err(|_| SamplerError::Shutdown)?;
+                if t_wait.is_some() {
+                    PROFILE_CONSUMER_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                add_elapsed_ns(&PROFILE_CONSUMER_BLOCKED_NS, t_wait);
+                recv
+            }
+            Err(TryRecvError::Disconnected) => return Err(SamplerError::Shutdown),
+        };
+        if profile_enabled() {
+            PROFILE_CONSUMED_VAL_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(batch)
     }
 
     /// Get column embeddings as a flat f16 slice: [C, EMBEDDING_DIM].
@@ -1091,6 +1681,10 @@ impl Sampler {
             let _ = h.join();
         }
 
+        if profile_enabled() && !self.profile_reported {
+            log_profile_report();
+            self.profile_reported = true;
+        }
         info!("Sampler shut down.");
     }
 }
@@ -1108,57 +1702,7 @@ pub enum SamplerError {
     Shutdown,
 }
 
-fn count_seq0_active_tiles(batch: &RawBatch, tile: usize) -> (usize, usize, usize, usize, usize, usize) {
-    let s = batch.sequence_length.min(256);
-    let r = batch.max_rows;
-    let fk_adj = &batch.fk_adj[..r * r];
-    let out_perm = &batch.out_perm[..batch.sequence_length];
-    let in_perm = &batch.in_perm[..batch.sequence_length];
-    let col_perm = &batch.col_perm[..batch.sequence_length];
-
-    let mut out_raw = std::collections::HashSet::new();
-    let mut out_p = std::collections::HashSet::new();
-    let mut in_raw = std::collections::HashSet::new();
-    let mut in_p = std::collections::HashSet::new();
-    let mut col_raw = std::collections::HashSet::new();
-    let mut col_p = std::collections::HashSet::new();
-
-    for i in 0..s {
-        for j in 0..s {
-            if batch.is_padding[i] == 1 || batch.is_padding[j] == 1 {
-                continue;
-            }
-            let ri = batch.seq_row_ids[i] as usize;
-            let rj = batch.seq_row_ids[j] as usize;
-            let same_row = ri == rj;
-            let fk_ij = ri < r && rj < r && fk_adj[ri * r + rj] == 1;
-            let fk_ji = ri < r && rj < r && fk_adj[rj * r + ri] == 1;
-            let same_col = batch.column_ids[i] == batch.column_ids[j];
-            if same_row || fk_ij {
-                out_raw.insert((i / tile, j / tile));
-                out_p.insert((out_perm[i] as usize / tile, out_perm[j] as usize / tile));
-            }
-            if fk_ji {
-                in_raw.insert((i / tile, j / tile));
-                in_p.insert((in_perm[i] as usize / tile, in_perm[j] as usize / tile));
-            }
-            if same_col {
-                col_raw.insert((i / tile, j / tile));
-                col_p.insert((col_perm[i] as usize / tile, col_perm[j] as usize / tile));
-            }
-        }
-    }
-    (
-        out_raw.len(),
-        out_p.len(),
-        in_raw.len(),
-        in_p.len(),
-        col_raw.len(),
-        col_p.len(),
-    )
-}
-
-/// Background producer loop: continuously builds batches and pushes to channel.
+/// Background producer: loop build_batch → send; runs in a dedicated thread per split.
 fn producer_loop(
     db: Arc<Database>,
     seed_manager: Arc<SeedManager>,
@@ -1179,32 +1723,47 @@ fn producer_loop(
             .wrapping_add(config.rank as u64 * 1000)
             .wrapping_add(split_offset),
     );
+    let mut workspace = BatchBuildWorkspace::new(config.batch_size as usize);
 
     debug!("Producer {:?} started", split);
 
-    let mut produced_batches: u64 = 0;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
-        match build_batch(&db, &seed_manager, &config, split, &mut rng) {
+        match build_batch(&db, &seed_manager, &config, split, &mut rng, &mut workspace) {
             Some(batch) => {
-                produced_batches += 1;
-                if config.perm_stats_every > 0
-                    && produced_batches.is_multiple_of(config.perm_stats_every as u64)
-                {
-                    let side = batch.sequence_length.min(256);
-                    let tile = (config.perm_tile_size as usize).max(1).min(side.max(1));
-                    let (out_raw, out_perm, in_raw, in_perm, col_raw, col_perm) =
-                        count_seq0_active_tiles(&batch, tile);
-                    info!(
-                        "Sampler {:?} tile stats seq0 (side={}, tile={}): out {}->{} in {}->{} col {}->{}",
-                        split, side, tile, out_raw, out_perm, in_raw, in_perm, col_raw, col_perm
-                    );
+                let send_ok = match tx.try_send(batch) {
+                    Ok(()) => true,
+                    Err(TrySendError::Full(batch)) => {
+                        let t_wait = if profile_enabled() {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        let send_result = tx.send(batch);
+                        if t_wait.is_some() {
+                            PROFILE_PRODUCER_BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                        add_elapsed_ns(&PROFILE_PRODUCER_BLOCKED_NS, t_wait);
+                        send_result.is_ok()
+                    }
+                    Err(TrySendError::Disconnected(_)) => false,
+                };
+                if !send_ok {
+                    break;
                 }
-                if tx.send(batch).is_err() {
-                    break; // receiver dropped
+                if profile_enabled() {
+                    match split {
+                        Split::Train => {
+                            PROFILE_PRODUCED_TRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Split::Val => {
+                            PROFILE_PRODUCED_VAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Split::Test => {}
+                    }
                 }
             }
             None => {

@@ -24,6 +24,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def dense_to_csr_packed(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert dense [B,S,S] uint8 mask to packed CSR arrays."""
+    b, s, _ = mask.shape
+    row_ptr = np.zeros((b, s + 1), dtype=np.uint32)
+    seq_offsets = np.zeros((b + 1,), dtype=np.uint32)
+    per_seq_cols: list[np.ndarray] = []
+    for bi in range(b):
+        seq_offsets[bi] = sum(len(cols) for cols in per_seq_cols)
+        row_ptr[bi, 0] = 0
+        seq_cols: list[np.ndarray] = []
+        write = 0
+        for i in range(s):
+            cols = np.nonzero(mask[bi, i])[0]
+            nnz = len(cols)
+            if nnz > 0:
+                seq_cols.append(cols.astype(np.uint16))
+                write += nnz
+            row_ptr[bi, i + 1] = write
+        if seq_cols:
+            per_seq_cols.append(np.concatenate(seq_cols))
+        else:
+            per_seq_cols.append(np.zeros((0,), dtype=np.uint16))
+    seq_offsets[b] = sum(len(cols) for cols in per_seq_cols)
+    if per_seq_cols:
+        col_idx = np.concatenate(per_seq_cols)
+    else:
+        col_idx = np.zeros((0,), dtype=np.uint16)
+    return row_ptr, seq_offsets, col_idx
+
+
 def make_dummy_batch(rng, batch_size, seq_len, max_rows, d_text, num_cols=32):
     """Generate a synthetic batch with realistic shapes and varied targets."""
     b, s, r = batch_size, seq_len, max_rows
@@ -59,11 +89,21 @@ def make_dummy_batch(rng, batch_size, seq_len, max_rows, d_text, num_cols=32):
         target_idx = rng.choice(non_pad, size=n_targets, replace=False)
         is_target[i, target_idx] = 1
 
-    # FK adjacency: identity (each row connects to itself only)
-    fk_adj = np.eye(r, dtype=np.uint8)[None, :, :].repeat(b, axis=0)
-
-    # Permutations: identity
-    identity_perm = np.arange(s, dtype=np.uint16)[None, :].repeat(b, axis=0)
+    # Build masks then convert to fixed-shape CSR transport.
+    ri = seq_row_ids[:, :, None]
+    rj = seq_row_ids[:, None, :]
+    outbound_mask = (ri == rj).astype(np.uint8)
+    inbound_mask = (ri == rj).astype(np.uint8)
+    col_i = column_ids[:, :, None]
+    col_j = column_ids[:, None, :]
+    column_mask = (col_i == col_j).astype(np.uint8)
+    valid = ((1 - is_padding)[:, :, None] & (1 - is_padding)[:, None, :]).astype(np.uint8)
+    outbound_mask *= valid
+    inbound_mask *= valid
+    column_mask *= valid
+    out_rp, out_off, out_ci = dense_to_csr_packed(outbound_mask)
+    in_rp, in_off, in_ci = dense_to_csr_packed(inbound_mask)
+    col_rp, col_off, col_ci = dense_to_csr_packed(column_mask)
 
     # Text embeddings (just one dummy entry)
     text_batch_embeddings = np.zeros((1, d_text), dtype=np.uint16)
@@ -84,10 +124,16 @@ def make_dummy_batch(rng, batch_size, seq_len, max_rows, d_text, num_cols=32):
         "is_null": is_null,
         "is_target": is_target,
         "is_padding": is_padding,
-        "fk_adj": fk_adj,
-        "col_perm": identity_perm.copy(),
-        "out_perm": identity_perm.copy(),
-        "in_perm": identity_perm.copy(),
+        "mask_format": np.array([1], dtype=np.uint8),
+        "outbound_csr_row_ptr": out_rp,
+        "outbound_csr_seq_offsets": out_off,
+        "outbound_csr_col_idx": out_ci,
+        "inbound_csr_row_ptr": in_rp,
+        "inbound_csr_seq_offsets": in_off,
+        "inbound_csr_col_idx": in_ci,
+        "column_csr_row_ptr": col_rp,
+        "column_csr_seq_offsets": col_off,
+        "column_csr_col_idx": col_ci,
         "text_batch_embeddings": text_batch_embeddings,
         "target_stype": target_stype,
         "task_idx": task_idx,

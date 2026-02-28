@@ -8,24 +8,25 @@
 
 All learning signal is expressed as **tasks** against a database.
 We specify at training-time the set of tasks we're interested in solving for our database.
-Every task is a SQL query that materializes ground-truth labels as tuples:
+Every task is a SQL query that materializes ground-truth labels as tuples in a "task table".
 
 ```
 (anchor_row, observation_time, target_value)
 ```
 
-- **anchor_row**: which row to root the BFS subgraph on.
-- **observation_time**: the point in time the model observes from (epoch microseconds, `i64`).
+- **anchor_row**: which row in the task table to root the BFS subgraph on.
+- **observation_time**: the point in time the model observes from (signed epoch microseconds, `i64`).
   The sampler will only include rows that existed at or before this time (temporal filtering).
   Every task always has an observation time per seed — the preprocessor resolves it at materialization time (see below).
+  Some tasks are "autocomplete" tasks, in that the observation time is considered to be "the current time" - this is 
+  actually just expressed at i64::MAX.
 - **target_value**: a (derived) quantity that the model predicts.
   Semantically interpreted as an instance of `target_stype` (numerical, categorical, boolean, or timestamp).
   Loss computation is determined by this value and semantic type.
 
-Tasks live in the `tasks` map of `metadata.json`. The training loop samples a
-task, draws seeds from that task's anchor rows, builds subgraphs, masks the target
-on the seed row, and computes a single-type loss. The model and sampler are
-task-agnostic — they just see anchor rows, subgraphs, and targets.
+Tasks live in the `tasks` map of `metadata.json`.
+The training loop samples a task, draws seeds from that task's anchor rows, builds subgraphs, masks the target
+on the seed row, and computes a single-type loss. The model and sampler are task-agnostic — they just see anchor rows, subgraphs, and targets.
 
 ---
 
@@ -49,7 +50,7 @@ All tasks are defined with the same structure:
 
 ### Cell masking (trivial)
 
-Predict an existing column value on an anchor row for a pre-existing table.
+Predict an existing column value on an anchor row where the target value already exists in a table.
 The simplest possible task, which sorta vaguely looks like BERT-style masking:
 
 ```json
@@ -63,11 +64,11 @@ task: {
 }
 ```
 
-The target is a cell (VoteTypeId) that already exists in the table.
+In this task, the target task has a cell (VoteTypeId) that already exists in a base table (votes.parquet).
 During training, the model will materialize this task table, sample anchor/seed rows from it,
 mask out the VoteTypeId cell, and predict it from the surrounding subgraph.
 
-No `observation_time_column` is needed — the preprocessor falls back to the
+No `observation_time_column` is passed here — the preprocessor falls back to the
 anchor table's `temporal_column` (if any), or `i64::MAX` for static tables.
 See "Observation time resolution" above.
 
@@ -79,7 +80,7 @@ You can set up tasks the same as above, but restricted to some set of rows meeti
 SELECT Id, rating FROM 'orders.parquet' WHERE rating IS NOT NULL
 ```
 
-### Derived tasks (aggregation, existence, etc.)
+### Derived tasks (aggregation, existence, etc.) for forecasting
 
 The target cell can be computed from joins and aggregations — it doesn't have to exist as a cell in any table.
 These require temporal bounds in the SQL and an explicit `observation_time_column`:
@@ -112,13 +113,12 @@ WHERE q.PostTypeId = 1
 
 ## Training Loop
 
-Each training step:
+On each training step, the training loop does the following:
 
-1. **Sample a task** (uniform random, or weighted by importance/difficulty).
+1. **Sample a task** (uniform random, or weighted by importance/difficulty - could do curriculum learning here).
 2. **Draw a batch of seeds** from that task's anchor rows.
 3. **BFS from each seed**, filtering by the seed's observation time.
-4. **Mask the target column** on the seed row (for cell masking tasks) or
-   provide the derived target externally (for aggregation tasks).
+4. **Mask the target column** on the seed row.
 5. **Forward pass** through the relational transformer.
 6. **Compute loss** using the type-specific decoder head matching `target_stype`.
 

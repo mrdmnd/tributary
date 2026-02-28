@@ -18,7 +18,6 @@ fn batch_to_dict<'py>(py: Python<'py>, batch: RawBatch) -> PyResult<Bound<'py, P
     let dict = PyDict::new(py);
     let b = batch.batch_size;
     let s = batch.sequence_length;
-    let r = batch.max_rows;
     let u = batch.num_unique_texts;
 
     // [B, S] tensors
@@ -57,19 +56,31 @@ fn batch_to_dict<'py>(py: Python<'py>, batch: RawBatch) -> PyResult<Bound<'py, P
     let is_padding = PyArray1::from_vec(py, batch.is_padding).reshape([b, s])?;
     dict.set_item("is_padding", is_padding)?;
 
-    // [B, R, R] adjacency
-    let fk_adj = PyArray1::from_vec(py, batch.fk_adj).reshape([b, r, r])?;
-    dict.set_item("fk_adj", fk_adj)?;
-
-    // [B, S] permutations
-    let col_perm = PyArray1::from_vec(py, batch.col_perm).reshape([b, s])?;
-    dict.set_item("col_perm", col_perm)?;
-
-    let out_perm = PyArray1::from_vec(py, batch.out_perm).reshape([b, s])?;
-    dict.set_item("out_perm", out_perm)?;
-
-    let in_perm = PyArray1::from_vec(py, batch.in_perm).reshape([b, s])?;
-    dict.set_item("in_perm", in_perm)?;
+    dict.set_item(
+        "mask_format",
+        PyArray1::from_vec(py, vec![batch.mask_format]),
+    )?;
+    let outbound_csr_row_ptr =
+        PyArray1::from_vec(py, batch.outbound_csr_row_ptr).reshape([b, s + 1])?;
+    dict.set_item("outbound_csr_row_ptr", outbound_csr_row_ptr)?;
+    let outbound_csr_seq_offsets = PyArray1::from_vec(py, batch.outbound_csr_seq_offsets);
+    dict.set_item("outbound_csr_seq_offsets", outbound_csr_seq_offsets)?;
+    let outbound_csr_col_idx = PyArray1::from_vec(py, batch.outbound_csr_col_idx);
+    dict.set_item("outbound_csr_col_idx", outbound_csr_col_idx)?;
+    let inbound_csr_row_ptr =
+        PyArray1::from_vec(py, batch.inbound_csr_row_ptr).reshape([b, s + 1])?;
+    dict.set_item("inbound_csr_row_ptr", inbound_csr_row_ptr)?;
+    let inbound_csr_seq_offsets = PyArray1::from_vec(py, batch.inbound_csr_seq_offsets);
+    dict.set_item("inbound_csr_seq_offsets", inbound_csr_seq_offsets)?;
+    let inbound_csr_col_idx = PyArray1::from_vec(py, batch.inbound_csr_col_idx);
+    dict.set_item("inbound_csr_col_idx", inbound_csr_col_idx)?;
+    let column_csr_row_ptr =
+        PyArray1::from_vec(py, batch.column_csr_row_ptr).reshape([b, s + 1])?;
+    dict.set_item("column_csr_row_ptr", column_csr_row_ptr)?;
+    let column_csr_seq_offsets = PyArray1::from_vec(py, batch.column_csr_seq_offsets);
+    dict.set_item("column_csr_seq_offsets", column_csr_seq_offsets)?;
+    let column_csr_col_idx = PyArray1::from_vec(py, batch.column_csr_col_idx);
+    dict.set_item("column_csr_col_idx", column_csr_col_idx)?;
 
     // [U, D_t] text embeddings (f16 -> stored as u16 for numpy compatibility)
     let text_emb_u16: Vec<u16> = batch
@@ -110,9 +121,6 @@ impl PySampler {
         default_batch_size = 32,
         default_sequence_length = 1024,
         bfs_child_width = 16,
-        max_rows_per_seq = 200,
-        perm_tile_size = 32,
-        perm_stats_every = 100,
     ))]
     fn new(
         py: Python<'_>,
@@ -126,9 +134,6 @@ impl PySampler {
         default_batch_size: u32,
         default_sequence_length: u32,
         bfs_child_width: u32,
-        max_rows_per_seq: u32,
-        perm_tile_size: u32,
-        perm_stats_every: u32,
     ) -> PyResult<Self> {
         let config = SamplerConfig {
             db_path,
@@ -141,9 +146,6 @@ impl PySampler {
             batch_size: default_batch_size,
             sequence_length: default_sequence_length,
             bfs_child_width,
-            max_rows_per_seq,
-            perm_tile_size,
-            perm_stats_every,
         };
 
         let sampler = py

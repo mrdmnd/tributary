@@ -343,8 +343,8 @@ impl CsrGraph {
 // Graph View (zero-copy mmap'd CSR)
 // ============================================================================
 
-/// Header size for `graph.bin`: four `u32` values.
-const GRAPH_HEADER_U32S: usize = 4;
+/// Header size for `graph.bin`: six `u32` values.
+const GRAPH_HEADER_U32S: usize = 6;
 
 /// A zero-copy, memory-mapped view of a bidirectional CSR graph.
 ///
@@ -358,16 +358,23 @@ const GRAPH_HEADER_U32S: usize = 4;
 /// ## File layout
 ///
 /// ```text
-/// Header (16 bytes):
+/// Header (24 bytes):
 ///   [0] num_nodes  (u32) — outgoing
 ///   [1] num_edges  (u32) — outgoing
 ///   [2] num_nodes  (u32) — incoming (must match [0])
 ///   [3] num_edges  (u32) — incoming (must match [1])
+///   [4] num_edges  (u32) — incoming static (no temporal cutoff needed)
+///   [5] num_edges  (u32) — incoming temporal (sorted by timestamp z-score)
 /// Data (packed u32 arrays):
 ///   outgoing.row_ptr  [num_nodes + 1 elements]
 ///   outgoing.col_idx  [num_edges elements]
 ///   incoming.row_ptr  [num_nodes + 1 elements]
 ///   incoming.col_idx  [num_edges elements]
+///   incoming_static.row_ptr  [num_nodes + 1 elements]
+///   incoming_static.col_idx  [num_static_edges elements]
+///   incoming_temporal.row_ptr [num_nodes + 1 elements]
+///   incoming_temporal.col_idx [num_temporal_edges elements]
+///   incoming_temporal.zscore  [num_temporal_edges elements, f32]
 /// ```
 pub struct GraphView {
     /// Keeps the memory map alive for the lifetime of the view.
@@ -380,6 +387,16 @@ pub struct GraphView {
     in_row_ptr: &'static [u32],
     /// Incoming CSR column indices (packed neighbor lists).
     in_col_idx: &'static [u32],
+    /// Incoming static CSR row pointers (`num_nodes + 1` elements).
+    in_static_row_ptr: &'static [u32],
+    /// Incoming static CSR column indices.
+    in_static_col_idx: &'static [u32],
+    /// Incoming temporal CSR row pointers (`num_nodes + 1` elements).
+    in_temporal_row_ptr: &'static [u32],
+    /// Incoming temporal CSR column indices.
+    in_temporal_col_idx: &'static [u32],
+    /// Incoming temporal z-scores aligned with `in_temporal_col_idx`.
+    in_temporal_z: &'static [f32],
     /// Number of nodes in the graph.
     num_nodes: usize,
     /// Number of directed edges in the graph.
@@ -408,6 +425,8 @@ impl GraphView {
             unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u32, GRAPH_HEADER_U32S) };
         let num_nodes = header[0] as usize;
         let num_edges = header[1] as usize;
+        let num_static_edges = header[4] as usize;
+        let num_temporal_edges = header[5] as usize;
         assert_eq!(
             header[2] as usize, num_nodes,
             "incoming num_nodes ({}) != outgoing num_nodes ({num_nodes})",
@@ -420,8 +439,15 @@ impl GraphView {
         );
 
         let row_ptr_len = num_nodes + 1;
-        let expected_u32s = GRAPH_HEADER_U32S + 2 * row_ptr_len + 2 * num_edges;
-        let expected_bytes = expected_u32s * std::mem::size_of::<u32>();
+        let expected_u32s = GRAPH_HEADER_U32S
+            + 2 * row_ptr_len
+            + 2 * num_edges
+            + row_ptr_len
+            + num_static_edges
+            + row_ptr_len
+            + num_temporal_edges;
+        let expected_bytes = expected_u32s * std::mem::size_of::<u32>()
+            + num_temporal_edges * std::mem::size_of::<f32>();
         assert_eq!(
             byte_len, expected_bytes,
             "graph.bin size mismatch: expected {expected_bytes} bytes \
@@ -431,14 +457,47 @@ impl GraphView {
         // SAFETY: The mmap is read-only and immutable. The Arc keeps the
         // backing memory alive for as long as this struct exists. We extend
         // the slice lifetimes to 'static because the Arc prevents deallocation.
-        let base = unsafe { (mmap.as_ptr() as *const u32).add(GRAPH_HEADER_U32S) };
+        let base = mmap.as_ptr();
         let (out_row_ptr, out_col_idx, in_row_ptr, in_col_idx) = unsafe {
-            let out_rp = std::slice::from_raw_parts(base, row_ptr_len);
-            let out_ci = std::slice::from_raw_parts(base.add(row_ptr_len), num_edges);
-            let in_rp = std::slice::from_raw_parts(base.add(row_ptr_len + num_edges), row_ptr_len);
+            let base_u32 = (base as *const u32).add(GRAPH_HEADER_U32S);
+            let out_rp = std::slice::from_raw_parts(base_u32, row_ptr_len);
+            let out_ci = std::slice::from_raw_parts(base_u32.add(row_ptr_len), num_edges);
+            let in_rp =
+                std::slice::from_raw_parts(base_u32.add(row_ptr_len + num_edges), row_ptr_len);
             let in_ci =
-                std::slice::from_raw_parts(base.add(2 * row_ptr_len + num_edges), num_edges);
+                std::slice::from_raw_parts(base_u32.add(2 * row_ptr_len + num_edges), num_edges);
             (out_rp, out_ci, in_rp, in_ci)
+        };
+        let (
+            in_static_row_ptr,
+            in_static_col_idx,
+            in_temporal_row_ptr,
+            in_temporal_col_idx,
+            in_temporal_z,
+        ) = unsafe {
+            let base_u32 =
+                (base as *const u32).add(GRAPH_HEADER_U32S + 2 * row_ptr_len + 2 * num_edges);
+            let in_static_rp = std::slice::from_raw_parts(base_u32, row_ptr_len);
+            let in_static_ci =
+                std::slice::from_raw_parts(base_u32.add(row_ptr_len), num_static_edges);
+            let in_temporal_rp = std::slice::from_raw_parts(
+                base_u32.add(row_ptr_len + num_static_edges),
+                row_ptr_len,
+            );
+            let in_temporal_ci = std::slice::from_raw_parts(
+                base_u32.add(2 * row_ptr_len + num_static_edges),
+                num_temporal_edges,
+            );
+            let temporal_z_ptr =
+                base_u32.add(2 * row_ptr_len + num_static_edges + num_temporal_edges) as *const f32;
+            let in_temporal_z = std::slice::from_raw_parts(temporal_z_ptr, num_temporal_edges);
+            (
+                in_static_rp,
+                in_static_ci,
+                in_temporal_rp,
+                in_temporal_ci,
+                in_temporal_z,
+            )
         };
 
         Self {
@@ -447,6 +506,11 @@ impl GraphView {
             out_col_idx,
             in_row_ptr,
             in_col_idx,
+            in_static_row_ptr,
+            in_static_col_idx,
+            in_temporal_row_ptr,
+            in_temporal_col_idx,
+            in_temporal_z,
             num_nodes,
             num_edges,
         }
@@ -480,6 +544,23 @@ impl GraphView {
         &self.in_col_idx[start..end]
     }
 
+    /// Incoming neighbors from rows without usable temporal values.
+    pub fn incoming_static_neighbors(&self, row: RowIdx) -> &[u32] {
+        let start = self.in_static_row_ptr[row.0 as usize] as usize;
+        let end = self.in_static_row_ptr[row.0 as usize + 1] as usize;
+        &self.in_static_col_idx[start..end]
+    }
+
+    /// Incoming neighbors from rows with temporal values, sorted by z-score.
+    pub fn incoming_temporal_neighbors(&self, row: RowIdx) -> (&[u32], &[f32]) {
+        let start = self.in_temporal_row_ptr[row.0 as usize] as usize;
+        let end = self.in_temporal_row_ptr[row.0 as usize + 1] as usize;
+        (
+            &self.in_temporal_col_idx[start..end],
+            &self.in_temporal_z[start..end],
+        )
+    }
+
     /// Number of outgoing edges (forward FK references) from `row`.
     pub fn out_degree(&self, row: RowIdx) -> u32 {
         self.out_row_ptr[row.0 as usize + 1] - self.out_row_ptr[row.0 as usize]
@@ -502,6 +583,11 @@ impl GraphView {
 pub fn write_graph_bin(
     outgoing: &CsrGraph,
     incoming: &CsrGraph,
+    incoming_static_row_ptr: &[u32],
+    incoming_static_col_idx: &[u32],
+    incoming_temporal_row_ptr: &[u32],
+    incoming_temporal_col_idx: &[u32],
+    incoming_temporal_z: &[f32],
     path: &Path,
 ) -> std::io::Result<()> {
     assert_eq!(
@@ -521,14 +607,34 @@ pub fn write_graph_bin(
 
     let num_nodes = outgoing.num_nodes() as u32;
     let num_edges = outgoing.num_edges() as u32;
+    let num_static_edges = incoming_static_col_idx.len() as u32;
+    let num_temporal_edges = incoming_temporal_col_idx.len() as u32;
+    assert_eq!(
+        incoming_static_row_ptr.len(),
+        outgoing.num_nodes() + 1,
+        "incoming_static_row_ptr length must be num_nodes + 1",
+    );
+    assert_eq!(
+        incoming_temporal_row_ptr.len(),
+        outgoing.num_nodes() + 1,
+        "incoming_temporal_row_ptr length must be num_nodes + 1",
+    );
+    assert_eq!(
+        incoming_temporal_col_idx.len(),
+        incoming_temporal_z.len(),
+        "incoming temporal col_idx and z-score lengths must match",
+    );
 
     let mut w = BufWriter::new(File::create(path)?);
 
-    // Header: [num_nodes, num_edges, num_nodes, num_edges]
+    // Header:
+    // [num_nodes, num_edges, num_nodes, num_edges, num_static_edges, num_temporal_edges]
     w.write_all(&num_nodes.to_ne_bytes())?;
     w.write_all(&num_edges.to_ne_bytes())?;
     w.write_all(&num_nodes.to_ne_bytes())?;
     w.write_all(&num_edges.to_ne_bytes())?;
+    w.write_all(&num_static_edges.to_ne_bytes())?;
+    w.write_all(&num_temporal_edges.to_ne_bytes())?;
 
     /// Write a `&[u32]` slice as raw bytes.
     fn write_u32_slice(w: &mut BufWriter<File>, s: &[u32]) -> std::io::Result<()> {
@@ -543,6 +649,18 @@ pub fn write_graph_bin(
     write_u32_slice(&mut w, &outgoing.col_idx)?;
     write_u32_slice(&mut w, &incoming.row_ptr)?;
     write_u32_slice(&mut w, &incoming.col_idx)?;
+    write_u32_slice(&mut w, incoming_static_row_ptr)?;
+    write_u32_slice(&mut w, incoming_static_col_idx)?;
+    write_u32_slice(&mut w, incoming_temporal_row_ptr)?;
+    write_u32_slice(&mut w, incoming_temporal_col_idx)?;
+    // SAFETY: f32 has no padding and a well-defined memory layout.
+    let z_bytes = unsafe {
+        std::slice::from_raw_parts(
+            incoming_temporal_z.as_ptr() as *const u8,
+            std::mem::size_of_val(incoming_temporal_z),
+        )
+    };
+    w.write_all(z_bytes)?;
 
     w.flush()?;
     Ok(())

@@ -1,5 +1,5 @@
 //! Preprocessor binary: transforms a raw parquet database into the binary format
-//! used by the training pipeline.
+//! used by the sampling pipeline.
 //!
 //! ## Input
 //!
@@ -1018,7 +1018,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Step 6: Build FK graph and write graph.bin ───────────────────────
     info!("Step 6: Building FK graph...");
-    let pb_graph = ProgressBar::new(num_tables as u64 * 2);
+    let pb_graph = ProgressBar::new(num_tables as u64 * 2 + 1);
     pb_graph.set_style(
         ProgressStyle::with_template(
             "  Graph      {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] {msg}",
@@ -1049,7 +1049,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pb_graph.inc(1);
     }
 
-    // 6b) Collect FK edges
+    // 6b) Build per-row temporal z-score lookup for temporal incoming index.
+    pb_graph.set_message("indexing temporal rows");
+    let mut row_temporal_valid = vec![0u8; total_rows];
+    let mut row_temporal_z = vec![0f32; total_rows];
+    for (ti, lt) in loaded_tables.iter().enumerate() {
+        let Some(tc_name) = &table_temporal_col_names[ti] else {
+            continue;
+        };
+        let Some(col_idx) = lt.schema.index_of(tc_name).ok() else {
+            continue;
+        };
+        let arr = lt.batch.column(col_idx);
+        let Some(ts_arr) = cast_to_timestamp_us(arr.as_ref()) else {
+            continue;
+        };
+        let row_start = table_row_ranges[ti].0.0 as usize;
+        for i in 0..ts_arr.len() {
+            if ts_arr.is_null(i) {
+                continue;
+            }
+            let global_row = row_start + i;
+            row_temporal_valid[global_row] = 1;
+            row_temporal_z[global_row] = if global_ts_std_us > 0.0 {
+                ((ts_arr.value(i) as f64 - global_ts_mean_us) / global_ts_std_us) as f32
+            } else {
+                0.0
+            };
+        }
+    }
+    pb_graph.inc(1);
+
+    // 6c) Collect FK edges
     pb_graph.set_message("resolving FK edges");
     let mut edges: Vec<(u32, u32)> = Vec::new();
     for (ti, lt) in loaded_tables.iter().enumerate() {
@@ -1090,13 +1121,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Collected {} FK edges", HumanCount(edges.len() as u64));
 
     let (outgoing, incoming) = CsrGraph::build_pair(total_rows, edges);
+    let mut incoming_static_row_ptr: Vec<u32> = Vec::with_capacity(total_rows + 1);
+    let mut incoming_static_col_idx: Vec<u32> = Vec::new();
+    let mut incoming_temporal_row_ptr: Vec<u32> = Vec::with_capacity(total_rows + 1);
+    let mut incoming_temporal_col_idx: Vec<u32> = Vec::new();
+    let mut incoming_temporal_z: Vec<f32> = Vec::new();
+    incoming_static_row_ptr.push(0);
+    incoming_temporal_row_ptr.push(0);
+    for dst in 0..total_rows {
+        let mut temporal_pairs: Vec<(f32, u32)> = Vec::new();
+        for &src in incoming.neighbors(dst as u32) {
+            let src_idx = src as usize;
+            if row_temporal_valid[src_idx] == 1 {
+                temporal_pairs.push((row_temporal_z[src_idx], src));
+            } else {
+                incoming_static_col_idx.push(src);
+            }
+        }
+        temporal_pairs.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (z, src) in temporal_pairs {
+            incoming_temporal_col_idx.push(src);
+            incoming_temporal_z.push(z);
+        }
+        incoming_static_row_ptr.push(incoming_static_col_idx.len() as u32);
+        incoming_temporal_row_ptr.push(incoming_temporal_col_idx.len() as u32);
+    }
     let graph_path = output_dir.join("graph.bin");
-    write_graph_bin(&outgoing, &incoming, &graph_path)?;
+    write_graph_bin(
+        &outgoing,
+        &incoming,
+        &incoming_static_row_ptr,
+        &incoming_static_col_idx,
+        &incoming_temporal_row_ptr,
+        &incoming_temporal_col_idx,
+        &incoming_temporal_z,
+        &graph_path,
+    )?;
     info!(
-        "  Wrote {} ({} nodes, {} edges)",
+        "  Wrote {} ({} nodes, {} edges, {} static incoming, {} temporal incoming)",
         graph_path.display(),
         outgoing.num_nodes(),
-        outgoing.num_edges()
+        outgoing.num_edges(),
+        incoming_static_col_idx.len(),
+        incoming_temporal_col_idx.len()
     );
 
     // ── Step 7: Materialize tasks via DataFusion SQL ─────────────────────
