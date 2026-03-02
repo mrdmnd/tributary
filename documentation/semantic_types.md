@@ -23,7 +23,7 @@ Semantic types are defined in `headwater/src/common.rs` as the `SemanticType` en
 
 ### Identifier (`0`)
 
-Identifiers uniquely (or nearly uniquely) distinguish a row. 
+Identifiers uniquely (or nearly uniquely) distinguish a row.
 Their purpose is entity identity, not attribute description. Examples: `customer_id`, `email`, `display_name`.
 
 - Integer columns named `*_id` or `*Id` are almost always identifiers.

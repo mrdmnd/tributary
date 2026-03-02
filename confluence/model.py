@@ -18,7 +18,11 @@ from confluence.layers import (
     ZeroCenteredRMSNorm,
 )
 
-# Semantic type constants (must match Rust SemanticType enum)
+# Intrinsic constants (must match headwater/src/common.rs)
+NUM_SEMANTIC_TYPES = 7  # SemanticType enum: Identifier=0..Ignored=6
+TIMESTAMP_DIM = 15  # TIMESTAMP_CYCLIC_PAIRS * 2 + 1
+NUM_BOOL_VALUES = 2  # false=0, true=1
+
 STYPE_IDENTIFIER = 0
 STYPE_NUMERICAL = 1
 STYPE_TIMESTAMP = 2
@@ -102,7 +106,7 @@ class ValueEncoder(nn.Module):
         bool_emb_table = self.param(
             "boolean_encoder",
             nn.initializers.normal(stddev=0.02),
-            (cfg.num_bool_values, d),
+            (NUM_BOOL_VALUES, d),
         )
         bool_val = bool_emb_table[bool_input]  # [B, S, D]
 
@@ -121,7 +125,7 @@ class ValueEncoder(nn.Module):
 
         # Dense type dispatch: sum of one_hot(stype, t) * encoder_t(values)
         stypes = semantic_types.astype(jnp.int32)  # [B, S]
-        type_one_hot = jax.nn.one_hot(stypes, cfg.num_semantic_types)  # [B,S,7]
+        type_one_hot = jax.nn.one_hot(stypes, NUM_SEMANTIC_TYPES)  # [B,S,7]
 
         # Stack all encoders: [B, S, 7, D]
         all_vals = jnp.stack(
@@ -180,7 +184,7 @@ class DecoderHeads(nn.Module):
         null_logits = nn.Dense(1, use_bias=True, name="null_head")(h).squeeze(-1)
         num_preds = nn.Dense(1, use_bias=True, name="numerical_decoder")(h).squeeze(-1)
         bool_logits = nn.Dense(1, use_bias=True, name="boolean_decoder")(h).squeeze(-1)
-        ts_preds = nn.Dense(self.config.d_time, use_bias=True, name="timestamp_decoder")(h)
+        ts_preds = nn.Dense(TIMESTAMP_DIM, use_bias=True, name="timestamp_decoder")(h)
         cat_preds = nn.Dense(d, use_bias=True, name="categorical_decoder")(h)
 
         return ModelOutput(

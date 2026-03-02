@@ -18,7 +18,7 @@ Every task is a SQL query that materializes ground-truth labels as tuples in a "
 - **observation_time**: the point in time the model observes from (signed epoch microseconds, `i64`).
   The sampler will only include rows that existed at or before this time (temporal filtering).
   Every task always has an observation time per seed — the preprocessor resolves it at materialization time (see below).
-  Some tasks are "autocomplete" tasks, in that the observation time is considered to be "the current time" - this is 
+  Some tasks are "autocomplete" tasks, in that the observation time is considered to be "the current time" - this is
   actually just expressed at i64::MAX.
 - **target_value**: a (derived) quantity that the model predicts.
   Semantically interpreted as an instance of `target_stype` (numerical, categorical, boolean, or timestamp).

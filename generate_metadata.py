@@ -110,7 +110,7 @@ Every column MUST receive one of these types:
   High cardinality, values are labels not meaningful content.
   Integer columns named *Id or *_id are almost always identifiers.
   String columns that are names/labels (not prose) are often identifiers.
-  Other examples: phone numbers, email addresses, URLs, etc. 
+  Other examples: phone numbers, email addresses, URLs, etc.
   Textual fields where the *language semantics* of the value are NOT meaningful might
   be identifiers.
 
@@ -155,7 +155,7 @@ Guidelines:
   no meaningful creation time. Omit temporal_column for these.
 - The temporal_column must be a column with stype "timestamp" in the same
   table.
-- Some tables may have multiple temporal columns. For example, a table that 
+- Some tables may have multiple temporal columns. For example, a table that
   a row with multiple "checkpoint" timestamps, indicating progression through
   a process. In this case, you'll have to use judgement to determine which column
   corresponds to the "creation" time for that row.

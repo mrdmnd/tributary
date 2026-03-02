@@ -7,9 +7,10 @@ Implements:
 - SwiGLU FFN
 """
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
+
 from confluence.config import ModelConfig
 
 
@@ -18,14 +19,13 @@ class ZeroCenteredRMSNorm(nn.Module):
 
     gamma is initialized to 0 so the layer starts as pure normalization.
     """
+
     eps: float = 1e-6
 
     @nn.compact
     def __call__(self, x):
-        gamma = self.param(
-            "gamma", nn.initializers.zeros_init(), (x.shape[-1],)
-        )
-        rms = jnp.sqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + self.eps)
+        gamma = self.param("gamma", nn.initializers.zeros_init(), (x.shape[-1],))
+        rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
         return (1.0 + gamma) * x / rms
 
 
@@ -35,6 +35,7 @@ class QKNormedMultiHeadAttention(nn.Module):
     Q and K are L2-normalized after projection. A learnable scalar temperature
     per head scales the dot products. No bias in W_Q, W_K, W_V, W_O.
     """
+
     config: ModelConfig
     output_scale: float = 1.0  # For scaled residual init (1/sqrt(4*N_layers))
 
@@ -71,7 +72,7 @@ class QKNormedMultiHeadAttention(nn.Module):
         k = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-6)
 
         # Learnable temperature per head, initialized to sqrt(d_head)
-        init_tau = float(cfg.d_head ** 0.5)
+        init_tau = float(cfg.d_head**0.5)
         tau = self.param(
             "tau",
             lambda rng, shape: jnp.full(shape, init_tau),
@@ -119,6 +120,7 @@ class GatedAttentionSublayer(nn.Module):
     The gate is sigmoid(x_norm @ W_gate) applied elementwise to the attention
     output before the residual connection.
     """
+
     config: ModelConfig
     output_scale: float = 1.0
 
@@ -137,9 +139,7 @@ class GatedAttentionSublayer(nn.Module):
         x_norm = ZeroCenteredRMSNorm(eps=cfg.rms_norm_eps, name="norm")(x)
 
         # Attention in sequence order
-        attn_out = QKNormedMultiHeadAttention(
-            config=cfg, output_scale=self.output_scale, name="mha"
-        )(x_norm, mask)
+        attn_out = QKNormedMultiHeadAttention(config=cfg, output_scale=self.output_scale, name="mha")(x_norm, mask)
 
         # Sigmoid gate: gate = sigmoid(x_norm @ W_gate)
         gate = nn.Dense(d, use_bias=False, name="w_gate")(x_norm)
@@ -154,6 +154,7 @@ class SwiGLUFFN(nn.Module):
 
     No bias terms. D_ff = 768 for D = 256.
     """
+
     config: ModelConfig
     output_scale: float = 1.0
 
@@ -180,6 +181,7 @@ class TransformerLayer(nn.Module):
 
     Attention order: outbound -> inbound -> column.
     """
+
     config: ModelConfig
     layer_idx: int = 0
 
@@ -191,24 +193,16 @@ class TransformerLayer(nn.Module):
         output_scale = 1.0 / (4.0 * n_layers) ** 0.5
 
         # Outbound attention (self + FK parents)
-        x = GatedAttentionSublayer(
-            config=cfg, output_scale=output_scale, name="outbound"
-        )(x, outbound_mask)
+        x = GatedAttentionSublayer(config=cfg, output_scale=output_scale, name="outbound")(x, outbound_mask)
 
         # Inbound attention (FK children)
-        x = GatedAttentionSublayer(
-            config=cfg, output_scale=output_scale, name="inbound"
-        )(x, inbound_mask)
+        x = GatedAttentionSublayer(config=cfg, output_scale=output_scale, name="inbound")(x, inbound_mask)
 
         # Column attention (same-column peers)
-        x = GatedAttentionSublayer(
-            config=cfg, output_scale=output_scale, name="column"
-        )(x, column_mask)
+        x = GatedAttentionSublayer(config=cfg, output_scale=output_scale, name="column")(x, column_mask)
 
         # FFN with pre-norm
         x_norm = ZeroCenteredRMSNorm(eps=cfg.rms_norm_eps, name="ffn_norm")(x)
-        x = x + SwiGLUFFN(
-            config=cfg, output_scale=output_scale, name="ffn"
-        )(x_norm)
+        x = x + SwiGLUFFN(config=cfg, output_scale=output_scale, name="ffn")(x_norm)
 
         return x

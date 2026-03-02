@@ -8,29 +8,29 @@ class ModelConfig:
     """Configuration for the RelationalTransformer model."""
 
     # Core dimensions
-    d_model: int = 256          # Model hidden dimension (D)
-    d_text: int = 256           # Frozen text embedding dimension (D_t)
-    d_ff: int = 768             # FFN hidden dimension (ceil(8/3 * D), rounded to 256)
-    n_layers: int = 6           # Number of transformer layers
-    n_heads: int = 8            # Number of attention heads
-    d_head: int = 32            # Per-head dimension (D / n_heads)
-    d_time: int = 15            # Timestamp encoding dimension
+    d_model: int = 1024  # Model hidden dimension (D)
+    d_text: int = 256  # Frozen text embedding dimension (D_t)
+    d_ff: int = 4096  # FFN hidden dimension
+    n_layers: int = 6  # Number of transformer layers
+    n_heads: int = 8  # Number of attention heads (d_head = d_model // n_heads)
 
     # Sequence dimensions
-    max_seq_len: int = 1024     # Maximum sequence length (S)
-    max_rows: int = 200         # Maximum rows per sequence (R)
-
-    # Semantic types (must match Rust SemanticType enum)
-    num_semantic_types: int = 7  # Identifier=0..Ignored=6
+    max_seq_len: int = 1024  # Maximum sequence length (S)
 
     # Attention
-    dropout_rate: float = 0.0   # No dropout in initial version
+    dropout_rate: float = 0.0  # No dropout in initial version
 
     # Normalization
     rms_norm_eps: float = 1e-6
 
-    # Number of boolean values for embedding
-    num_bool_values: int = 2    # false=0, true=1
+    def __post_init__(self) -> None:
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
+
+    @property
+    def d_head(self) -> int:
+        """Per-head dimension (d_model // n_heads)."""
+        return self.d_model // self.n_heads
 
 
 @dataclass
@@ -72,7 +72,7 @@ class TrainingConfig:
 
     # Sampler
     bfs_child_width: int = 16
-    num_prefetch: int = 3
+    num_prefetch: int = 2
     split_ratios: tuple = (0.8, 0.1, 0.1)
     split_seed: int = 123
     seed: int = 42

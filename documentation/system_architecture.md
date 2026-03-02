@@ -471,14 +471,14 @@ priority, yielding rayon workers to the training producer when both are active.
 The model operates in bfloat16 for most computation, with targeted float32 upcasts where
 low-precision gradients would produce NaN or overflow. Three design decisions enforce this:
 
-**1. No explicit padding zeroing in the value encoder.**  
+**1. No explicit padding zeroing in the value encoder.**
 The original design zeroed padding positions via `h0 = h0 * (1 - is_padding)`. This created
 exact-zero hidden states whose gradients through L2 normalization and RMSNorm produced NaN
 (the gradient of `x / ||x||` at `x = 0` is `I / eps`, which overflows in bf16). Since attention
 masks already exclude padding from affecting non-padding positions, the zeroing was redundant
 and is omitted.
 
-**2. Float32 attention with safe L2 normalization.**  
+**2. Float32 attention with safe L2 normalization.**
 QK-normalized attention (Q and K are L2-normalized before the dot product) is particularly
 sensitive to low-precision gradients. The QKV projections use no bias, so padding positions
 produce zero Q/K vectors after projection. The attention layer:
@@ -491,7 +491,7 @@ produce zero Q/K vectors after projection. The attention layer:
   softmax inputs that could cause numerical issues in the backward pass.
 - Casts back to the input dtype (bf16) after the softmax-weighted sum.
 
-**3. Diagonal self-attention in all masks.**  
+**3. Diagonal self-attention in all masks.**
 Every attention mask (outbound, inbound, column) includes the identity diagonal, ensuring
 every position can attend to at least itself. Without this, padding positions whose mask rows
 are all-False produce softmax over all-`-inf` inputs → `0/0 = NaN` in the backward pass.

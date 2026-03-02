@@ -15,16 +15,17 @@ from confluence.config import TrainingConfig
 
 def make_schedule(peak_lr, warmup_steps, total_steps, min_ratio=0.1):
     """Linear warmup + cosine decay to min_ratio * peak_lr."""
+
     def schedule_fn(count):
         warmup = jnp.minimum(count / jnp.maximum(warmup_steps, 1), 1.0)
         progress = jnp.clip(
             (count - warmup_steps) / jnp.maximum(total_steps - warmup_steps, 1),
-            0.0, 1.0,
+            0.0,
+            1.0,
         )
-        decay = min_ratio + (1.0 - min_ratio) * 0.5 * (
-            1.0 + jnp.cos(jnp.pi * progress)
-        )
+        decay = min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
         return peak_lr * warmup * decay
+
     return schedule_fn
 
 

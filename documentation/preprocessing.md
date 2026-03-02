@@ -33,7 +33,7 @@ data/
     - text_embeddings.bin
     - graph.bin
 
-## Raw Input Data 
+## Raw Input Data
 
 We get input datasets as collections of .parquet files - these are stored in the `raw` directory, with their database
 name as the directory name. Each raw database directory contains one `.parquet` files per table.
