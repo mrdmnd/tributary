@@ -15,3 +15,5 @@ target
 
 data/processed/
 data/raw/
+**/*.DS_Store
+**/batch_inspect.html

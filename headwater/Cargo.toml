@@ -64,9 +64,5 @@ name = "inspect"
 path = "src/bin/inspect.rs"
 
 [[bin]]
-name = "single_sample"
-path = "src/bin/single_sample.rs"
-
-[[bin]]
-name = "benchmark_sampler"
-path = "src/bin/benchmark_sampler.rs"
+name = "inspect_batch"
+path = "src/bin/inspect_batch.rs"

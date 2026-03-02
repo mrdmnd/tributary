@@ -53,19 +53,22 @@ In a production training scenarios you're probably being run on an 8x B200 node.
 
 You can ALWAYS ASSUME that you are running in an environment with CUDA support; no need for CPU fallbacks anywhere.
 
-### Rust (`headwater`)
+### Rust Guidelines
 
 This project uses cargo, like a normal rust project.
 Binaries should be built and compiled in --release mode.
 
-Use `cargo fmt` for consistent code formatting; `cargo clippy` to ensure lints and idiomatic suggestions are followed;
-write tests and use `cargo test` where appropriate.
+Use `cargo fmt` for consistent code formatting; `cargo clippy` to ensure lints and idiomatic suggestions are followed.
+Write tests and use `cargo test` where appropriate.
 
 Avoid anti-patterns like `unwrap`.
 
+Where possible, use the newtypes defined in `headwater/src/common.rs` to represent indices and other values.
+The existence of "as" and ".0" are usually code smells; try to find these and avoid them.
+
 Use tokio-rs `tracing` for logging instead or print statements.
 
-### Python
+### Python Guidelines
 
 The repository root is a **uv workspace** and the `confluence` Python package.
 The workspace root `pyproject.toml` contains both the package definition and shared tool configuration (ruff).
@@ -77,6 +80,23 @@ A single `uv.lock` at the root manages dependency resolution.
 
 Run training with `uv run train` (entry point defined in `[project.scripts]`).
 
+Use `ty` for typechecking.
+Use `deptry` to check for dependency updates, and ensure you're including what you use.
+Use `pytest` for testing.
 Use `ruff` for linting/formatting (config lives in the root `pyproject.toml`).
 
-When done making changes, always run the git precommit hooks:
+You should always ensure that functions are no longer than about 60 lines (one screen of text).
+You should always include strong type hints for all functions and variables.
+You should _especially_ be sure to use the `jaxtyping` library to put tensor shape types in place.
+
+For example:
+
+```python
+from jaxtyping import Float
+
+def my_function(x: Float[Tensor, "N M"]) -> Float[Tensor, "N M"]:
+    return x + 1
+```
+
+When done making changes, always run the git precommit hooks and fix any issues.
+You can do this by running `pre-commit` from the project root.

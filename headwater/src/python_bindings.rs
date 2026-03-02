@@ -7,28 +7,29 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::batch::RawBatch;
 use crate::common::TIMESTAMP_DIM;
 use crate::embedder::EMBEDDING_DIM;
-use crate::sampler::{RawBatch, Sampler, SamplerConfig};
+use crate::sampler::{Sampler, SamplerConfig};
 
 /// Convert a `RawBatch` into a Python dict of numpy arrays.
 ///
 /// Uses `PyArray::from_vec` for zero-copy ownership transfer from Rust to NumPy.
-fn batch_to_dict<'py>(py: Python<'py>, batch: RawBatch) -> PyResult<Bound<'py, PyDict>> {
+fn batch_to_dict<'py>(
+    py: Python<'py>,
+    batch: RawBatch,
+    b: usize,
+    s: usize,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    let b = batch.batch_size;
-    let s = batch.sequence_length;
     let u = batch.num_unique_texts;
 
     // [B, S] tensors
     let semantic_types = PyArray1::from_vec(py, batch.semantic_types).reshape([b, s])?;
     dict.set_item("semantic_types", semantic_types)?;
 
-    let column_ids = PyArray1::from_vec(py, batch.column_ids).reshape([b, s])?;
-    dict.set_item("column_ids", column_ids)?;
-
-    let seq_row_ids = PyArray1::from_vec(py, batch.seq_row_ids).reshape([b, s])?;
-    dict.set_item("seq_row_ids", seq_row_ids)?;
+    let column_embed_ids = PyArray1::from_vec(py, batch.column_embed_ids).reshape([b, s])?;
+    dict.set_item("column_embed_ids", column_embed_ids)?;
 
     let numeric_values = PyArray1::from_vec(py, batch.numeric_values).reshape([b, s])?;
     dict.set_item("numeric_values", numeric_values)?;
@@ -50,16 +51,9 @@ fn batch_to_dict<'py>(py: Python<'py>, batch: RawBatch) -> PyResult<Bound<'py, P
     let is_null = PyArray1::from_vec(py, batch.is_null).reshape([b, s])?;
     dict.set_item("is_null", is_null)?;
 
-    let is_target = PyArray1::from_vec(py, batch.is_target).reshape([b, s])?;
-    dict.set_item("is_target", is_target)?;
-
     let is_padding = PyArray1::from_vec(py, batch.is_padding).reshape([b, s])?;
     dict.set_item("is_padding", is_padding)?;
 
-    dict.set_item(
-        "mask_format",
-        PyArray1::from_vec(py, vec![batch.mask_format]),
-    )?;
     let outbound_csr_row_ptr =
         PyArray1::from_vec(py, batch.outbound_csr_row_ptr).reshape([b, s + 1])?;
     dict.set_item("outbound_csr_row_ptr", outbound_csr_row_ptr)?;
@@ -165,11 +159,15 @@ impl PySampler {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Sampler has been shut down"))?;
 
+        let cfg = sampler.config();
+        let b = cfg.batch_size as usize;
+        let s = cfg.sequence_length as usize;
+
         let batch = py
             .detach(|| sampler.next_train_batch())
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
-        batch_to_dict(py, batch)
+        batch_to_dict(py, batch, b, s)
     }
 
     /// Build and return the next validation batch. Returns a dict of numpy arrays.
@@ -180,11 +178,15 @@ impl PySampler {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Sampler has been shut down"))?;
 
+        let cfg = sampler.config();
+        let b = cfg.batch_size as usize;
+        let s = cfg.sequence_length as usize;
+
         let batch = py
             .detach(|| sampler.next_val_batch())
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
-        batch_to_dict(py, batch)
+        batch_to_dict(py, batch, b, s)
     }
 
     /// Get column-name embeddings: [num_columns, EMBEDDING_DIM] as float16

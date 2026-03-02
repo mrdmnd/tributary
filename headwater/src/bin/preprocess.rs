@@ -105,6 +105,12 @@ struct RawColumn {
 }
 
 #[derive(Deserialize, Debug)]
+struct RawColumnRef {
+    table: String,
+    column: String,
+}
+
+#[derive(Deserialize, Debug)]
 struct RawTask {
     query: String,
     anchor_table: String,
@@ -112,6 +118,8 @@ struct RawTask {
     target_column: String,
     target_stype: String,
     observation_time_column: Option<String>,
+    #[serde(default)]
+    columns_to_drop: Vec<RawColumnRef>,
 }
 
 // ============================================================================
@@ -1016,19 +1024,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pb_enc.finish_and_clear();
     info!("  Wrote {} table files", num_tables);
 
-    // ── Step 6: Build FK graph and write graph.bin ───────────────────────
-    info!("Step 6: Building FK graph...");
-    let pb_graph = ProgressBar::new(num_tables as u64 * 2 + 1);
-    pb_graph.set_style(
-        ProgressStyle::with_template(
-            "  Graph      {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
+    // Build (table_name, column_name) -> global ColumnIdx lookup for FK and columns_to_drop resolution.
+    let col_lookup: HashMap<(String, String), ColumnIdx> = {
+        let mut map = HashMap::new();
+        let mut ci = 0u32;
+        for (table_name, raw_table) in &raw_meta.tables {
+            for (col_name, _) in &raw_table.columns {
+                map.insert((table_name.clone(), col_name.clone()), ColumnIdx(ci));
+                ci += 1;
+            }
+        }
+        map
+    };
+
+    // ── Step 6: Build PK maps and collect FK edges ─────────────────────
+    // Graph construction is deferred to after task tables are created (step 7b)
+    // so that task table rows and their one-directional FK edges can be included.
+    info!("Step 6: Building PK maps and collecting FK edges...");
 
     // 6a) Build PK lookup maps: table_name -> HashMap<i64, global_row_idx>
-    pb_graph.set_message("building PK maps");
     let mut pk_maps: HashMap<String, HashMap<i64, u32>> = HashMap::new();
     for (ti, lt) in loaded_tables.iter().enumerate() {
         if let Some(pk_col_name) = &lt.raw_table.primary_key {
@@ -1046,11 +1060,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        pb_graph.inc(1);
     }
 
-    // 6b) Build per-row temporal z-score lookup for temporal incoming index.
-    pb_graph.set_message("indexing temporal rows");
+    // 6b) Build per-row temporal z-score lookup for the temporal incoming index.
     let mut row_temporal_valid = vec![0u8; total_rows];
     let mut row_temporal_z = vec![0f32; total_rows];
     for (ti, lt) in loaded_tables.iter().enumerate() {
@@ -1078,11 +1090,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
         }
     }
-    pb_graph.inc(1);
 
-    // 6c) Collect FK edges
-    pb_graph.set_message("resolving FK edges");
-    let mut edges: Vec<(u32, u32)> = Vec::new();
+    // 6c) Collect FK edges from real tables (task edges added in step 7b).
+    let mut real_edges: Vec<(u32, u32)> = Vec::new();
     for (ti, lt) in loaded_tables.iter().enumerate() {
         let row_start = table_row_ranges[ti].0.0;
 
@@ -1100,7 +1110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let fk_val = i64_arr.value(i);
                                         if let Some(&target_row) = pk_map.get(&fk_val) {
                                             let src_row = row_start + i as u32;
-                                            edges.push((src_row, target_row));
+                                            real_edges.push((src_row, target_row));
                                         }
                                     }
                                 }
@@ -1115,20 +1125,366 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        pb_graph.inc(1);
     }
-    pb_graph.finish_and_clear();
-    info!("  Collected {} FK edges", HumanCount(edges.len() as u64));
+    info!(
+        "  PK maps built, {} real FK edges collected",
+        HumanCount(real_edges.len() as u64)
+    );
 
-    let (outgoing, incoming) = CsrGraph::build_pair(total_rows, edges);
-    let mut incoming_static_row_ptr: Vec<u32> = Vec::with_capacity(total_rows + 1);
+    // ── Step 7: Materialize tasks + create task tables ──────────────────
+    info!("Step 7: Materializing tasks and creating task tables...");
+    let num_tasks = raw_meta.tasks.len();
+    let pb_tasks = ProgressBar::new(num_tasks as u64);
+    pb_tasks.set_style(
+        ProgressStyle::with_template(
+            "  Tasks      {bar:40.cyan/blue} {pos}/{len} tasks [{elapsed_precise}] {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+
+    let mut task_metadata_list: Vec<TaskMetadata> = Vec::new();
+    let mut task_edges: Vec<(u32, u32)> = Vec::new();
+    let mut task_col_name_strings: Vec<String> = Vec::new();
+
+    // Build table name -> TableIdx lookup
+    let table_name_to_idx: HashMap<String, usize> = table_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+
+    rt.block_on(async {
+        let session_config = datafusion::prelude::SessionConfig::new()
+            .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
+        let ctx = datafusion::prelude::SessionContext::new_with_config(session_config);
+
+        for (table_name, _) in &raw_meta.tables {
+            let path = raw_dir.join(format!("{table_name}.parquet"));
+            let path_str = path.to_str().unwrap();
+            let create_sql = format!(
+                "CREATE EXTERNAL TABLE \"{table_name}\" STORED AS PARQUET LOCATION '{path_str}'"
+            );
+            ctx.sql(&create_sql).await?;
+        }
+
+        for (task_name, raw_task) in raw_meta.tasks.iter() {
+            pb_tasks.set_message(task_name.clone());
+
+            let mut query = raw_task.query.clone();
+            for (tname, _) in &raw_meta.tables {
+                let from_pat = format!("'{tname}.parquet'");
+                let to_pat = format!("\"{tname}\"");
+                query = query.replace(&from_pat, &to_pat);
+            }
+
+            let df = ctx.sql(&query).await?;
+            let batches = df.collect().await?;
+
+            if batches.is_empty() {
+                warn!("    Task {} returned no results, skipping", task_name);
+                pb_tasks.inc(1);
+                continue;
+            }
+
+            let result_schema = batches[0].schema();
+            let result_batch = if batches.len() == 1 {
+                batches.into_iter().next().unwrap()
+            } else {
+                concat_batches(&result_schema, &batches)?
+            };
+
+            let num_seeds = result_batch.num_rows();
+            info!("    {} seeds", num_seeds);
+
+            let anchor_table_idx = *table_name_to_idx
+                .get(&raw_task.anchor_table)
+                .ok_or_else(|| format!("anchor_table '{}' not found", raw_task.anchor_table))?;
+            let anchor_pk_map = pk_maps
+                .get(&raw_task.anchor_table)
+                .ok_or_else(|| format!("no PK map for anchor_table '{}'", raw_task.anchor_table))?;
+
+            let anchor_col_idx = result_schema.index_of(&raw_task.anchor_key)?;
+            let anchor_arr = result_batch.column(anchor_col_idx);
+            let anchor_i64 = cast_to_i64(anchor_arr.as_ref()).ok_or_else(|| {
+                format!("cannot cast anchor_key '{}' to i64", raw_task.anchor_key)
+            })?;
+
+            let mut anchor_rows: Vec<u32> = Vec::with_capacity(num_seeds);
+            let mut valid_mask: Vec<bool> = Vec::with_capacity(num_seeds);
+            for i in 0..num_seeds {
+                if anchor_i64.is_null(i) {
+                    anchor_rows.push(0);
+                    valid_mask.push(false);
+                } else {
+                    let pk_val = anchor_i64.value(i);
+                    if let Some(&global_row) = anchor_pk_map.get(&pk_val) {
+                        anchor_rows.push(global_row);
+                        valid_mask.push(true);
+                    } else {
+                        anchor_rows.push(0);
+                        valid_mask.push(false);
+                    }
+                }
+            }
+
+            let valid_indices: Vec<usize> = valid_mask
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v { Some(i) } else { None })
+                .collect();
+            let num_valid = valid_indices.len();
+            if num_valid == 0 {
+                warn!("    No valid seeds for task {}, skipping", task_name);
+                pb_tasks.inc(1);
+                continue;
+            }
+            let anchor_rows_valid: Vec<u32> =
+                valid_indices.iter().map(|&i| anchor_rows[i]).collect();
+
+            let observation_times: Vec<i64> = if let Some(obs_col_name) =
+                &raw_task.observation_time_column
+            {
+                let obs_col_idx = result_schema.index_of(obs_col_name)?;
+                let obs_arr = result_batch.column(obs_col_idx);
+                let obs_ts = cast_to_timestamp_us(obs_arr.as_ref()).ok_or_else(|| {
+                    format!(
+                        "cannot cast observation_time '{}' to timestamp",
+                        obs_col_name
+                    )
+                })?;
+                valid_indices
+                    .iter()
+                    .map(|&i| {
+                        if obs_ts.is_null(i) {
+                            i64::MAX
+                        } else {
+                            obs_ts.value(i)
+                        }
+                    })
+                    .collect()
+            } else if let Some(tc_name) = &raw_meta.tables[&raw_task.anchor_table].temporal_column {
+                let anchor_lt = loaded_tables
+                    .iter()
+                    .find(|lt| lt.name == raw_task.anchor_table)
+                    .ok_or_else(|| {
+                        format!(
+                            "anchor table '{}' not found in loaded tables",
+                            raw_task.anchor_table
+                        )
+                    })?;
+                let tc_arr_idx = anchor_lt.schema.index_of(tc_name).map_err(|_| {
+                    format!(
+                        "temporal_column '{}' not found in table '{}'",
+                        tc_name, raw_task.anchor_table
+                    )
+                })?;
+                let tc_arr = anchor_lt.batch.column(tc_arr_idx);
+                let tc_ts = cast_to_timestamp_us(tc_arr.as_ref()).ok_or_else(|| {
+                    format!("cannot cast temporal_column '{}' to timestamp", tc_name)
+                })?;
+                let anchor_row_start = table_row_ranges[anchor_table_idx].0.0;
+                valid_indices
+                    .iter()
+                    .map(|&i| {
+                        let global_row = anchor_rows[i];
+                        let local_row = (global_row - anchor_row_start) as usize;
+                        if tc_ts.is_null(local_row) {
+                            i64::MAX
+                        } else {
+                            tc_ts.value(local_row)
+                        }
+                    })
+                    .collect()
+            } else {
+                vec![i64::MAX; num_valid]
+            };
+
+            let target_col_idx = result_schema.index_of(&raw_task.target_column)?;
+            let target_arr = result_batch.column(target_col_idx);
+            let target_stype = parse_stype(&raw_task.target_stype);
+
+            let (target_writer_data, target_stats) = encode_task_target(
+                target_stype,
+                target_arr.as_ref(),
+                &valid_indices,
+                &raw_task.target_column,
+                &cat_map,
+                global_ts_mean_us,
+                global_ts_std_us,
+            );
+
+            // Write the TaskView binary (anchor_rows, observation_times, target).
+            let target_writer = target_writer_data.as_writer();
+            let task_path = output_dir.join(format!("tasks/{}.bin", task_name));
+            write_task_bin(
+                &task_path,
+                num_valid as u32,
+                &anchor_rows_valid,
+                &observation_times,
+                &target_writer,
+            )?;
+
+            // ── Create the task table as a first-class table in the graph ──
+            let has_obs_time = raw_task.observation_time_column.is_some();
+            let task_num_cols: u32 = if has_obs_time { 2 } else { 1 };
+
+            let task_row_start = RowIdx(global_row_offset);
+            let task_row_end = RowIdx(global_row_offset + num_valid as u32);
+            let task_col_start = ColumnIdx(global_col_offset);
+            let task_col_end = ColumnIdx(global_col_offset + task_num_cols);
+
+            // Build the task table's column writers.
+            // Target is always the first column (position 0) by convention.
+            let mut task_table_writers: Vec<ColumnWriterData> = Vec::new();
+
+            task_table_writers.push(target_writer_data);
+
+            let target_col_global = ColumnIdx(global_col_offset);
+            all_col_names.push(format!("target_{}", raw_task.target_column));
+            all_col_table_names.push(task_name.clone());
+            all_col_stypes.push(target_stype);
+            all_col_fkey_targets.push(None);
+            all_col_descriptions.push(Some(format!(
+                "{} prediction target",
+                raw_task.target_column
+            )));
+            all_col_stats.push(target_stats.clone());
+
+            task_col_name_strings.push(format!(
+                "target of {}: {} prediction target",
+                task_name, raw_task.target_column
+            ));
+
+            if has_obs_time {
+                let obs_validity =
+                    build_bitmap_from_fn(num_valid, |i| observation_times[i] != i64::MAX);
+                let mut obs_values = vec![0.0f32; num_valid * TIMESTAMP_DIM];
+                for i in 0..num_valid {
+                    if observation_times[i] != i64::MAX {
+                        let encoded = encode_timestamp(
+                            observation_times[i],
+                            global_ts_mean_us,
+                            global_ts_std_us,
+                        );
+                        obs_values[i * TIMESTAMP_DIM..(i + 1) * TIMESTAMP_DIM]
+                            .copy_from_slice(&encoded);
+                    }
+                }
+                task_table_writers.push(ColumnWriterData::Timestamp {
+                    validity: obs_validity,
+                    values: obs_values,
+                });
+
+                all_col_names.push("observation_time".to_string());
+                all_col_table_names.push(task_name.clone());
+                all_col_stypes.push(SemanticType::Timestamp);
+                all_col_fkey_targets.push(None);
+                all_col_descriptions.push(Some(format!(
+                    "Temporal cutoff for the {} prediction",
+                    task_name
+                )));
+
+                let obs_stats = compute_obs_time_stats(&observation_times);
+                all_col_stats.push(obs_stats);
+
+                task_col_name_strings.push(format!(
+                    "observation_time of {}: Temporal cutoff for the prediction",
+                    task_name
+                ));
+            }
+
+            // Write the task table binary file.
+            let writers: Vec<ColumnWriter> =
+                task_table_writers.iter().map(|d| d.as_writer()).collect();
+            let task_table_path = output_dir.join(format!("tables/{}.bin", task_name));
+            write_table_bin(&task_table_path, num_valid as u32, &writers)?;
+
+            // Collect FK edges: task_row -> anchor_row (outgoing only).
+            for (i, &anchor_row) in anchor_rows_valid.iter().enumerate() {
+                let task_global_row = global_row_offset + i as u32;
+                task_edges.push((task_global_row, anchor_row));
+            }
+
+            // Record table metadata for this task table.
+            let task_table_idx = TableIdx((num_tables + task_metadata_list.len()) as u32);
+            table_row_ranges.push((task_row_start, task_row_end));
+            table_col_ranges.push((task_col_start, task_col_end));
+            table_names.push(task_name.clone());
+            table_pkey_col_names.push(None);
+            table_temporal_col_names.push(if has_obs_time {
+                Some("observation_time".to_string())
+            } else {
+                None
+            });
+
+            // Resolve columns_to_drop from raw (table, column) pairs to global ColumnIdx.
+            let columns_to_drop: Vec<ColumnIdx> = raw_task
+                .columns_to_drop
+                .iter()
+                .filter_map(|cr| {
+                    col_lookup
+                        .get(&(cr.table.clone(), cr.column.clone()))
+                        .copied()
+                })
+                .collect();
+
+            task_metadata_list.push(TaskMetadata {
+                name: task_name.clone(),
+                anchor_table: TableIdx(anchor_table_idx as u32),
+                task_table: task_table_idx,
+                target_stype,
+                target_col: target_col_global,
+                columns_to_drop,
+                num_seeds: num_valid as u32,
+                target_stats,
+            });
+
+            global_row_offset += num_valid as u32;
+            global_col_offset += task_num_cols;
+            pb_tasks.inc(1);
+        }
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    pb_tasks.finish_and_clear();
+    info!(
+        "  Materialized {} tasks ({} task FK edges)",
+        task_metadata_list.len(),
+        HumanCount(task_edges.len() as u64)
+    );
+
+    let total_rows_with_tasks = global_row_offset as usize;
+    let total_cols_with_tasks = global_col_offset as usize;
+
+    // ── Step 7b: Build FK graph (real + task edges) ─────────────────────
+    info!("Step 7b: Building FK graph...");
+
+    // Extend temporal arrays for task table rows (task rows have no temporal z-score for incoming edges).
+    row_temporal_valid.resize(total_rows_with_tasks, 0);
+    row_temporal_z.resize(total_rows_with_tasks, 0.0);
+
+    // Build outgoing CSR from ALL edges (real + task).
+    let mut all_outgoing_edges = real_edges.clone();
+    all_outgoing_edges.extend_from_slice(&task_edges);
+    all_outgoing_edges.sort_unstable_by_key(|&(src, _)| src);
+    let outgoing = CsrGraph::from_sorted_edges(total_rows_with_tasks, &all_outgoing_edges);
+
+    // Build incoming CSR from REAL edges only (task edges are one-directional outgoing).
+    real_edges.sort_unstable_by_key(|&(src, _)| src);
+    let real_outgoing_for_incoming =
+        CsrGraph::from_sorted_edges(total_rows_with_tasks, &real_edges);
+    let incoming = real_outgoing_for_incoming.transpose();
+
+    // Build temporal/static incoming split.
+    let mut incoming_static_row_ptr: Vec<u32> = Vec::with_capacity(total_rows_with_tasks + 1);
     let mut incoming_static_col_idx: Vec<u32> = Vec::new();
-    let mut incoming_temporal_row_ptr: Vec<u32> = Vec::with_capacity(total_rows + 1);
+    let mut incoming_temporal_row_ptr: Vec<u32> = Vec::with_capacity(total_rows_with_tasks + 1);
     let mut incoming_temporal_col_idx: Vec<u32> = Vec::new();
     let mut incoming_temporal_z: Vec<f32> = Vec::new();
     incoming_static_row_ptr.push(0);
     incoming_temporal_row_ptr.push(0);
-    for dst in 0..total_rows {
+    for dst in 0..total_rows_with_tasks {
         let mut temporal_pairs: Vec<(f32, u32)> = Vec::new();
         for &src in incoming.neighbors(dst as u32) {
             let src_idx = src as usize;
@@ -1166,247 +1522,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         incoming_temporal_col_idx.len()
     );
 
-    // ── Step 7: Materialize tasks via DataFusion SQL ─────────────────────
-    info!("Step 7: Materializing tasks...");
-    let num_tasks = raw_meta.tasks.len();
-    let pb_tasks = ProgressBar::new(num_tasks as u64);
-    pb_tasks.set_style(
-        ProgressStyle::with_template(
-            "  Tasks      {bar:40.cyan/blue} {pos}/{len} tasks [{elapsed_precise}] {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-
-    let mut task_metadata_list: Vec<TaskMetadata> = Vec::new();
-
-    // Build table name -> TableIdx lookup
-    let table_name_to_idx: HashMap<String, usize> = table_names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.clone(), i))
-        .collect();
-
-    rt.block_on(async {
-        let session_config = datafusion::prelude::SessionConfig::new()
-            .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
-        let ctx = datafusion::prelude::SessionContext::new_with_config(session_config);
-
-        // Register all parquet files with their original table names via SQL.
-        // We use CREATE EXTERNAL TABLE with double-quoted identifiers so that
-        // the registration goes through the same SQL parser (with ident
-        // normalization disabled), preserving the exact table name casing
-        // (e.g. "postHistory") in the catalog.
-        for (table_name, _) in &raw_meta.tables {
-            let path = raw_dir.join(format!("{table_name}.parquet"));
-            let path_str = path.to_str().unwrap();
-            let create_sql = format!(
-                "CREATE EXTERNAL TABLE \"{table_name}\" STORED AS PARQUET LOCATION '{path_str}'"
-            );
-            ctx.sql(&create_sql).await?;
-        }
-
-        for (task_name, raw_task) in raw_meta.tasks.iter() {
-            pb_tasks.set_message(task_name.clone());
-
-            // Rewrite SQL: replace 'tableName.parquet' string literals with
-            // the double-quoted table name (matching the registered name above).
-            // Double-quoting preserves case for mixed-case table names like postHistory.
-            let mut query = raw_task.query.clone();
-            for (tname, _) in &raw_meta.tables {
-                let from_pat = format!("'{tname}.parquet'");
-                let to_pat = format!("\"{tname}\"");
-                query = query.replace(&from_pat, &to_pat);
-            }
-
-            let df = ctx.sql(&query).await?;
-            let batches = df.collect().await?;
-
-            if batches.is_empty() {
-                warn!("    Task {} returned no results, skipping", task_name);
-                pb_tasks.inc(1);
-                continue;
-            }
-
-            let result_schema = batches[0].schema();
-            let result_batch = if batches.len() == 1 {
-                batches.into_iter().next().unwrap()
-            } else {
-                concat_batches(&result_schema, &batches)?
-            };
-
-            let num_seeds = result_batch.num_rows();
-            info!("    {} seeds", num_seeds);
-
-            // Resolve anchor table
-            let anchor_table_idx = *table_name_to_idx
-                .get(&raw_task.anchor_table)
-                .ok_or_else(|| format!("anchor_table '{}' not found", raw_task.anchor_table))?;
-            let anchor_pk_map = pk_maps
-                .get(&raw_task.anchor_table)
-                .ok_or_else(|| format!("no PK map for anchor_table '{}'", raw_task.anchor_table))?;
-
-            // Extract anchor_key column -> global RowIdx
-            let anchor_col_idx = result_schema.index_of(&raw_task.anchor_key)?;
-            let anchor_arr = result_batch.column(anchor_col_idx);
-            let anchor_i64 = cast_to_i64(anchor_arr.as_ref()).ok_or_else(|| {
-                format!("cannot cast anchor_key '{}' to i64", raw_task.anchor_key)
-            })?;
-
-            let mut anchor_rows: Vec<u32> = Vec::with_capacity(num_seeds);
-            let mut valid_mask: Vec<bool> = Vec::with_capacity(num_seeds);
-            for i in 0..num_seeds {
-                if anchor_i64.is_null(i) {
-                    anchor_rows.push(0);
-                    valid_mask.push(false);
-                } else {
-                    let pk_val = anchor_i64.value(i);
-                    if let Some(&global_row) = anchor_pk_map.get(&pk_val) {
-                        anchor_rows.push(global_row);
-                        valid_mask.push(true);
-                    } else {
-                        anchor_rows.push(0);
-                        valid_mask.push(false);
-                    }
-                }
-            }
-
-            // Filter to only valid (resolvable) seeds
-            let valid_indices: Vec<usize> = valid_mask
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &v)| if v { Some(i) } else { None })
-                .collect();
-            let num_valid = valid_indices.len();
-            if num_valid == 0 {
-                warn!("    No valid seeds for task {}, skipping", task_name);
-                pb_tasks.inc(1);
-                continue;
-            }
-            let anchor_rows_valid: Vec<u32> =
-                valid_indices.iter().map(|&i| anchor_rows[i]).collect();
-
-            // Resolve observation time for every seed row. The cascade:
-            // 1. Task has observation_time_column → use that value.
-            // 2. Anchor table has temporal_column → use anchor row's temporal value.
-            // 3. Neither → i64::MAX (no temporal filtering).
-            let observation_times: Vec<i64> = if let Some(obs_col_name) =
-                &raw_task.observation_time_column
-            {
-                let obs_col_idx = result_schema.index_of(obs_col_name)?;
-                let obs_arr = result_batch.column(obs_col_idx);
-                let obs_ts = cast_to_timestamp_us(obs_arr.as_ref()).ok_or_else(|| {
-                    format!(
-                        "cannot cast observation_time '{}' to timestamp",
-                        obs_col_name
-                    )
-                })?;
-                valid_indices
-                    .iter()
-                    .map(|&i| {
-                        if obs_ts.is_null(i) {
-                            i64::MAX
-                        } else {
-                            obs_ts.value(i)
-                        }
-                    })
-                    .collect()
-            } else if let Some(tc_name) = &raw_meta.tables[&raw_task.anchor_table].temporal_column {
-                // Fall back to anchor table's temporal_column value.
-                let anchor_lt = loaded_tables
-                    .iter()
-                    .find(|lt| lt.name == raw_task.anchor_table)
-                    .ok_or_else(|| {
-                        format!(
-                            "anchor table '{}' not found in loaded tables",
-                            raw_task.anchor_table
-                        )
-                    })?;
-                let tc_arr_idx = anchor_lt.schema.index_of(tc_name).map_err(|_| {
-                    format!(
-                        "temporal_column '{}' not found in table '{}'",
-                        tc_name, raw_task.anchor_table
-                    )
-                })?;
-                let tc_arr = anchor_lt.batch.column(tc_arr_idx);
-                let tc_ts = cast_to_timestamp_us(tc_arr.as_ref()).ok_or_else(|| {
-                    format!("cannot cast temporal_column '{}' to timestamp", tc_name)
-                })?;
-                let anchor_row_start = table_row_ranges[anchor_table_idx].0.0;
-                valid_indices
-                    .iter()
-                    .map(|&i| {
-                        let global_row = anchor_rows[i];
-                        let local_row = (global_row - anchor_row_start) as usize;
-                        if tc_ts.is_null(local_row) {
-                            i64::MAX
-                        } else {
-                            tc_ts.value(local_row)
-                        }
-                    })
-                    .collect()
-            } else {
-                // Static task: no temporal filtering.
-                vec![i64::MAX; num_valid]
-            };
-
-            // Extract and encode target column
-            let target_col_idx = result_schema.index_of(&raw_task.target_column)?;
-            let target_arr = result_batch.column(target_col_idx);
-            let target_stype = parse_stype(&raw_task.target_stype);
-
-            let (target_writer_data, target_stats) = encode_task_target(
-                target_stype,
-                target_arr.as_ref(),
-                &valid_indices,
-                &raw_task.target_column,
-                &cat_map,
-                global_ts_mean_us,
-                global_ts_std_us,
-            );
-
-            let target_writer = target_writer_data.as_writer();
-
-            let task_path = output_dir.join(format!("tasks/{}.bin", task_name));
-            write_task_bin(
-                &task_path,
-                num_valid as u32,
-                &anchor_rows_valid,
-                &observation_times,
-                &target_writer,
-            )?;
-            task_metadata_list.push(TaskMetadata {
-                name: task_name.clone(),
-                anchor_table: TableIdx(anchor_table_idx as u32),
-                target_stype,
-                num_seeds: num_valid as u32,
-                target_stats,
-            });
-            pb_tasks.inc(1);
-        }
-
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })?;
-    pb_tasks.finish_and_clear();
-    info!("  Materialized {} tasks", task_metadata_list.len());
-
     // ── Step 8: Build and write metadata.json + embedding .bin files ─────
     info!("Step 8: Writing metadata and embeddings...");
 
-    // 8a) Resolve FK targets to ColumnIdx
-    // Build mapping: "table.column" -> global ColumnIdx
-    let mut col_lookup: HashMap<(String, String), ColumnIdx> = HashMap::new();
-    {
-        let mut ci = 0u32;
-        for (table_name, raw_table) in &raw_meta.tables {
-            for (col_name, _) in &raw_table.columns {
-                col_lookup.insert((table_name.clone(), col_name.clone()), ColumnIdx(ci));
-                ci += 1;
-            }
-        }
-    }
-
-    let column_metadata: Vec<ColumnMetadata> = (0..total_cols)
+    let column_metadata: Vec<ColumnMetadata> = (0..total_cols_with_tasks)
         .map(|i| {
             let fkey_target_col = all_col_fkey_targets[i].as_ref().and_then(|fk| {
                 let parts: Vec<&str> = fk.splitn(2, '.').collect();
@@ -1427,8 +1546,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    // 8b) Build TableMetadata with pkey_col
-    let table_metadata: Vec<TableMetadata> = (0..loaded_tables.len())
+    // 8b) Build TableMetadata (real tables + task tables)
+    let total_table_count = table_names.len();
+    let table_metadata: Vec<TableMetadata> = (0..total_table_count)
         .map(|ti| {
             let pkey_col = table_pkey_col_names[ti].as_ref().and_then(|pk_name| {
                 col_lookup
@@ -1436,9 +1556,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .copied()
             });
             let temporal_col = table_temporal_col_names[ti].as_ref().and_then(|tc_name| {
-                col_lookup
-                    .get(&(table_names[ti].clone(), tc_name.clone()))
-                    .copied()
+                // For task tables, temporal_col uses the task table's own column index.
+                // The col_lookup only has real table columns, so we look up directly.
+                if ti < num_tables {
+                    col_lookup
+                        .get(&(table_names[ti].clone(), tc_name.clone()))
+                        .copied()
+                } else {
+                    Some(table_col_ranges[ti].0)
+                }
             });
             TableMetadata {
                 name: table_names[ti].clone(),
@@ -1464,9 +1590,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(output_dir.join("metadata.json"), &metadata_json)?;
     info!("  Wrote metadata.json ({} bytes)", metadata_json.len());
 
-    // Write column_embeddings.bin — one embedding per global column (flat f16 array).
-    let mut col_emb_data: Vec<u8> = Vec::with_capacity(column_embeddings.len() * EMBEDDING_DIM * 2);
-    for emb in column_embeddings.iter() {
+    // Compute embeddings for task table column names.
+    let task_col_embeddings: Vec<Vec<f16>> = if task_col_name_strings.is_empty() {
+        Vec::new()
+    } else if args.skip_embeddings {
+        vec![vec![f16::ZERO; EMBEDDING_DIM]; task_col_name_strings.len()]
+    } else {
+        let config = EmbedderConfig::from_baseten_env()?;
+        let embedder = Embedder::new(config)?;
+        let refs: Vec<&str> = task_col_name_strings.iter().map(|s| s.as_str()).collect();
+        info!(
+            "  Embedding {} task column names...",
+            task_col_name_strings.len()
+        );
+        let flat = rt.block_on(async { embedder.embed_texts(&refs).await })?;
+        flat.chunks_exact(EMBEDDING_DIM)
+            .map(|c| c.to_vec())
+            .collect()
+    };
+
+    // Write column_embeddings.bin — real column embeddings + task column embeddings.
+    let total_col_emb_count = column_embeddings.len() + task_col_embeddings.len();
+    let mut col_emb_data: Vec<u8> = Vec::with_capacity(total_col_emb_count * EMBEDDING_DIM * 2);
+    for emb in column_embeddings.iter().chain(task_col_embeddings.iter()) {
         for &v in emb {
             col_emb_data.extend_from_slice(&f16::to_ne_bytes(v));
         }
@@ -1474,7 +1620,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(output_dir.join("column_embeddings.bin"), &col_emb_data)?;
     info!(
         "  Wrote column_embeddings.bin ({} column embeddings, {} bytes)",
-        column_embeddings.len(),
+        total_col_emb_count,
         col_emb_data.len()
     );
 
@@ -1510,10 +1656,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = pipeline_start.elapsed();
     info!("Preprocessing complete in {}!", HumanDuration(elapsed));
     info!("  Output directory: {}", output_dir.display());
-    info!("  Tables: {}", loaded_tables.len());
+    info!(
+        "  Tables: {} real + {} task = {}",
+        loaded_tables.len(),
+        db_metadata.task_metadata.len(),
+        total_table_count
+    );
     info!("  Tasks: {}", db_metadata.task_metadata.len());
-    info!("  Total rows: {}", HumanCount(total_rows as u64));
-    info!("  Total columns: {}", total_cols);
+    info!(
+        "  Total rows: {} (real) + {} (task) = {}",
+        HumanCount(total_rows as u64),
+        HumanCount((total_rows_with_tasks - total_rows) as u64),
+        HumanCount(total_rows_with_tasks as u64)
+    );
+    info!("  Total columns: {}", total_cols_with_tasks);
     info!(
         "  Categorical vocab: {}, Text vocab: {}",
         HumanCount(cat_list.len() as u64),
@@ -1971,5 +2127,49 @@ fn encode_task_target(
         }
 
         _ => panic!("invalid target_stype {:?} for task target", target_stype),
+    }
+}
+
+/// Compute `ColumnStats::Timestamp` for an observation time array (epoch microseconds).
+/// Values of `i64::MAX` are treated as null.
+fn compute_obs_time_stats(observation_times: &[i64]) -> ColumnStats {
+    let n = observation_times.len();
+    let mut num_nulls = 0u64;
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    let mut min_val = i64::MAX;
+    let mut max_val = i64::MIN;
+
+    for &t in observation_times {
+        if t == i64::MAX {
+            num_nulls += 1;
+        } else {
+            sum += t as f64;
+            count += 1;
+            min_val = min_val.min(t);
+            max_val = max_val.max(t);
+        }
+    }
+
+    let mean_us = if count > 0 { sum / count as f64 } else { 0.0 };
+    let mut var_sum = 0.0f64;
+    for &t in observation_times {
+        if t != i64::MAX {
+            let d = t as f64 - mean_us;
+            var_sum += d * d;
+        }
+    }
+    let std_us = if count > 1 {
+        (var_sum / (count - 1) as f64).sqrt()
+    } else {
+        1.0
+    };
+
+    ColumnStats::Timestamp {
+        num_nulls,
+        min_us: if n > 0 && count > 0 { min_val } else { 0 },
+        max_us: if n > 0 && count > 0 { max_val } else { 0 },
+        mean_us,
+        std_us,
     }
 }

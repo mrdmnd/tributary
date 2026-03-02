@@ -9,11 +9,11 @@ import logging
 import time
 from functools import partial
 
-import headwater
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+import headwater
 from confluence.config import ModelConfig, TrainingConfig
 from confluence.loss import compute_loss
 from confluence.model import RelationalTransformer
@@ -26,9 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def numpy_batch_to_jax(
-    np_batch: dict[str, np.ndarray], device: jax.Device
-) -> dict[str, jax.Array]:
+def numpy_batch_to_jax(np_batch: dict[str, np.ndarray], device: jax.Device) -> dict[str, jax.Array]:
     """Convert a numpy batch dict to JAX arrays on the given device.
 
     Passes the full pytree in a single ``device_put`` so JAX can batch
@@ -58,18 +56,15 @@ def create_dummy_batch(config: ModelConfig, training_config: TrainingConfig):
     col_idx = np.zeros((0,), dtype=np.uint16)
 
     return {
-        "semantic_types": np.zeros((b, s), dtype=np.int8),
-        "column_ids": np.zeros((b, s), dtype=np.int32),
-        "seq_row_ids": np.zeros((b, s), dtype=np.uint16),
+        "semantic_types": np.zeros((b, s), dtype=np.uint8),
+        "column_embed_ids": np.zeros((b, s), dtype=np.uint32),
         "numeric_values": np.zeros((b, s), dtype=np.float32),
         "timestamp_values": np.zeros((b, s, 15), dtype=np.float32),
         "bool_values": np.zeros((b, s), dtype=np.uint8),
         "categorical_embed_ids": np.zeros((b, s), dtype=np.uint32),
         "text_embed_ids": np.zeros((b, s), dtype=np.uint32),
         "is_null": np.zeros((b, s), dtype=np.uint8),
-        "is_target": np.zeros((b, s), dtype=np.uint8),
         "is_padding": np.ones((b, s), dtype=np.uint8),
-        "mask_format": np.array([1], dtype=np.uint8),
         "outbound_csr_row_ptr": row_ptr.copy(),
         "outbound_csr_seq_offsets": seq_offsets.copy(),
         "outbound_csr_col_idx": col_idx.copy(),
@@ -91,17 +86,18 @@ def make_categorical_encoder_fn(params, model):
     This is used in the loss computation to project category embeddings
     through the same Linear(D_t -> D) used in value encoding.
     """
+
     def categorical_encoder_fn(cat_embs):
         # Access the categorical_encoder kernel and bias from params
         encoder_params = params["params"]["value_encoder"]["categorical_encoder"]
         kernel = encoder_params["kernel"]
         bias = encoder_params["bias"]
         return cat_embs @ kernel + bias
+
     return categorical_encoder_fn
 
 
-def run_validation(sampler, model, params, col_emb_table, cat_emb_table,
-                   device, num_val_steps):
+def run_validation(sampler, model, params, col_emb_table, cat_emb_table, device, num_val_steps):
     """Run validation and return average loss."""
     total_loss = 0.0
     for _ in range(num_val_steps):
@@ -118,22 +114,14 @@ def run_validation(sampler, model, params, col_emb_table, cat_emb_table,
 
 def main():
     parser = argparse.ArgumentParser(description="Train the relational transformer")
-    parser.add_argument("--db-path", type=str, required=True,
-                        help="Path to preprocessed database directory")
-    parser.add_argument("--num-steps", type=int, default=1000,
-                        help="Number of training steps")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Batch size per GPU")
-    parser.add_argument("--seq-length", type=int, default=256,
-                        help="Sequence length")
-    parser.add_argument("--n-layers", type=int, default=4,
-                        help="Number of transformer layers")
-    parser.add_argument("--eval-interval", type=int, default=100,
-                        help="Steps between validation runs")
-    parser.add_argument("--num-val-steps", type=int, default=10,
-                        help="Number of validation steps per eval")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed")
+    parser.add_argument("--db-path", type=str, required=True, help="Path to preprocessed database directory")
+    parser.add_argument("--num-steps", type=int, default=1000, help="Number of training steps")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size per GPU")
+    parser.add_argument("--seq-length", type=int, default=256, help="Sequence length")
+    parser.add_argument("--n-layers", type=int, default=4, help="Number of transformer layers")
+    parser.add_argument("--eval-interval", type=int, default=100, help="Steps between validation runs")
+    parser.add_argument("--num-val-steps", type=int, default=10, help="Number of validation steps per eval")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
     # --- JAX Distributed Setup ---
@@ -152,10 +140,7 @@ def main():
 
     logger.info(f"Process {rank}/{world_size} using device: {device}")
     if world_size > 1 and local_device_count != 1:
-        raise RuntimeError(
-            "This training loop currently expects one process per GPU "
-            "(local_device_count must be 1 when world_size > 1)."
-        )
+        raise RuntimeError("This training loop currently expects one process per GPU (local_device_count must be 1 when world_size > 1).")
 
     # --- Configuration ---
     model_config = ModelConfig(
@@ -192,16 +177,9 @@ def main():
     cat_emb_raw = sampler.categorical_embeddings()  # [Vc, D_t] as uint16
 
     # Convert f16 bits to bfloat16 via float16 intermediate
-    col_emb_table = jax.device_put(
-        jnp.array(col_emb_raw, dtype=jnp.float16).astype(jnp.bfloat16), device
-    )
-    cat_emb_table = jax.device_put(
-        jnp.array(cat_emb_raw, dtype=jnp.float16).astype(jnp.bfloat16), device
-    )
-    logger.info(
-        f"GPU tables uploaded: col_emb={col_emb_table.shape}, "
-        f"cat_emb={cat_emb_table.shape}"
-    )
+    col_emb_table = jax.device_put(jnp.array(col_emb_raw, dtype=jnp.float16).astype(jnp.bfloat16), device)
+    cat_emb_table = jax.device_put(jnp.array(cat_emb_raw, dtype=jnp.float16).astype(jnp.bfloat16), device)
+    logger.info(f"GPU tables uploaded: col_emb={col_emb_table.shape}, cat_emb={cat_emb_table.shape}")
 
     # --- Initialize Model ---
     model = RelationalTransformer(config=model_config)
@@ -229,7 +207,10 @@ def main():
             output = model.apply(params, batch, col_emb, cat_emb)
             cat_enc_fn = make_categorical_encoder_fn(params, model)
             return compute_loss(
-                output, batch, cat_emb, cat_enc_fn,
+                output,
+                batch,
+                cat_emb,
+                cat_enc_fn,
                 z_loss_weight=training_config.z_loss_weight,
             )
 
@@ -247,7 +228,10 @@ def main():
             output = model.apply(params, batch, col_emb, cat_emb)
             cat_enc_fn = make_categorical_encoder_fn(params, model)
             return compute_loss(
-                output, batch, cat_emb, cat_enc_fn,
+                output,
+                batch,
+                cat_emb,
+                cat_enc_fn,
                 z_loss_weight=training_config.z_loss_weight,
             )
 
@@ -277,15 +261,11 @@ def main():
         np_batch = sampler.next_train_batch()
         if world_size > 1:
             batch = numpy_batch_to_pmap(np_batch)
-            params, opt_state, loss = train_step_pmapped(
-                params, opt_state, batch, col_emb_table, cat_emb_table
-            )
+            params, opt_state, loss = train_step_pmapped(params, opt_state, batch, col_emb_table, cat_emb_table)
             loss_val = float(jax.device_get(loss)[0])
         else:
             batch = numpy_batch_to_jax(np_batch, device)
-            params, opt_state, loss = train_step_single(
-                params, opt_state, batch, col_emb_table, cat_emb_table
-            )
+            params, opt_state, loss = train_step_single(params, opt_state, batch, col_emb_table, cat_emb_table)
             # Block on loss for logging (forces sync)
             loss_val = float(loss)
         dt = time.perf_counter() - t0
@@ -293,10 +273,7 @@ def main():
 
         if step % 10 == 0:
             avg_dt = sum(step_times[-10:]) / len(step_times[-10:])
-            logger.info(
-                f"step {step:6d} | loss {loss_val:.4f} | "
-                f"{dt:.3f}s/step | avg {avg_dt:.3f}s/step"
-            )
+            logger.info(f"step {step:6d} | loss {loss_val:.4f} | {dt:.3f}s/step | avg {avg_dt:.3f}s/step")
 
         # Periodic validation
         if step > 0 and step % args.eval_interval == 0:
@@ -308,8 +285,13 @@ def main():
                 eval_col_emb = col_emb_table[0]
                 eval_cat_emb = cat_emb_table[0]
             val_loss = run_validation(
-                sampler, model, eval_params, eval_col_emb, eval_cat_emb,
-                device, args.num_val_steps,
+                sampler,
+                model,
+                eval_params,
+                eval_col_emb,
+                eval_cat_emb,
+                device,
+                args.num_val_steps,
             )
             logger.info(f"  val_loss: {val_loss:.4f}")
 
@@ -323,8 +305,13 @@ def main():
         eval_col_emb = col_emb_table[0]
         eval_cat_emb = cat_emb_table[0]
     val_loss = run_validation(
-        sampler, model, eval_params, eval_col_emb, eval_cat_emb,
-        device, training_config.num_val_steps,
+        sampler,
+        model,
+        eval_params,
+        eval_col_emb,
+        eval_cat_emb,
+        device,
+        training_config.num_val_steps,
     )
     logger.info(f"Final val_loss: {val_loss:.4f}")
 

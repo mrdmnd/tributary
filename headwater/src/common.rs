@@ -104,25 +104,39 @@ pub struct TableMetadata {
 
 /// Metadata for a single prediction task.
 ///
-/// Each task is defined by a SQL query that materializes ground-truth labels as
-/// `(anchor_row, observation_time, target_value)` tuples. The preprocessor
-/// executes the query and stores the results in a `<task_name>.bin` file.
+/// Each task is a first-class table in the database graph. The task table has
+/// 1-2 columns: an optional observation_time (Timestamp) and the target value.
+/// An FK edge connects each task row to its anchor row in the anchor table.
 ///
-/// During training, the sampler picks a task, draws seeds from its anchor rows,
-/// builds BFS subgraphs, and constructs batches. The target column comes from
-/// the materialized task table, not from any column in the original database tables
-/// (though for simple cell-masking tasks, they may coincide).
+/// The BFS starts from the task table row, emitting the task's cells first,
+/// then following the FK edge to the anchor row and expanding outward.
+///
+/// The target cell is always the last column of the task table. Its position
+/// in the sequence is deterministic: position 0 (no obs_time) or position 1
+/// (with obs_time).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskMetadata {
     /// Human-readable task name (e.g. "predict_vote_type").
     pub name: String,
 
-    /// Which table anchors the subgraph sampling for this task.
+    /// Which real database table anchors the subgraph sampling for this task.
     pub anchor_table: TableIdx,
+
+    /// The task's own table in `table_metadata`, containing obs_time + target columns.
+    pub task_table: TableIdx,
 
     /// Semantic type of the prediction target.
     /// Only `Numerical`, `Categorical`, `Boolean`, and `Timestamp` are valid here.
     pub target_stype: SemanticType,
+
+    /// Global column index of the target column in the task table.
+    pub target_col: ColumnIdx,
+
+    /// Global column indices to skip during BFS (prevents autocomplete leakage).
+    /// For autocomplete tasks, this includes the real table's target column.
+    /// For forecast tasks, this is empty.
+    #[serde(default)]
+    pub columns_to_drop: Vec<ColumnIdx>,
 
     /// Number of seed rows (anchor_row, target_value pairs) in the materialized task table.
     pub num_seeds: u32,
@@ -420,11 +434,12 @@ impl GraphView {
             "graph.bin too small for header ({byte_len} < {header_bytes} bytes)",
         );
 
-        // SAFETY: Mmap is page-aligned (>= 4-byte aligned). Header is 4 u32s.
+        // SAFETY: Mmap is page-aligned (>= 4-byte aligned). Header is 6 u32s.
         let header: &[u32] =
             unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u32, GRAPH_HEADER_U32S) };
         let num_nodes = header[0] as usize;
-        let num_edges = header[1] as usize;
+        let num_out_edges = header[1] as usize;
+        let num_in_edges = header[3] as usize;
         let num_static_edges = header[4] as usize;
         let num_temporal_edges = header[5] as usize;
         assert_eq!(
@@ -432,16 +447,12 @@ impl GraphView {
             "incoming num_nodes ({}) != outgoing num_nodes ({num_nodes})",
             header[2],
         );
-        assert_eq!(
-            header[3] as usize, num_edges,
-            "incoming num_edges ({}) != outgoing num_edges ({num_edges})",
-            header[3],
-        );
 
         let row_ptr_len = num_nodes + 1;
         let expected_u32s = GRAPH_HEADER_U32S
             + 2 * row_ptr_len
-            + 2 * num_edges
+            + num_out_edges
+            + num_in_edges
             + row_ptr_len
             + num_static_edges
             + row_ptr_len
@@ -451,7 +462,8 @@ impl GraphView {
         assert_eq!(
             byte_len, expected_bytes,
             "graph.bin size mismatch: expected {expected_bytes} bytes \
-             ({num_nodes} nodes, {num_edges} edges), got {byte_len}",
+             ({num_nodes} nodes, {num_out_edges} out-edges, {num_in_edges} in-edges), \
+             got {byte_len}",
         );
 
         // SAFETY: The mmap is read-only and immutable. The Arc keeps the
@@ -461,11 +473,15 @@ impl GraphView {
         let (out_row_ptr, out_col_idx, in_row_ptr, in_col_idx) = unsafe {
             let base_u32 = (base as *const u32).add(GRAPH_HEADER_U32S);
             let out_rp = std::slice::from_raw_parts(base_u32, row_ptr_len);
-            let out_ci = std::slice::from_raw_parts(base_u32.add(row_ptr_len), num_edges);
-            let in_rp =
-                std::slice::from_raw_parts(base_u32.add(row_ptr_len + num_edges), row_ptr_len);
-            let in_ci =
-                std::slice::from_raw_parts(base_u32.add(2 * row_ptr_len + num_edges), num_edges);
+            let out_ci = std::slice::from_raw_parts(base_u32.add(row_ptr_len), num_out_edges);
+            let in_rp = std::slice::from_raw_parts(
+                base_u32.add(row_ptr_len + num_out_edges),
+                row_ptr_len,
+            );
+            let in_ci = std::slice::from_raw_parts(
+                base_u32.add(2 * row_ptr_len + num_out_edges),
+                num_in_edges,
+            );
             (out_rp, out_ci, in_rp, in_ci)
         };
         let (
@@ -475,8 +491,9 @@ impl GraphView {
             in_temporal_col_idx,
             in_temporal_z,
         ) = unsafe {
-            let base_u32 =
-                (base as *const u32).add(GRAPH_HEADER_U32S + 2 * row_ptr_len + 2 * num_edges);
+            let off =
+                GRAPH_HEADER_U32S + 2 * row_ptr_len + num_out_edges + num_in_edges;
+            let base_u32 = (base as *const u32).add(off);
             let in_static_rp = std::slice::from_raw_parts(base_u32, row_ptr_len);
             let in_static_ci =
                 std::slice::from_raw_parts(base_u32.add(row_ptr_len), num_static_edges);
@@ -512,7 +529,7 @@ impl GraphView {
             in_temporal_col_idx,
             in_temporal_z,
             num_nodes,
-            num_edges,
+            num_edges: num_out_edges,
         }
     }
 
@@ -521,7 +538,7 @@ impl GraphView {
         self.num_nodes
     }
 
-    /// Total number of directed edges in the graph.
+    /// Total number of outgoing directed edges in the graph.
     pub fn num_edges(&self) -> usize {
         self.num_edges
     }
@@ -575,11 +592,12 @@ impl GraphView {
 /// Write a bidirectional CSR graph to a flat binary file (`graph.bin`).
 ///
 /// See [`GraphView`] for the file layout. The outgoing and incoming graphs
-/// must have the same number of nodes and edges (the incoming graph is
-/// typically produced by [`CsrGraph::transpose`]).
+/// must have the same number of nodes but may have different edge counts
+/// (e.g. task edges are one-directional outgoing).
 ///
 /// # Panics
-/// Panics if the outgoing and incoming graphs have different dimensions.
+/// Panics if the graphs have different node counts or if auxiliary array
+/// dimensions are inconsistent.
 pub fn write_graph_bin(
     outgoing: &CsrGraph,
     incoming: &CsrGraph,
@@ -597,16 +615,10 @@ pub fn write_graph_bin(
         outgoing.num_nodes(),
         incoming.num_nodes(),
     );
-    assert_eq!(
-        outgoing.num_edges(),
-        incoming.num_edges(),
-        "outgoing num_edges ({}) != incoming num_edges ({})",
-        outgoing.num_edges(),
-        incoming.num_edges(),
-    );
 
     let num_nodes = outgoing.num_nodes() as u32;
-    let num_edges = outgoing.num_edges() as u32;
+    let num_out_edges = outgoing.num_edges() as u32;
+    let num_in_edges = incoming.num_edges() as u32;
     let num_static_edges = incoming_static_col_idx.len() as u32;
     let num_temporal_edges = incoming_temporal_col_idx.len() as u32;
     assert_eq!(
@@ -628,11 +640,11 @@ pub fn write_graph_bin(
     let mut w = BufWriter::new(File::create(path)?);
 
     // Header:
-    // [num_nodes, num_edges, num_nodes, num_edges, num_static_edges, num_temporal_edges]
+    // [num_nodes, num_out_edges, num_nodes, num_in_edges, num_static_edges, num_temporal_edges]
     w.write_all(&num_nodes.to_ne_bytes())?;
-    w.write_all(&num_edges.to_ne_bytes())?;
+    w.write_all(&num_out_edges.to_ne_bytes())?;
     w.write_all(&num_nodes.to_ne_bytes())?;
-    w.write_all(&num_edges.to_ne_bytes())?;
+    w.write_all(&num_in_edges.to_ne_bytes())?;
     w.write_all(&num_static_edges.to_ne_bytes())?;
     w.write_all(&num_temporal_edges.to_ne_bytes())?;
 

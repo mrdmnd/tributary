@@ -150,7 +150,7 @@ cargo build --release
 
 ## Project structure
 
-```
+```bash
 headwater/                  — Rust crate (preprocessing, sampling, inspection)
   src/
     lib.rs                  — crate root (mimalloc global allocator)
@@ -173,7 +173,7 @@ data/
 
 ## Preprocessed output layout
 
-```
+```bash
 data/processed/<dataset>/
   metadata.json              — schema, column stats, task definitions (JSON)
   column_embeddings.bin      — flat [C, 256] f16 array (one per global column)

@@ -73,14 +73,14 @@ opt-level = 3
 lto = "thin"
 ```
 
-Always profile against the `profiling` profile (or `release` with `debug = true`). 
+Always profile against the `profiling` profile (or `release` with `debug = true`).
 Never profile unoptimized debug builds — the results will be meaningless for production performance analysis.
 
 ---
 
 ## 2. Benchmarking: Measuring Performance
 
-Benchmarking answers "how fast is this code?" Profiling answers "why is it this fast (or slow)?" 
+Benchmarking answers "how fast is this code?" Profiling answers "why is it this fast (or slow)?"
 Always benchmark first, then profile the areas that need improvement.
 
 ### 2.1 Criterion.rs (Micro-Benchmarks)
@@ -234,8 +234,8 @@ cargo flamegraph --profile profiling -- --my-args
 # Produces flamegraph.svg in the current directory
 ```
 
-Flamegraphs are the single most useful visualization for CPU-bound code. 
-Read them bottom-up: the x-axis is *not* time but rather the set of sampled stacks sorted alphabetically; width represents the proportion of total samples.
+Flamegraphs are the single most useful visualization for CPU-bound code.
+Read them bottom-up: the x-axis is _not_ time but rather the set of sampled stacks sorted alphabetically; width represents the proportion of total samples.
 
 ### 3.2 Instrumentation Profilers
 
@@ -436,16 +436,16 @@ cargo bench -- --baseline main
 
 ## 8. Quick Reference: Tool Selection
 
-| Goal | Tool |
-|---|---|
-| Micro-benchmark a function | Criterion.rs |
-| Benchmark a whole binary | Hyperfine |
-| Find hot functions (low overhead) | `perf record` + `perf report`, or `samply` |
-| Visualize hot paths | Flamegraph (`cargo flamegraph` or `samply`) |
-| Exact call counts and instruction costs | Callgrind (Valgrind) |
-| Cache miss analysis | `perf stat -d` or Cachegrind |
-| Allocation profiling | DHAT (Valgrind) or custom global allocator |
-| Assembly inspection | `cargo asm` or Compiler Explorer |
-| Hardware counter deep-dive | `perf stat -e <counters>` |
-| Compare two binaries | Hyperfine with multiple commands |
-| CI regression detection | Criterion baselines + `critcmp` |
+| Goal                                    | Tool                                        |
+| --------------------------------------- | ------------------------------------------- |
+| Micro-benchmark a function              | Criterion.rs                                |
+| Benchmark a whole binary                | Hyperfine                                   |
+| Find hot functions (low overhead)       | `perf record` + `perf report`, or `samply`  |
+| Visualize hot paths                     | Flamegraph (`cargo flamegraph` or `samply`) |
+| Exact call counts and instruction costs | Callgrind (Valgrind)                        |
+| Cache miss analysis                     | `perf stat -d` or Cachegrind                |
+| Allocation profiling                    | DHAT (Valgrind) or custom global allocator  |
+| Assembly inspection                     | `cargo asm` or Compiler Explorer            |
+| Hardware counter deep-dive              | `perf stat -e <counters>`                   |
+| Compare two binaries                    | Hyperfine with multiple commands            |
+| CI regression detection                 | Criterion baselines + `critcmp`             |

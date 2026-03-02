@@ -1,7 +1,7 @@
 """Relational transformer model for database learning.
 
 Implements:
-- ValueEncoder: column-name encoding + type-specific value encoding + null/target gating
+- ValueEncoder: column-name encoding + type-specific value encoding + null/target masking
 - DecoderHeads: null, numerical, boolean, timestamp, categorical
 - RelationalTransformer: full model combining encoder, transformer layers, and decoder
 """
@@ -44,7 +44,7 @@ class ValueEncoder(nn.Module):
 
     h0 = RMSNorm(col_enc + val_final)
 
-    Where col_enc = Linear(D_t -> D)(column_embedding_table[column_ids])
+    Where col_enc = Linear(D_t -> D)(column_embedding_table[column_embed_ids])
     and val_final is the type-specific value, gated by null and target masks.
     """
 
@@ -66,14 +66,17 @@ class ValueEncoder(nn.Module):
         d = cfg.d_model
         d_t = cfg.d_text
 
-        semantic_types = batch["semantic_types"]  # [B, S] int8
-        column_ids = batch["column_ids"]  # [B, S] int32
+        semantic_types = batch["semantic_types"]  # [B, S] uint8
+        column_embed_ids = batch["column_embed_ids"]  # [B, S] uint32
         is_null = batch["is_null"].astype(jnp.float32)  # [B, S]
-        is_target = batch["is_target"].astype(jnp.float32)  # [B, S]
         is_padding = batch["is_padding"].astype(jnp.float32)  # [B, S]
 
+        # Target mask: the target cell is always at position 0 by convention.
+        s = semantic_types.shape[1]
+        is_target = (jnp.arange(s) == 0).astype(jnp.float32)[None, :]  # [1, S]
+
         # Column-name encoding: lookup + project
-        col_raw = col_emb_table[column_ids]  # [B, S, D_t]
+        col_raw = col_emb_table[column_embed_ids]  # [B, S, D_t]
         col_raw = col_raw.astype(jnp.bfloat16)
         col_enc = nn.Dense(d, use_bias=True, name="column_name_encoder")(col_raw)
 
@@ -217,7 +220,7 @@ def _csr_to_dense_mask(
 
 def build_attention_masks(batch):
     """Build dense masks from CSR transport."""
-    s = int(batch["seq_row_ids"].shape[1])
+    s = int(batch["column_embed_ids"].shape[1])
     return (
         _csr_to_dense_mask(
             batch["outbound_csr_row_ptr"],
