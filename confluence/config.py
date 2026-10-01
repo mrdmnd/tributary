@@ -10,7 +10,7 @@ class ModelConfig:
     # Core dimensions
     d_model: int = 1024  # Model hidden dimension (D)
     d_text: int = 256  # Frozen text embedding dimension (D_t)
-    d_ff: int = 4096  # FFN hidden dimension
+    d_ff: int = 4 * d_model  # FFN hidden dimension
     n_layers: int = 6  # Number of transformer layers
     n_heads: int = 8  # Number of attention heads (d_head = d_model // n_heads)
 

@@ -1,7 +1,7 @@
 # Attention Mechanisms
 
-Confluence uses three structured attention patterns per layer. Unlike the RT paper, there is no fourth "full attention"
-layer — all cell visibility is governed entirely by relational structure.
+Confluence uses three structured attention patterns per layer. 
+Unlike the RT paper, there is no fourth "full attention" layer — all cell visibility is governed entirely by relational structure.
 
 ## Attention patterns
 
